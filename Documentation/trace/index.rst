@@ -76,6 +76,7 @@ interactions and system performance.
    coresight/index
    rv/index
    hisi-ptt
+   cxl-hmu
    mmiotrace
    hwlat_detector
    osnoise-tracer

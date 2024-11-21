@@ -13,6 +13,13 @@
  */
 #define CXL_PCI_DEFAULT_MAX_VECTORS 16
 
+/* A few CHMU registers are needed to establish size */
+#define CHMU_COMMON_CAP0_REG				0x00
+#define   CHMU_COMMON_CAP0_VER_MSK			GENMASK(3, 0)
+#define   CHMU_COMMON_CAP0_NUMINST_MSK			GENMASK(15, 8)
+#define CHMU_COMMON_CAP1_REG				0x08
+#define   CHMU_COMMON_CAP1_INSTLEN_MSK			GENMASK(15, 0)
+
 /*
  * Table Access DOE, CDAT Read Entry Response
  *

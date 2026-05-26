@@ -263,6 +263,17 @@ static umode_t cxl_pmu_format_is_visible(struct kobject *kobj,
 	     attr == cxl_pmu_format_attr[cxl_pmu_hdm_attr]))
 		return 0;
 
+	/*
+	 * Threshold, Invert, and Edge are RO on Fixed-function counters
+	 * (CXL rev 4.0, Table 8-185). Hide them when only Fixed-function
+	 * counters are present, since software cannot program these fields.
+	 */
+	if (bitmap_empty(info->conf_counter_bm, CXL_PMU_MAX_COUNTERS) &&
+	    (attr == cxl_pmu_format_attr[cxl_pmu_threshold_attr] ||
+	     attr == cxl_pmu_format_attr[cxl_pmu_invert_attr] ||
+	     attr == cxl_pmu_format_attr[cxl_pmu_edge_attr]))
+		return 0;
+
 	return attr->mode;
 }
 

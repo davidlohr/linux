@@ -520,6 +520,7 @@ static int cxl_pmu_get_event_idx(struct perf_event *event, int *counter_idx,
 	struct cxl_pmu_info *info = pmu_to_cxl_pmu_info(event->pmu);
 	DECLARE_BITMAP(configurable_and_free, CXL_PMU_MAX_COUNTERS);
 	struct cxl_pmu_ev_cap *pmu_ev;
+	bool try_fixed;
 	u32 mask;
 	u16 gid, vid;
 	int i;
@@ -528,15 +529,27 @@ static int cxl_pmu_get_event_idx(struct perf_event *event, int *counter_idx,
 	gid = cxl_pmu_config_get_gid(event);
 	mask = cxl_pmu_config_get_mask(event);
 
-	pmu_ev = cxl_pmu_find_fixed_counter_ev_cap(info, vid, gid, mask);
-	if (!IS_ERR(pmu_ev)) {
-		if (!counter_idx)
-			return 0;
-		if (!test_bit(pmu_ev->counter_idx, info->used_counter_bm)) {
-			*counter_idx = pmu_ev->counter_idx;
-			return 0;
+	/*
+	 * Edge, Invert, and Threshold are RO on Fixed-function counters
+	 * (CXL rev 4.0, 8.2.7.2.1, Table 8-185). If the user supplied a
+	 * non-default value for any of them, restrict allocation to
+	 * Configurable counters so the request can actually take effect.
+	 */
+	try_fixed = !cxl_pmu_config1_get_edge(event) &&
+		    !cxl_pmu_config1_get_invert(event) &&
+		    !cxl_pmu_config1_get_threshold(event);
+
+	if (try_fixed) {
+		pmu_ev = cxl_pmu_find_fixed_counter_ev_cap(info, vid, gid, mask);
+		if (!IS_ERR(pmu_ev)) {
+			if (!counter_idx)
+				return 0;
+			if (!test_bit(pmu_ev->counter_idx, info->used_counter_bm)) {
+				*counter_idx = pmu_ev->counter_idx;
+				return 0;
+			}
+			/* Fixed counter is in use, but maybe a configurable one? */
 		}
-		/* Fixed counter is in use, but maybe a configurable one? */
 	}
 
 	pmu_ev = cxl_pmu_find_config_counter_ev_cap(info, vid, gid, mask);
@@ -642,29 +655,28 @@ static void cxl_pmu_event_start(struct perf_event *event, int flags)
 	cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_INT_ON_OVRFLW, 1);
 	cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_FREEZE_ON_OVRFLW, 1);
 	cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_ENABLE, 1);
-	cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_EDGE,
-			  cxl_pmu_config1_get_edge(event) ? 1 : 0);
-	cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_INVERT,
-			  cxl_pmu_config1_get_invert(event) ? 1 : 0);
 
-	/* Fixed purpose counters have next two fields RO */
+	/* Fixed purpose counters are RO */
 	if (test_bit(hwc->idx, info->conf_counter_bm)) {
+		cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_EDGE,
+				  cxl_pmu_config1_get_edge(event) ? 1 : 0);
+		cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_INVERT,
+				  cxl_pmu_config1_get_invert(event) ? 1 : 0);
 		cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_EVENT_GRP_ID_IDX_MSK,
 				  hwc->event_base);
 		cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_EVENTS_MSK,
 				  cxl_pmu_config_get_mask(event));
+		cfg &= ~CXL_PMU_COUNTER_CFG_THRESHOLD_MSK;
+		/*
+		 * For events that generate only 1 count per clock the CXL
+		 * spec states the threshold shall be set to 1; setting 0
+		 * counts the raw value, which is equivalent in that case.
+		 * Behavior for non-1 values is event-implementation defined.
+		 * (CXL rev 4.0 8.2.7.2.1, Counter Configuration - Threshold)
+		 */
+		cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_THRESHOLD_MSK,
+				  cxl_pmu_config1_get_threshold(event));
 	}
-	cfg &= ~CXL_PMU_COUNTER_CFG_THRESHOLD_MSK;
-	/*
-	 * For events that generate only 1 count per clock the CXL 3.0 spec
-	 * states the threshold shall be set to 1 but if set to 0 it will
-	 * count the raw value anwyay?
-	 * There is no definition of what events will count multiple per cycle
-	 * and hence to which non 1 values of threshold can apply.
-	 * (CXL 3.0 8.2.7.2.1 Counter Configuration - threshold field definition)
-	 */
-	cfg |= FIELD_PREP(CXL_PMU_COUNTER_CFG_THRESHOLD_MSK,
-			  cxl_pmu_config1_get_threshold(event));
 	writeq(cfg, base + CXL_PMU_COUNTER_CFG_REG(hwc->idx));
 
 	local64_set(&hwc->prev_count, 0);

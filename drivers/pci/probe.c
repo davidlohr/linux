@@ -676,6 +676,8 @@ static void pci_init_host_bridge(struct pci_host_bridge *bridge)
 	bridge->native_dpc = 1;
 	bridge->domain_nr = PCI_DOMAIN_NR_NOT_SET;
 	bridge->native_cxl_error = 1;
+	/* No _OSC negotiation exists for UIO SVC yet; default to OS owned */
+	bridge->native_svc = 1;
 	bridge->dev.type = &pci_host_bridge_type;
 	pci_ide_init_host_bridge(bridge);
 

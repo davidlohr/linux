@@ -21,6 +21,8 @@
 #include <linux/seq_buf.h>
 #include <linux/xarray.h>
 
+#include "pci.h"
+
 struct pci_p2pdma {
 	struct gen_pool *pool;
 	bool p2pmem_published;
@@ -490,28 +492,6 @@ static struct pci_dev *find_parent_pci_dev(struct device *dev)
 	}
 
 	return NULL;
-}
-
-/*
- * Check if a PCI bridge has its ACS redirection bits set to redirect P2P
- * TLPs upstream via ACS. Returns 1 if the packets will be redirected
- * upstream, 0 otherwise.
- */
-static int pci_bridge_has_acs_redir(struct pci_dev *pdev)
-{
-	int pos;
-	u16 ctrl;
-
-	pos = pdev->acs_cap;
-	if (!pos)
-		return 0;
-
-	pci_read_config_word(pdev, pos + PCI_ACS_CTRL, &ctrl);
-
-	if (ctrl & (PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_EC))
-		return 1;
-
-	return 0;
 }
 
 static void seq_buf_print_bus_devfn(struct seq_buf *buf, struct pci_dev *pdev)

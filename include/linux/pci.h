@@ -664,6 +664,7 @@ struct pci_host_bridge {
 	unsigned int	native_ltr:1;		/* OS may use PCIe LTR */
 	unsigned int	native_dpc:1;		/* OS may use PCIe DPC */
 	unsigned int	native_cxl_error:1;	/* OS may use CXL RAS/Events */
+	unsigned int	native_svc:1;		/* OS may program UIO SVC/VC */
 	unsigned int	preserve_config:1;	/* Preserve FW resource setup */
 	unsigned int	size_windows:1;		/* Enable root bus sizing */
 	unsigned int	msi_domain:1;		/* Bridge wants MSI domain */

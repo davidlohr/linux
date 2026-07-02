@@ -722,6 +722,7 @@ static inline int pci_uio_svc_resource(struct pci_dev *pdev)
 {
 	return -ENODEV;
 }
+
 #endif
 
 #ifdef CONFIG_PCI_TSM
@@ -1060,6 +1061,28 @@ void pci_enable_acs(struct pci_dev *dev);
 int pci_dev_specific_acs_enabled(struct pci_dev *dev, u16 acs_flags);
 int pci_dev_specific_enable_acs(struct pci_dev *dev);
 int pci_dev_specific_disable_acs_redir(struct pci_dev *dev);
+
+/*
+ * Check if a PCI bridge has its ACS redirection bits set to redirect P2P
+ * TLPs upstream via ACS. Returns 1 if the packets will be redirected
+ * upstream, 0 otherwise.
+ */
+static inline int pci_bridge_has_acs_redir(struct pci_dev *pdev)
+{
+	int pos;
+	u16 ctrl;
+
+	pos = pdev->acs_cap;
+	if (!pos)
+		return 0;
+
+	pci_read_config_word(pdev, pos + PCI_ACS_CTRL, &ctrl);
+
+	if (ctrl & (PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_EC))
+		return 1;
+
+	return 0;
+}
 void pci_disable_broken_acs_cap(struct pci_dev *pdev);
 int pcie_failed_link_retrain(struct pci_dev *dev);
 #else

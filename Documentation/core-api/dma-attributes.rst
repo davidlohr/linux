@@ -179,3 +179,28 @@ interface when building their uAPIs, when possible.
 
 It must never be used in an in-kernel driver that only works with
 kernel memory.
+
+DMA_ATTR_UIO
+------------
+
+DMA_ATTR_UIO declares that the device may access the mapping using PCIe
+Unordered IO semantics (PCIe 6.x, sec 6.34). It is annotation only: it
+grants nothing, orders nothing, and waits for nothing. Callers must hold
+a valid, unrevoked pci_uio_route covering (device, range) for the whole
+lifetime of the mapping - dma-debug checks this opportunistically.
+
+The requester driver must quiesce its queues and observe all required
+UIO completions *before* calling dma_unmap_*(). The DMA core never
+fences hardware. This is the standard "stop DMA before unmap" contract;
+UIO merely gives "stopped" a precise hardware definition (all UIO
+completions accounted by DW sum), which remains the driver's to check.
+
+Cache maintenance is governed solely by the presence or absence of
+DMA_ATTR_MMIO: UIO peer mappings may target host-cacheable device
+memory (e.g. CXL HDM-DB regions), for which MMIO semantics would skip
+maintenance the mapping actually needs. Never derive DMA_ATTR_MMIO from
+"the transfer is peer to peer".
+
+Mappings created with DMA_ATTR_UIO must be unmapped with DMA_ATTR_UIO.
+UIO against cacheable system RAM is currently unsupported and warns
+under CONFIG_DMA_API_DEBUG.

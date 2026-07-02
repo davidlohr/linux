@@ -104,6 +104,30 @@
 #define DMA_ATTR_CC_SHARED	(1UL << 13)
 
 /*
+ * DMA_ATTR_UIO - annotation only.
+ *
+ * Declares that the device may access this mapping using PCIe Unordered
+ * IO semantics. Grants nothing, orders nothing, waits for nothing.
+ * Callers must hold a valid pci_uio_route covering the mapped range for
+ * the mapping device.
+ *
+ * The requester driver must quiesce the relevant queues/batches and
+ * observe all required UIO completions BEFORE calling dma_unmap_*().
+ * The DMA core does not fence hardware and never blocks on device
+ * state. This is the standard DMA API contract ("stop DMA before
+ * unmap") - UIO merely gives "stopped" a crisp hardware definition
+ * (all completions observed), which remains the driver's to check.
+ *
+ * Cache maintenance is governed by the presence or absence of
+ * DMA_ATTR_MMIO, never by this attribute: UIO peer mappings may target
+ * host-cacheable device memory (e.g. CXL HDM), for which MMIO semantics
+ * would be wrong.
+ *
+ * Mappings created with DMA_ATTR_UIO must be unmapped with it.
+ */
+#define DMA_ATTR_UIO		(1UL << 14)
+
+/*
  * A dma_addr_t can hold any valid DMA or bus address for the platform.  It can
  * be given to a device to use as a DMA source or target.  It is specific to a
  * given device and there may be a translation between the CPU physical address

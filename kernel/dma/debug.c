@@ -1085,7 +1085,7 @@ static void check_unmap(struct dma_debug_entry *ref)
 #define DMA_ATTR_UNMAP_VALID                                               \
 	(DMA_ATTR_NO_KERNEL_MAPPING | DMA_ATTR_FORCE_CONTIGUOUS |          \
 	 DMA_ATTR_MMIO | DMA_ATTR_REQUIRE_COHERENT | DMA_ATTR_PRIVILEGED | \
-	 DMA_ATTR_CC_SHARED)
+	 DMA_ATTR_CC_SHARED | DMA_ATTR_UIO)
 	if ((ref->attrs & DMA_ATTR_UNMAP_VALID) !=
 	    (entry->attrs & DMA_ATTR_UNMAP_VALID)) {
 		err_printk(ref->dev, entry,
@@ -1258,6 +1258,106 @@ void debug_dma_map_single(struct device *dev, const void *addr,
 }
 EXPORT_SYMBOL(debug_dma_map_single);
 
+/*
+ * Physical ranges for which a validated PCIe UIO route is currently
+ * held, registered by the PCI core (pci_uio_route_get()/put()). A
+ * DMA_ATTR_UIO mapping outside any registered range for the mapping
+ * device means the caller is annotating UIO without holding the route
+ * that makes it legal.
+ */
+struct dma_debug_uio_range {
+	struct list_head list;
+	struct device *dev;
+	phys_addr_t start;
+	size_t len;
+};
+
+static LIST_HEAD(dma_debug_uio_ranges);
+static DEFINE_SPINLOCK(dma_debug_uio_lock);
+
+void dma_debug_uio_range_add(struct device *dev, phys_addr_t start, size_t len)
+{
+	struct dma_debug_uio_range *range;
+	unsigned long flags;
+
+	if (dma_debug_disabled())
+		return;
+
+	range = kzalloc(sizeof(*range), GFP_KERNEL);
+	if (!range)
+		return;
+
+	range->dev = dev;
+	range->start = start;
+	range->len = len;
+
+	spin_lock_irqsave(&dma_debug_uio_lock, flags);
+	list_add(&range->list, &dma_debug_uio_ranges);
+	spin_unlock_irqrestore(&dma_debug_uio_lock, flags);
+}
+EXPORT_SYMBOL_GPL(dma_debug_uio_range_add);
+
+void dma_debug_uio_range_del(struct device *dev, phys_addr_t start, size_t len)
+{
+	struct dma_debug_uio_range *range;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dma_debug_uio_lock, flags);
+	list_for_each_entry(range, &dma_debug_uio_ranges, list) {
+		if (range->dev == dev && range->start == start &&
+		    range->len == len) {
+			list_del(&range->list);
+			kfree(range);
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&dma_debug_uio_lock, flags);
+}
+EXPORT_SYMBOL_GPL(dma_debug_uio_range_del);
+
+static bool dma_debug_uio_covered(struct device *dev, phys_addr_t phys,
+				  size_t size)
+{
+	struct dma_debug_uio_range *range;
+	unsigned long flags;
+	bool covered = false;
+
+	spin_lock_irqsave(&dma_debug_uio_lock, flags);
+	list_for_each_entry(range, &dma_debug_uio_ranges, list) {
+		if (range->dev == dev && phys >= range->start &&
+		    phys + size <= range->start + range->len) {
+			covered = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&dma_debug_uio_lock, flags);
+
+	return covered;
+}
+
+static void check_uio_map(struct device *dev, struct dma_debug_entry *entry,
+			  phys_addr_t phys, size_t size, unsigned long attrs)
+{
+	unsigned long pfn = PHYS_PFN(phys);
+
+	/*
+	 * Encodes the deliberate deferral of host-memory UIO: until an
+	 * IOMMU and cache maintenance story exists for UIO into system
+	 * RAM, UIO mappings must target peer (device) memory only. The
+	 * DMA_ATTR_MMIO branch already reported RAM abuse, do not repeat.
+	 */
+	if (!(attrs & DMA_ATTR_MMIO) &&
+	    pfn_valid(pfn) && !PageReserved(pfn_to_page(pfn)))
+		err_printk(dev, entry,
+			   "DMA_ATTR_UIO mapping of cacheable system RAM [addr=%pa]\n",
+			   &phys);
+
+	if (!dma_debug_uio_covered(dev, phys, size))
+		err_printk(dev, entry,
+			   "DMA_ATTR_UIO mapping without a covering UIO route [addr=%pa] [len=%zu]\n",
+			   &phys, size);
+}
+
 void debug_dma_map_phys(struct device *dev, phys_addr_t phys, size_t size,
 		int direction, dma_addr_t dma_addr, unsigned long attrs)
 {
@@ -1295,6 +1395,9 @@ void debug_dma_map_phys(struct device *dev, phys_addr_t phys, size_t size,
 		if (!PhysHighMem(phys))
 			check_for_illegal_area(dev, phys_to_virt(phys), size);
 	}
+
+	if (attrs & DMA_ATTR_UIO)
+		check_uio_map(dev, entry, phys, size, attrs);
 
 	add_dma_entry(entry);
 }

@@ -11,10 +11,13 @@
 #ifndef _LINUX_PCI_P2PDMA_H
 #define _LINUX_PCI_P2PDMA_H
 
+#include <linux/dma-mapping.h>
 #include <linux/pci.h>
 
 struct block_device;
 struct scatterlist;
+struct pci_uio_route;
+struct pci_uio_route_req;
 
 /**
  * enum p2pdma_provider_type - what kind of memory a provider exposes
@@ -142,15 +145,50 @@ enum pci_p2pdma_map_type {
 /**
  * struct pci_p2pdma_map_info - transfer plan for a provider subrange
  * @type: address-form classification for programming the DMA engine
+ * @xport_flags: transport properties orthogonal to the address form
+ * @uio_route: reference-held UIO route backing PCI_P2PDMA_XPORT_UIO,
+ *	or NULL. The caller owns the reference and must
+ *	pci_uio_route_put() it after the final unmap of mappings
+ *	created under this plan.
  *
  * Produced by pci_p2pdma_map_info(). Unlike the page/map_state path,
  * this interface is range-aware: for interleaved providers eligibility
  * and classification are properties of the queried subrange (which
  * endpoints it decodes to), not of the provider as a whole.
+ *
+ * Address form and transport ordering are orthogonal: UIO is not a new
+ * map type but a transport flag, so existing consumers of the map type
+ * enum never see new states.
  */
 struct pci_p2pdma_map_info {
 	enum pci_p2pdma_map_type type;
+	unsigned int xport_flags;
+#define PCI_P2PDMA_XPORT_UIO	BIT(0)
+	struct pci_uio_route *uio_route;
 };
+
+/**
+ * p2pdma_map_attrs - derive DMA attributes for a peer transfer plan
+ * @info: transfer plan from pci_p2pdma_map_info()
+ * @provider: the provider the plan was computed against
+ *
+ * Centralized so no consumer hand-rolls it wrong: DMA_ATTR_MMIO is a
+ * property of the provider's exposure model (BAR MMIO), never of "the
+ * transfer is P2P" - CXL HDM may be host cacheable and must keep cache
+ * maintenance. DMA_ATTR_UIO reflects a held UIO route only.
+ */
+static inline unsigned long
+p2pdma_map_attrs(const struct pci_p2pdma_map_info *info,
+		 const struct p2pdma_provider *provider)
+{
+	unsigned long attrs = 0;
+
+	if (p2pdma_provider_is_mmio(provider))
+		attrs |= DMA_ATTR_MMIO;
+	if (info->uio_route)
+		attrs |= DMA_ATTR_UIO;
+	return attrs;
+}
 
 #ifdef CONFIG_PCI_P2PDMA
 int pcim_p2pdma_init(struct pci_dev *pdev);
@@ -175,6 +213,7 @@ enum pci_p2pdma_map_type pci_p2pdma_map_type(struct p2pdma_provider *provider,
 					     struct device *dev);
 int pci_p2pdma_map_info(struct p2pdma_provider *provider, struct device *client,
 			phys_addr_t offset, resource_size_t len,
+			const struct pci_uio_route_req *uio_req,
 			struct pci_p2pdma_map_info *info);
 #else /* CONFIG_PCI_P2PDMA */
 static inline int pcim_p2pdma_init(struct pci_dev *pdev)
@@ -245,6 +284,7 @@ pci_p2pdma_map_type(struct p2pdma_provider *provider, struct device *dev)
 static inline int pci_p2pdma_map_info(struct p2pdma_provider *provider,
 				      struct device *client,
 				      phys_addr_t offset, resource_size_t len,
+				      const struct pci_uio_route_req *uio_req,
 				      struct pci_p2pdma_map_info *info)
 {
 	return -EOPNOTSUPP;

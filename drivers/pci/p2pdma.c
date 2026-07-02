@@ -12,6 +12,7 @@
 #include <linux/ctype.h>
 #include <linux/dma-map-ops.h>
 #include <linux/pci-p2pdma.h>
+#include <linux/pci-uio.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/genalloc.h>
@@ -292,6 +293,8 @@ int pcim_p2pdma_init(struct pci_dev *pdev)
 		p2p->mem[i].size = pci_resource_len(pdev, i);
 		p2p->mem[i].bus_offset =
 			pci_bus_address(pdev, i) - pci_resource_start(pdev, i);
+		if (pci_uio_completer_capable(pdev))
+			p2p->mem[i].flags |= P2PDMA_PROVIDER_UIO_COMPLETER;
 	}
 
 	ret = devm_add_action_or_reset(&pdev->dev, pci_p2pdma_release, pdev);
@@ -1126,35 +1129,15 @@ p2pdma_merge_map_type(enum pci_p2pdma_map_type a, enum pci_p2pdma_map_type b)
 	return PCI_P2PDMA_MAP_BUS_ADDR;
 }
 
-/**
- * pci_p2pdma_map_info - classify a peer transfer for a provider subrange
- * @provider: peer memory provider
- * @client: device wishing to do the DMA
- * @offset: offset into the provider's range
- * @len: length of the transfer window
- * @info: returned transfer plan
- *
- * Range-aware variant of pci_p2pdma_map_type(): the classification is
- * computed for [@offset, @offset + @len) of @provider. For providers
- * with a range_validate hook (interleaved CXL regions), the subrange is
- * validated and the result is the worst case across every endpoint the
- * subrange decodes to - an interleaved transfer plan is only as direct
- * as its least direct leg.
- *
- * Returns 0 with @info populated (including the NOT_SUPPORTED
- * classification), or a negative error for an invalid subrange.
- */
-int pci_p2pdma_map_info(struct p2pdma_provider *provider, struct device *client,
-			phys_addr_t offset, resource_size_t len,
-			struct pci_p2pdma_map_info *info)
+static int pci_p2pdma_ordered_info(struct p2pdma_provider *provider,
+				   struct device *client,
+				   phys_addr_t offset, resource_size_t len,
+				   struct pci_p2pdma_map_info *info)
 {
 	enum pci_p2pdma_map_type type;
 	struct p2p_target_set *targets;
 	unsigned int i;
 	int rc, dist;
-
-	if (!len || offset > provider->size || len > provider->size - offset)
-		return -EINVAL;
 
 	if (!provider->range_validate) {
 		info->type = pci_p2pdma_map_type(provider, client);
@@ -1178,8 +1161,85 @@ int pci_p2pdma_map_info(struct p2pdma_provider *provider, struct device *client,
 	}
 	p2p_target_set_put(targets);
 
+	/*
+	 * In-fabric *ordered* P2P to a CXL HDM address is not defined
+	 * transport: switch forwarding of P2P into HDM ranges is a
+	 * UIO-keyed decoder mechanism, not generic memory routing. The
+	 * ordered plan for HDM is host mediated.
+	 */
+	if (provider->type == P2PDMA_PROVIDER_CXL_HDM &&
+	    type == PCI_P2PDMA_MAP_BUS_ADDR)
+		type = PCI_P2PDMA_MAP_THRU_HOST_BRIDGE;
+
 	info->type = type;
 	return 0;
+}
+
+/**
+ * pci_p2pdma_map_info - classify a peer transfer for a provider subrange
+ * @provider: peer memory provider
+ * @client: device wishing to do the DMA
+ * @offset: offset into the provider's range
+ * @len: length of the transfer window
+ * @uio_req: UIO transport request, or NULL for ordered classification
+ * @info: returned transfer plan
+ *
+ * Range-aware variant of pci_p2pdma_map_type(): the classification is
+ * computed for [@offset, @offset + @len) of @provider. For providers
+ * with a range_validate hook (interleaved CXL regions), the subrange is
+ * validated and the result is the worst case across every endpoint the
+ * subrange decodes to - an interleaved transfer plan is only as direct
+ * as its least direct leg.
+ *
+ * UIO policy semantics (see &enum pci_uio_policy): with a NULL @uio_req
+ * or FORBIDDEN, this is a pure address-form classification. REQUIRED
+ * propagates route acquisition failure - no ordered result is offered.
+ * PREFERRED falls back by re-deriving the ordered mapping decision from
+ * scratch; for CXL HDM that legitimately changes @info->type to the
+ * host-mediated form, because the fallback is a different transfer
+ * plan, never an attribute-stripped copy of the UIO plan.
+ *
+ * On success with a UIO route, the caller owns @info->uio_route and
+ * must pci_uio_route_put() it after the final unmap.
+ *
+ * Returns 0 with @info populated (including the NOT_SUPPORTED
+ * classification), or a negative error for an invalid subrange or a
+ * REQUIRED route that cannot be built.
+ */
+int pci_p2pdma_map_info(struct p2pdma_provider *provider, struct device *client,
+			phys_addr_t offset, resource_size_t len,
+			const struct pci_uio_route_req *uio_req,
+			struct pci_p2pdma_map_info *info)
+{
+	int rc;
+
+	info->xport_flags = 0;
+	info->uio_route = NULL;
+
+	if (!len || offset > provider->size || len > provider->size - offset)
+		return -EINVAL;
+
+	if (uio_req && uio_req->policy != PCI_UIO_FORBIDDEN) {
+		struct pci_uio_route *route;
+
+		if (!dev_is_pci(client))
+			return -EINVAL;
+
+		rc = pci_uio_route_get(to_pci_dev(client), provider, offset,
+				       len, uio_req, &route);
+		if (!rc) {
+			info->xport_flags |= PCI_P2PDMA_XPORT_UIO;
+			info->uio_route = route;
+			info->type = route->flags & PCI_UIO_ROUTE_IN_FABRIC ?
+					PCI_P2PDMA_MAP_BUS_ADDR :
+					PCI_P2PDMA_MAP_THRU_HOST_BRIDGE;
+			return 0;
+		}
+		if (uio_req->policy == PCI_UIO_REQUIRED)
+			return rc;
+	}
+
+	return pci_p2pdma_ordered_info(provider, client, offset, len, info);
 }
 EXPORT_SYMBOL_GPL(pci_p2pdma_map_info);
 

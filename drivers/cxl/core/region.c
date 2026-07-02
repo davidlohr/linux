@@ -252,6 +252,22 @@ static void cxl_region_decode_reset(struct cxl_region *cxlr, int count)
 		return;
 
 	/*
+	 * The region's P2P provider dies with the decode: force
+	 * quiesce/revoke of any UIO route terminating at a target
+	 * endpoint before the decoders stop matching addresses.
+	 */
+	if (p->uio) {
+		for (i = 0; i < count && i < p->nr_targets; i++) {
+			struct cxl_memdev *cxlmd =
+				cxled_to_memdev(p->targets[i]);
+
+			if (dev_is_pci(cxlmd->cxlds->dev))
+				pci_uio_route_revoke_dev(
+					to_pci_dev(cxlmd->cxlds->dev));
+		}
+	}
+
+	/*
 	 * Before region teardown attempt to flush, evict any data cached for
 	 * this region, or scream loudly about missing arch / platform support
 	 * for CXL teardown.
@@ -423,6 +439,148 @@ static int cxl_region_uio_validate(struct cxl_region *cxlr)
 	return 0;
 }
 
+/**
+ * cxl_region_p2p_validate - decode a subrange to its P2P target set
+ * @cxlr: committed region
+ * @hpa: host physical start of the subrange
+ * @len: subrange length
+ * @targets: on success, the kmalloc()ed endpoint set (caller frees)
+ *
+ * Validates HPA-range ownership against the committed region, decodes
+ * the interleave to produce the full endpoint target set for the
+ * subrange, and reports the interleave granularity (which clamps the
+ * UIO request boundary: a request straddling an interleave boundary is
+ * forwarded to the start-address owner and Completer Aborted).
+ *
+ * The returned target set holds a reference on every pci_dev (taken
+ * while the region rwsem pins the memdevs); release the set with
+ * p2p_target_set_put().
+ */
+int cxl_region_p2p_validate(struct cxl_region *cxlr, phys_addr_t hpa,
+			    resource_size_t len,
+			    struct p2p_target_set **targets)
+{
+	struct cxl_region_params *p = &cxlr->params;
+	unsigned long pos_map = 0;
+	struct p2p_target_set *tset;
+	unsigned int nr, i, n;
+	u16 eig;
+	u8 eiw;
+
+	lockdep_assert_held(&cxl_rwsem.region);
+
+	if (p->state != CXL_CONFIG_COMMIT || !p->res)
+		return -ENODEV;
+
+	if (!len || hpa < p->res->start || hpa - p->res->start >
+	    resource_size(p->res) - len)
+		return -EINVAL;
+
+	if (ways_to_eiw(p->interleave_ways, &eiw) ||
+	    granularity_to_eig(p->interleave_granularity, &eig))
+		return -ENXIO;
+
+	/* Which interleave positions does [hpa, hpa + len) touch? */
+	if (len >= (resource_size_t)p->interleave_ways *
+		   p->interleave_granularity) {
+		pos_map = GENMASK(p->interleave_ways - 1, 0);
+	} else {
+		u64 addr = ALIGN_DOWN(hpa, p->interleave_granularity);
+
+		for (; addr < hpa + len; addr += p->interleave_granularity) {
+			int pos = cxl_calculate_position(addr - p->res->start,
+							 eiw, eig);
+			if (pos < 0 || pos >= p->nr_targets)
+				return -ENXIO;
+			pos_map |= BIT(pos);
+		}
+	}
+
+	nr = hweight_long(pos_map);
+	tset = kmalloc(struct_size(tset, targets, nr), GFP_KERNEL);
+	if (!tset)
+		return -ENOMEM;
+
+	tset->nr_targets = nr;
+	tset->interleave_granularity = p->interleave_granularity;
+	for (i = 0, n = 0; i < p->nr_targets; i++) {
+		struct cxl_memdev *cxlmd;
+
+		if (!(pos_map & BIT(i)))
+			continue;
+
+		cxlmd = cxled_to_memdev(p->targets[i]);
+		if (!dev_is_pci(cxlmd->cxlds->dev)) {
+			while (n--)
+				pci_dev_put(tset->targets[n]);
+			kfree(tset);
+			return -ENODEV;
+		}
+		/*
+		 * Pin while the region rwsem still pins the memdev: the
+		 * caller consumes the set after this lock drops, when a
+		 * racing teardown could otherwise free the pci_dev.
+		 */
+		tset->targets[n++] =
+			pci_dev_get(to_pci_dev(cxlmd->cxlds->dev));
+	}
+
+	*targets = tset;
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_region_p2p_validate, "CXL");
+
+static int cxl_region_range_validate(struct p2pdma_provider *provider,
+				     struct device *client,
+				     phys_addr_t offset, resource_size_t len,
+				     struct p2p_target_set **targets)
+{
+	struct cxl_region *cxlr = container_of(provider, struct cxl_region,
+					       p2p_provider);
+
+	guard(rwsem_read)(&cxl_rwsem.region);
+	return cxl_region_p2p_validate(cxlr, provider->base + offset, len,
+				       targets);
+}
+
+/**
+ * cxl_region_p2pdma_provider - expose a committed region as peer memory
+ * @cxlr: region to expose
+ *
+ * Returns the region's typed P2PDMA provider: base is the committed
+ * HPA, bus_offset is 0 (peers emit host physical addresses - switch
+ * HDM/FAST decoders route by HPA), and UIO completer capability
+ * reflects the committed 'uio' provisioning. Lifetime is bound to the
+ * region under the usual revocation contract: all consumer references
+ * and DMA mappings must be gone before the region uncommits.
+ */
+struct p2pdma_provider *cxl_region_p2pdma_provider(struct cxl_region *cxlr)
+{
+	struct cxl_region_params *p = &cxlr->params;
+
+	guard(rwsem_read)(&cxl_rwsem.region);
+	if (p->state != CXL_CONFIG_COMMIT)
+		return ERR_PTR(-ENXIO);
+
+	return &cxlr->p2p_provider;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_region_p2pdma_provider, "CXL");
+
+static void cxl_region_p2p_init(struct cxl_region *cxlr)
+{
+	struct cxl_region_params *p = &cxlr->params;
+
+	cxlr->p2p_provider = (struct p2pdma_provider) {
+		.owner = &cxlr->dev,
+		.type = P2PDMA_PROVIDER_CXL_HDM,
+		.base = p->res->start,
+		.size = resource_size(p->res),
+		.bus_offset = 0,
+		.flags = p->uio ? P2PDMA_PROVIDER_UIO_COMPLETER : 0,
+		.range_validate = cxl_region_range_validate,
+	};
+}
+
 static int __commit(struct cxl_region *cxlr)
 {
 	struct cxl_region_params *p = &cxlr->params;
@@ -456,6 +614,7 @@ static int __commit(struct cxl_region *cxlr)
 	if (rc)
 		return rc;
 
+	cxl_region_p2p_init(cxlr);
 	p->state = CXL_CONFIG_COMMIT;
 
 	return 0;

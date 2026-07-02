@@ -11,6 +11,7 @@
 #include <linux/log2.h>
 #include <linux/node.h>
 #include <linux/io.h>
+#include <linux/pci-p2pdma.h>
 #include <linux/pci-uio.h>
 #include <linux/range.h>
 #include <cxl/cxl.h>
@@ -548,6 +549,7 @@ struct cxl_region {
 	struct cxl_pmem_region *cxlr_pmem;
 	unsigned long flags;
 	struct cxl_region_params params;
+	struct p2pdma_provider p2p_provider;
 	struct access_coordinate coord[ACCESS_COORDINATE_MAX];
 	struct notifier_block node_notifier;
 	struct notifier_block adist_notifier;
@@ -983,6 +985,10 @@ bool cxl_endpoint_decoder_reset_detected(struct cxl_port *port);
 int cxl_bi_setup(struct cxl_dev_state *cxlds);
 int cxl_hdm_uio_setup(struct cxl_dev_state *cxlds);
 int cxl_uio_segment_check(struct cxl_memdev *cxlmd);
+struct p2pdma_provider *cxl_region_p2pdma_provider(struct cxl_region *cxlr);
+int cxl_region_p2p_validate(struct cxl_region *cxlr, phys_addr_t hpa,
+			    resource_size_t len,
+			    struct p2p_target_set **targets);
 struct cxl_dport *devm_cxl_add_dport_by_dev(struct cxl_port *port,
 					    struct device *dport_dev);
 

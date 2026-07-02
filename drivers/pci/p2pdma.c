@@ -285,6 +285,9 @@ int pcim_p2pdma_init(struct pci_dev *pdev)
 			continue;
 
 		p2p->mem[i].owner = &pdev->dev;
+		p2p->mem[i].type = P2PDMA_PROVIDER_PCI_BAR_MMIO;
+		p2p->mem[i].base = pci_resource_start(pdev, i);
+		p2p->mem[i].size = pci_resource_len(pdev, i);
 		p2p->mem[i].bus_offset =
 			pci_bus_address(pdev, i) - pci_resource_start(pdev, i);
 	}
@@ -1129,6 +1132,76 @@ enum pci_p2pdma_map_type pci_p2pdma_map_type(struct p2pdma_provider *provider,
 
 	return type;
 }
+
+/* Merge per-target classifications: any worse member dominates */
+static enum pci_p2pdma_map_type
+p2pdma_merge_map_type(enum pci_p2pdma_map_type a, enum pci_p2pdma_map_type b)
+{
+	if (a == PCI_P2PDMA_MAP_NOT_SUPPORTED ||
+	    b == PCI_P2PDMA_MAP_NOT_SUPPORTED)
+		return PCI_P2PDMA_MAP_NOT_SUPPORTED;
+	if (a == PCI_P2PDMA_MAP_THRU_HOST_BRIDGE ||
+	    b == PCI_P2PDMA_MAP_THRU_HOST_BRIDGE)
+		return PCI_P2PDMA_MAP_THRU_HOST_BRIDGE;
+	return PCI_P2PDMA_MAP_BUS_ADDR;
+}
+
+/**
+ * pci_p2pdma_map_info - classify a peer transfer for a provider subrange
+ * @provider: peer memory provider
+ * @client: device wishing to do the DMA
+ * @offset: offset into the provider's range
+ * @len: length of the transfer window
+ * @info: returned transfer plan
+ *
+ * Range-aware variant of pci_p2pdma_map_type(): the classification is
+ * computed for [@offset, @offset + @len) of @provider. For providers
+ * with a range_validate hook (interleaved CXL regions), the subrange is
+ * validated and the result is the worst case across every endpoint the
+ * subrange decodes to - an interleaved transfer plan is only as direct
+ * as its least direct leg.
+ *
+ * Returns 0 with @info populated (including the NOT_SUPPORTED
+ * classification), or a negative error for an invalid subrange.
+ */
+int pci_p2pdma_map_info(struct p2pdma_provider *provider, struct device *client,
+			phys_addr_t offset, resource_size_t len,
+			struct pci_p2pdma_map_info *info)
+{
+	enum pci_p2pdma_map_type type;
+	struct p2p_target_set *targets;
+	unsigned int i;
+	int rc, dist;
+
+	if (!len || offset > provider->size || len > provider->size - offset)
+		return -EINVAL;
+
+	if (!provider->range_validate) {
+		info->type = pci_p2pdma_map_type(provider, client);
+		return 0;
+	}
+
+	if (!dev_is_pci(client))
+		return -EINVAL;
+
+	rc = provider->range_validate(provider, client, offset, len, &targets);
+	if (rc)
+		return rc;
+
+	type = PCI_P2PDMA_MAP_BUS_ADDR;
+	for (i = 0; i < targets->nr_targets; i++) {
+		enum pci_p2pdma_map_type t;
+
+		t = calc_map_type_and_dist(targets->targets[i],
+					   to_pci_dev(client), &dist, false);
+		type = p2pdma_merge_map_type(type, t);
+	}
+	p2p_target_set_put(targets);
+
+	info->type = type;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(pci_p2pdma_map_info);
 
 void __pci_p2pdma_update_state(struct pci_p2pdma_map_state *state,
 		struct device *dev, struct page *page)

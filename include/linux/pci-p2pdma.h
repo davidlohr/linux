@@ -17,16 +17,88 @@ struct block_device;
 struct scatterlist;
 
 /**
+ * enum p2pdma_provider_type - what kind of memory a provider exposes
+ *
+ * @P2PDMA_PROVIDER_PCI_BAR_MMIO: PCI BAR backed MMIO. Never mapped
+ *	cacheable by the CPU; DMA mappings of it carry DMA_ATTR_MMIO.
+ * @P2PDMA_PROVIDER_CXL_HDM: a committed CXL region (SPA decoded,
+ *	potentially CPU cacheable, host managed coherency). Peers emit
+ *	host physical addresses - switch HDM/FAST decoders route by HPA
+ *	- so @bus_offset is always 0 and DMA_ATTR_MMIO is never implied.
+ *
+ * The type determines mapping attribute derivation and consumers' CPU
+ * access rules. It is data, not behavior: everything address-related
+ * remains base + offset.
+ */
+enum p2pdma_provider_type {
+	P2PDMA_PROVIDER_PCI_BAR_MMIO = 0,
+	P2PDMA_PROVIDER_CXL_HDM,
+};
+
+/**
+ * struct p2p_target_set - endpoints a provider subrange decodes to
+ * @nr_targets: number of entries in @targets
+ * @interleave_granularity: bytes of contiguous HPA per target
+ * @targets: every PCI endpoint the range decodes to
+ *
+ * Allocated by a provider's @range_validate hook (single allocation)
+ * with a reference held on every target (the hook resolves them under
+ * its own locking; the caller pins them before that lock drops).
+ * Release with p2p_target_set_put().
+ */
+struct p2p_target_set {
+	unsigned int nr_targets;
+	u32 interleave_granularity;
+	struct pci_dev *targets[] __counted_by(nr_targets);
+};
+
+/**
  * struct p2pdma_provider
  *
- * A p2pdma provider is a range of MMIO address space available to the CPU.
+ * A p2pdma provider is a range of peer memory address space available
+ * to the CPU.
  * @owner: Device to which this provider belongs.
- * @bus_offset: Bus offset for p2p communication.
+ * @type: memory exposure model, see &enum p2pdma_provider_type.
+ * @base: CPU physical base address (BAR start, or region HPA).
+ * @size: size of the provided range in bytes.
+ * @bus_offset: Bus offset for p2p communication (0 for CXL_HDM).
+ * @flags: P2PDMA_PROVIDER_* properties of the whole range.
+ * @range_validate: optional subrange/target-set validation. NULL means
+ *	the whole [base, base + size) range is uniformly valid with a
+ *	single implicit target (the owner). Interleaved CXL regions back
+ *	this with interleave decode; on success *@targets returns the
+ *	kmalloc()ed endpoint set for the queried subrange.
  */
 struct p2pdma_provider {
 	struct device *owner;
+	enum p2pdma_provider_type type;
+	phys_addr_t base;
+	resource_size_t size;
 	u64 bus_offset;
+	unsigned long flags;
+#define P2PDMA_PROVIDER_UIO_COMPLETER	BIT(0)
+	int (*range_validate)(struct p2pdma_provider *provider,
+			      struct device *client,
+			      phys_addr_t offset, resource_size_t len,
+			      struct p2p_target_set **targets);
 };
+
+static inline bool p2pdma_provider_is_mmio(const struct p2pdma_provider *p)
+{
+	return p->type == P2PDMA_PROVIDER_PCI_BAR_MMIO;
+}
+
+/* Drop the target references and free a range_validate() result */
+static inline void p2p_target_set_put(struct p2p_target_set *tset)
+{
+	unsigned int i;
+
+	if (!tset)
+		return;
+	for (i = 0; i < tset->nr_targets; i++)
+		pci_dev_put(tset->targets[i]);
+	kfree(tset);
+}
 
 enum pci_p2pdma_map_type {
 	/*
@@ -67,6 +139,19 @@ enum pci_p2pdma_map_type {
 	PCI_P2PDMA_MAP_THRU_HOST_BRIDGE,
 };
 
+/**
+ * struct pci_p2pdma_map_info - transfer plan for a provider subrange
+ * @type: address-form classification for programming the DMA engine
+ *
+ * Produced by pci_p2pdma_map_info(). Unlike the page/map_state path,
+ * this interface is range-aware: for interleaved providers eligibility
+ * and classification are properties of the queried subrange (which
+ * endpoints it decodes to), not of the provider as a whole.
+ */
+struct pci_p2pdma_map_info {
+	enum pci_p2pdma_map_type type;
+};
+
 #ifdef CONFIG_PCI_P2PDMA
 int pcim_p2pdma_init(struct pci_dev *pdev);
 struct p2pdma_provider *pcim_p2pdma_provider(struct pci_dev *pdev, int bar);
@@ -88,6 +173,9 @@ ssize_t pci_p2pdma_enable_show(char *page, struct pci_dev *p2p_dev,
 			       bool use_p2pdma);
 enum pci_p2pdma_map_type pci_p2pdma_map_type(struct p2pdma_provider *provider,
 					     struct device *dev);
+int pci_p2pdma_map_info(struct p2pdma_provider *provider, struct device *client,
+			phys_addr_t offset, resource_size_t len,
+			struct pci_p2pdma_map_info *info);
 #else /* CONFIG_PCI_P2PDMA */
 static inline int pcim_p2pdma_init(struct pci_dev *pdev)
 {
@@ -153,6 +241,13 @@ static inline enum pci_p2pdma_map_type
 pci_p2pdma_map_type(struct p2pdma_provider *provider, struct device *dev)
 {
 	return PCI_P2PDMA_MAP_NOT_SUPPORTED;
+}
+static inline int pci_p2pdma_map_info(struct p2pdma_provider *provider,
+				      struct device *client,
+				      phys_addr_t offset, resource_size_t len,
+				      struct pci_p2pdma_map_info *info)
+{
+	return -EOPNOTSUPP;
 }
 #endif /* CONFIG_PCI_P2PDMA */
 

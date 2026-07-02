@@ -226,6 +226,21 @@ config PCI_P2PDMA
 
 	  If unsure, say N.
 
+config PCI_UIO
+	bool "PCIe Unordered IO (UIO) support"
+	depends on PCIEPORTBUS
+	help
+	  Enables discovery and transport management for PCIe Unordered IO
+	  (UIO, PCIe 6.x sec 6.34): capability enumeration (Device 3 and
+	  Streamlined Virtual Channel capabilities), validated and revocable
+	  UIO routes between a requester and a peer memory provider, and
+	  UIO virtual channel configuration. Requires flit-mode capable
+	  hardware end-to-end. This is a transport facility used by
+	  peer-to-peer DMA aware subsystems (e.g. CXL Direct P2P to HDM);
+	  it is unrelated to the Userspace I/O driver framework (UIO_*).
+
+	  If unsure, say N.
+
 config PCI_LABEL
 	def_bool y if (DMI || ACPI)
 	select NLS

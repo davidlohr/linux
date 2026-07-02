@@ -579,6 +579,13 @@ struct pci_dev {
 #endif
 	u16		acs_cap;	/* ACS Capability offset */
 	u16		acs_capabilities; /* ACS Capabilities */
+	u16		dev3_cap;	/* Device 3 Extended Capability offset */
+#ifdef CONFIG_PCI_UIO
+	u16		svc_cap;	/* Streamlined VC Capability offset */
+	unsigned int	uio_req_capable:1;  /* UIO Mem RdWr Requester Supported */
+	unsigned int	uio_cpl_capable:1;  /* UIO Mem RdWr Completer Supported */
+	unsigned int	uio_req_enabled:1;  /* UIO Requester Enable (route owned) */
+#endif
 	u8		supported_speeds; /* Supported Link Speeds Vector */
 	phys_addr_t	rom;		/* Physical address if not from BAR */
 	size_t		romlen;		/* Length if not from BAR */

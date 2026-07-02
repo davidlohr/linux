@@ -713,6 +713,17 @@ static inline void pci_ide_init_host_bridge(struct pci_host_bridge *hb) { }
 static inline void pci_ide_destroy(struct pci_dev *dev) { }
 #endif
 
+#ifdef CONFIG_PCI_UIO
+void pci_uio_init(struct pci_dev *dev);
+int pci_uio_svc_resource(struct pci_dev *pdev);
+#else
+static inline void pci_uio_init(struct pci_dev *dev) { }
+static inline int pci_uio_svc_resource(struct pci_dev *pdev)
+{
+	return -ENODEV;
+}
+#endif
+
 #ifdef CONFIG_PCI_TSM
 void pci_tsm_init(struct pci_dev *pdev);
 void pci_tsm_destroy(struct pci_dev *pdev);

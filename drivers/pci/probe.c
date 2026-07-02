@@ -2324,6 +2324,7 @@ static void pci_dev3_init(struct pci_dev *pdev)
 
 	if (!cap)
 		return;
+	pdev->dev3_cap = cap;
 	pci_read_config_dword(pdev, cap + PCI_DEV3_STA, &val);
 	pdev->fm_enabled = !!(val & PCI_DEV3_STA_SEGMENT);
 }
@@ -2673,6 +2674,7 @@ static void pci_init_capabilities(struct pci_dev *dev)
 	pci_tph_init(dev);		/* TLP Processing Hints */
 	pci_rebar_init(dev);		/* Resizable BAR */
 	pci_dev3_init(dev);		/* Device 3 capabilities */
+	pci_uio_init(dev);		/* Unordered IO */
 	pci_ide_init(dev);		/* Link Integrity and Data Encryption */
 
 	pcie_report_downtraining(dev);

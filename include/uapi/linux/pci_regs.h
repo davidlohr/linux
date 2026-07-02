@@ -763,7 +763,8 @@
 #define PCI_EXT_CAP_ID_DEV3	0x2F	/* Device 3 Capability/Control/Status */
 #define PCI_EXT_CAP_ID_IDE	0x30    /* Integrity and Data Encryption */
 #define PCI_EXT_CAP_ID_PL_64GT	0x31	/* Physical Layer 64.0 GT/s */
-#define PCI_EXT_CAP_ID_MAX	PCI_EXT_CAP_ID_PL_64GT
+#define PCI_EXT_CAP_ID_SVC	0x35	/* Streamlined Virtual Channel */
+#define PCI_EXT_CAP_ID_MAX	PCI_EXT_CAP_ID_SVC
 
 #define PCI_EXT_CAP_DSN_SIZEOF	12
 #define PCI_EXT_CAP_MCAST_ENDPOINT_SIZEOF 40
@@ -1254,7 +1255,13 @@
 
 /* Device 3 Extended Capability */
 #define PCI_DEV3_CAP		0x04	/* Device 3 Capabilities Register */
+#define  PCI_DEV3_CAP_14BIT_TAG_CPL	0x00000002 /* 14-Bit Tag Completer Supported */
+#define  PCI_DEV3_CAP_14BIT_TAG_REQ	0x00000004 /* 14-Bit Tag Requester Supported */
+#define  PCI_DEV3_CAP_UIO_MEM_CPL	0x00000400 /* UIO Mem RdWr Completer Supported */
+#define  PCI_DEV3_CAP_UIO_MEM_REQ	0x00000800 /* UIO Mem RdWr Requester Supported */
 #define PCI_DEV3_CTL		0x08	/* Device 3 Control Register */
+#define  PCI_DEV3_CTL_UIO_REQ_EN	0x00000080 /* UIO Mem RdWr Requester Enable */
+#define  PCI_DEV3_CTL_UIO_256B_DIS	0x00000100 /* UIO Request 256B Boundary Disable */
 #define PCI_DEV3_STA		0x0c	/* Device 3 Status Register */
 #define  PCI_DEV3_STA_SEGMENT	0x8	/* Segment Captured (end-to-end flit-mode detected) */
 
@@ -1337,6 +1344,29 @@
 /* IDE Address Association Register 3 is "Memory Base Upper" */
 #define  PCI_IDE_SEL_ADDR_3(x)		(28 + (x) * PCI_IDE_SEL_ADDR_BLOCK_SIZE)
 #define PCI_IDE_SEL_BLOCK_SIZE(nr_assoc)  (20 + PCI_IDE_SEL_ADDR_BLOCK_SIZE * (nr_assoc))
+
+/* Streamlined Virtual Channel Extended Capability */
+#define PCI_SVC_PORT_CAP1	0x04	/* SVC Port Capability 1 */
+#define  PCI_SVC_PORT_CAP1_EVCC		0x00000007 /* SVC Extended VC Count */
+#define PCI_SVC_PORT_CAP2	0x08	/* SVC Port Capability 2 (RsvdP) */
+#define PCI_SVC_PORT_CTRL	0x0c	/* SVC Port Control */
+#define  PCI_SVC_PORT_CTRL_VC_EN_COMPLETED 0x00000001 /* VC Enablement Completed */
+#define PCI_SVC_PORT_STATUS	0x10	/* SVC Port Status */
+#define  PCI_SVC_PORT_STATUS_USE_VC_MFVC 0x00000001 /* Use VC/MFVC (RW1C) */
+#define PCI_SVC_RES_CAP(n)	(0x14 + (n) * 0x0c) /* SVC Resource Capability */
+#define  PCI_SVC_RES_CAP_PROTOCOLS	0x00000f00 /* SVC VC Protocols Supported */
+#define   PCI_SVC_PROTOCOL_NON_UIO	0x1	/* restricted non-UIO use only */
+#define   PCI_SVC_PROTOCOL_UIO		0x2	/* UIO use only */
+#define   PCI_SVC_PROTOCOL_UIO_OR_NON	0x3	/* UIO or restricted non-UIO */
+#define  PCI_SVC_RES_CAP_VC_ID		0x00007000 /* VC ID */
+#define PCI_SVC_RES_CTRL(n)	(0x18 + (n) * 0x0c) /* SVC Resource Control */
+#define  PCI_SVC_RES_CTRL_TCVC_MAP	0x000000ff /* TC/VC Map */
+#define  PCI_SVC_RES_CTRL_PROTOCOL	0x00000f00 /* VC Protocol Selected */
+#define  PCI_SVC_RES_CTRL_SFCUL		0x38000000 /* Shared FC Usage Limit */
+#define  PCI_SVC_RES_CTRL_SFCUL_EN	0x40000000 /* Shared FC Usage Limit Enable */
+#define  PCI_SVC_RES_CTRL_VC_ENABLE	0x80000000 /* VC Enable */
+#define PCI_SVC_RES_STATUS(n)	(0x1c + (n) * 0x0c) /* SVC Resource Status */
+#define  PCI_SVC_RES_STATUS_NEGO_PENDING 0x00000002 /* VC Negotiation Pending */
 
 /*
  * Compute Express Link (CXL r4.0, sec 8.1)

@@ -212,6 +212,17 @@ config CXL_REGION
 
 	  If unsure say 'y'
 
+config CXL_UIO_TEST
+	bool "CXL: PCIe Unordered IO route test consumer (TEST)"
+	depends on CXL_REGION && PCI_UIO && DEBUG_FS
+	help
+	  Debugfs driven test consumer that exercises PCIe UIO route
+	  acquisition, transfer plan classification and DMA mapping
+	  against committed CXL regions. Purely a validation vehicle
+	  for emulated (QEMU) UIO topologies.
+
+	  If unsure say 'n'
+
 config CXL_REGION_INVALIDATION_TEST
 	bool "CXL: Region Cache Management Bypass (TEST)"
 	depends on CXL_REGION

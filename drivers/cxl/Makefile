@@ -19,3 +19,6 @@ cxl_acpi-y := acpi.o
 cxl_pmem-y := pmem.o security.o
 cxl_mem-y := mem.o
 cxl_pci-y := pci.o
+
+obj-$(CONFIG_CXL_UIO_TEST) += cxl_uio_test.o
+cxl_uio_test-y := uio_test.o

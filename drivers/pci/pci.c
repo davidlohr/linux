@@ -34,6 +34,7 @@
 #include <linux/aer.h>
 #include <linux/bitfield.h>
 #include <linux/suspend.h>
+#include <linux/pci-uio.h>
 #include "pci.h"
 
 DEFINE_MUTEX(pci_slot_mutex);
@@ -5050,6 +5051,16 @@ static void pci_dev_save_and_disable(struct pci_dev *dev)
 		err_handler->reset_prepare(dev);
 	else if (dev->driver)
 		pci_warn(dev, "resetting");
+
+	/*
+	 * Reset revokes UIO transport: FLR clears the DevCtl3 UIO
+	 * Requester Enable (it is not on the FLR exemption list, unlike
+	 * SVC state), and the Command register clear below drops Bus
+	 * Master, either of which silently kills emission permission.
+	 * Make the revocation explicit and ordered while the device is
+	 * still coherent.
+	 */
+	pci_uio_route_revoke_dev(dev);
 
 	/*
 	 * Wake-up device prior to save.  PM registers default to D0 after

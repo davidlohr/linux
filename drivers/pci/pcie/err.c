@@ -233,6 +233,13 @@ pci_ers_result_t pcie_do_recovery(struct pci_dev *dev,
 	else
 		bridge = pci_upstream_bridge(dev);
 
+	/*
+	 * Error containment invalidates UIO transport below the
+	 * recovering bridge; force quiesce/revoke before any reset so
+	 * requesters stop counting completions that will never arrive.
+	 */
+	pci_uio_route_revoke_subtree(bridge);
+
 	pci_walk_bridge(bridge, pci_pm_runtime_get_sync, NULL);
 
 	pci_dbg(bridge, "broadcast error_detected message\n");

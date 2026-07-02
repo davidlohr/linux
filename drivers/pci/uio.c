@@ -764,6 +764,28 @@ static void pci_uio_route_drop_roles(struct pci_uio_route *route,
 				route->len);
 }
 
+static void pci_uio_route_revoke_locked(struct pci_uio_route *route)
+{
+	struct pci_host_bridge *bridge =
+		pci_find_host_bridge(route->requester->bus);
+
+	lockdep_assert_held(&pci_uio_lock);
+
+	if (route->revoked)
+		return;
+
+	route->generation++;
+	WRITE_ONCE(route->revoked, true);
+
+	if (route->ops && route->ops->quiesce)
+		route->ops->quiesce(route, route->ops_priv);
+
+	pci_uio_route_drop_roles(route, pci_uio_vc_ownership(bridge));
+
+	if (route->ops && route->ops->revoke)
+		route->ops->revoke(route, route->ops_priv);
+}
+
 /**
  * pci_uio_route_get - validate and commit a UIO transport binding
  * @requester: device that will emit UIO requests
@@ -1021,6 +1043,15 @@ int pci_uio_route_get(struct pci_dev *requester,
 	 * a registration that does not exist yet and never retry.
 	 */
 	dma_debug_uio_range_add(&requester->dev, provider->base + offset, len);
+	/*
+	 * A removal that ran before this route became list-visible could
+	 * not have revoked it; re-check now that it can.
+	 */
+	for (i = 0; i < r->nr_targets; i++)
+		if (pci_dev_is_disconnected(r->targets[i]))
+			break;
+	if (i < r->nr_targets || pci_dev_is_disconnected(requester))
+		pci_uio_route_revoke_locked(r);
 	mutex_unlock(&pci_uio_lock);
 
 	p2p_target_set_put(tset);
@@ -1112,6 +1143,93 @@ void pci_uio_route_put(struct pci_uio_route *route)
 	mutex_unlock(&pci_uio_lock);
 }
 EXPORT_SYMBOL_GPL(pci_uio_route_put);
+
+static bool pci_uio_route_involves(struct pci_uio_route *route,
+				   struct pci_dev *pdev)
+{
+	unsigned int i;
+
+	if (route->requester == pdev)
+		return true;
+	for (i = 0; i < route->nr_hops; i++)
+		if (route->hops[i] == pdev)
+			return true;
+	for (i = 0; i < route->nr_targets; i++)
+		if (route->targets[i] == pdev)
+			return true;
+	return false;
+}
+
+/**
+ * pci_uio_route_revoke_dev - kill every route involving a device
+ * @pdev: device being reset, contained or removed
+ *
+ * Fabric events (DPC, AER recovery, FLR, hot remove) enter here. Marks
+ * every route traversing @pdev revoked, bumps generations, invokes the
+ * holder's quiesce+revoke ops and drops the roles no surviving route
+ * needs. References drain via pci_uio_route_put().
+ */
+void pci_uio_route_revoke_dev(struct pci_dev *pdev)
+{
+	struct pci_uio_route *route;
+
+	if (list_empty(&pci_uio_routes))
+		return;
+
+	mutex_lock(&pci_uio_lock);
+	list_for_each_entry(route, &pci_uio_routes, node)
+		if (pci_uio_route_involves(route, pdev))
+			pci_uio_route_revoke_locked(route);
+	mutex_unlock(&pci_uio_lock);
+}
+EXPORT_SYMBOL_GPL(pci_uio_route_revoke_dev);
+
+static int pci_uio_revoke_walk(struct pci_dev *pdev, void *unused)
+{
+	struct pci_uio_route *route;
+
+	list_for_each_entry(route, &pci_uio_routes, node)
+		if (pci_uio_route_involves(route, pdev))
+			pci_uio_route_revoke_locked(route);
+	return 0;
+}
+
+/**
+ * pci_uio_destroy_dev - final device teardown, reap per-device state
+ * @pdev: device being destroyed
+ *
+ * Distinct from revocation: FLR/reset revoke routes but the device
+ * survives and its enable-count state stays reusable. Only final
+ * destruction reaps the state entry; every route involving @pdev was
+ * revoked (counts driven to zero) at pci_stop_dev() time.
+ */
+void pci_uio_destroy_dev(struct pci_dev *pdev)
+{
+	struct pci_uio_dev_state *state;
+
+	state = xa_erase(&pci_uio_dev_states, (unsigned long)pdev);
+	kfree(state);
+}
+
+/**
+ * pci_uio_route_revoke_subtree - kill routes touching a bus subtree
+ * @bridge: bridge whose subordinate hierarchy is affected
+ *
+ * Error containment (DPC/AER recovery) affects everything below the
+ * recovering bridge, including routes that never traverse the bridge
+ * itself.
+ */
+void pci_uio_route_revoke_subtree(struct pci_dev *bridge)
+{
+	if (list_empty(&pci_uio_routes))
+		return;
+
+	mutex_lock(&pci_uio_lock);
+	pci_uio_revoke_walk(bridge, NULL);
+	if (bridge->subordinate)
+		pci_walk_bus(bridge->subordinate, pci_uio_revoke_walk, NULL);
+	mutex_unlock(&pci_uio_lock);
+}
 
 /* Diagnostics only, never a production control surface */
 static int pci_uio_capabilities_show(struct seq_file *m, void *unused)

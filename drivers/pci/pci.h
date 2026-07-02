@@ -716,13 +716,16 @@ static inline void pci_ide_destroy(struct pci_dev *dev) { }
 #ifdef CONFIG_PCI_UIO
 void pci_uio_init(struct pci_dev *dev);
 int pci_uio_svc_resource(struct pci_dev *pdev);
+void pci_uio_route_revoke_subtree(struct pci_dev *bridge);
+void pci_uio_destroy_dev(struct pci_dev *pdev);
 #else
 static inline void pci_uio_init(struct pci_dev *dev) { }
 static inline int pci_uio_svc_resource(struct pci_dev *pdev)
 {
 	return -ENODEV;
 }
-
+static inline void pci_uio_route_revoke_subtree(struct pci_dev *bridge) { }
+static inline void pci_uio_destroy_dev(struct pci_dev *pdev) { }
 #endif
 
 #ifdef CONFIG_PCI_TSM

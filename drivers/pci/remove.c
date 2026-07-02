@@ -5,6 +5,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 
+#include <linux/pci-uio.h>
 #include "pci.h"
 
 static void pci_free_resources(struct pci_dev *dev)
@@ -23,6 +24,9 @@ static void pci_stop_dev(struct pci_dev *dev)
 
 	if (!pci_dev_test_and_clear_added(dev))
 		return;
+
+	/* Any UIO transport involving this device is now dead */
+	pci_uio_route_revoke_dev(dev);
 
 	device_release_driver(&dev->dev);
 	pci_proc_detach_device(dev);
@@ -51,6 +55,7 @@ static void pci_destroy_dev(struct pci_dev *dev)
 
 	pci_doe_destroy(dev);
 	pci_ide_destroy(dev);
+	pci_uio_destroy_dev(dev);
 	pcie_aspm_exit_link_state(dev);
 	pci_bridge_d3_update(dev);
 	pci_free_resources(dev);

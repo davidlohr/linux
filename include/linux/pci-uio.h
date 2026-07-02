@@ -177,6 +177,8 @@ bool pci_uio_routing_capable(struct pci_dev *pdev);
 
 enum pci_uio_vc_owner pci_uio_vc_ownership(struct pci_host_bridge *bridge);
 
+void pci_uio_route_revoke_dev(struct pci_dev *pdev);
+
 int pci_uio_route_get(struct pci_dev *requester,
 		      struct p2pdma_provider *provider,
 		      phys_addr_t offset, resource_size_t len,
@@ -209,6 +211,10 @@ static inline enum pci_uio_vc_owner
 pci_uio_vc_ownership(struct pci_host_bridge *bridge)
 {
 	return PCI_UIO_VC_OWNER_NONE;
+}
+
+static inline void pci_uio_route_revoke_dev(struct pci_dev *pdev)
+{
 }
 
 static inline int pci_uio_route_get(struct pci_dev *requester,

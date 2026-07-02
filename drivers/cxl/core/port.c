@@ -247,6 +247,34 @@ static ssize_t bi_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(bi);
 
+static ssize_t uio_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct cxl_endpoint_decoder *cxled = to_cxl_endpoint_decoder(dev);
+	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+	struct cxl_dev_state *cxlds = cxlmd->cxlds;
+
+	guard(rwsem_read)(&cxl_rwsem.region);
+	return sysfs_emit(buf, "%d\n", cxlds->uio && cxled->cxld.region &&
+			  cxled->cxld.region->params.uio);
+}
+static DEVICE_ATTR_RO(uio);
+
+/*
+ * Root decoder UIO target eligibility: the window must use Standard
+ * Modulo interleave arithmetic (XOR windows cannot serve UIO Direct
+ * P2P) and permit HDM-DB.
+ */
+static ssize_t cap_uio_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct cxl_root_decoder *cxlrd = to_cxl_root_decoder(dev);
+
+	return sysfs_emit(buf, "%d\n", !cxlrd->ops.hpa_to_spa &&
+			  cxl_root_decoder_is_bi(cxlrd));
+}
+static DEVICE_ATTR_RO(cap_uio);
+
 static ssize_t dpa_resource_show(struct device *dev, struct device_attribute *attr,
 			    char *buf)
 {
@@ -344,6 +372,7 @@ static struct attribute *cxl_decoder_root_attrs[] = {
 	&dev_attr_cap_type2.attr,
 	&dev_attr_cap_type3.attr,
 	&dev_attr_cap_bi.attr,
+	&dev_attr_cap_uio.attr,
 	&dev_attr_target_list.attr,
 	&dev_attr_qos_class.attr,
 	SET_CXL_REGION_ATTR(create_pmem_region)
@@ -426,6 +455,7 @@ static struct attribute *cxl_decoder_endpoint_attrs[] = {
 	&dev_attr_target_type.attr,
 	&dev_attr_mode.attr,
 	&dev_attr_bi.attr,
+	&dev_attr_uio.attr,
 	&dev_attr_dpa_size.attr,
 	&dev_attr_dpa_resource.attr,
 	SET_CXL_REGION_ATTR(region)

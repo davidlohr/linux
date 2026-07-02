@@ -11,6 +11,7 @@
 #include <linux/log2.h>
 #include <linux/node.h>
 #include <linux/io.h>
+#include <linux/pci-uio.h>
 #include <linux/range.h>
 #include <cxl/cxl.h>
 
@@ -57,6 +58,8 @@ extern const struct nvdimm_security_ops *cxl_security_ops;
 #define   CXL_HDM_DECODER_INTERLEAVE_14_12 BIT(9)
 #define   CXL_HDM_DECODER_INTERLEAVE_3_6_12_WAY BIT(11)
 #define   CXL_HDM_DECODER_INTERLEAVE_16_WAY BIT(12)
+#define   CXL_HDM_DECODER_UIO BIT(13)
+#define   CXL_HDM_DECODER_UIO_DECODER_COUNT_MASK GENMASK(19, 16)
 #define   CXL_HDM_DECODER_SUPPORTED_COHERENCY_MASK GENMASK(22, 21)
 #define     CXL_HDM_DECODER_COHERENCY_UNKNOWN 0x0
 #define     CXL_HDM_DECODER_COHERENCY_DEV 0x1
@@ -77,6 +80,10 @@ extern const struct nvdimm_security_ops *cxl_security_ops;
 #define   CXL_HDM_DECODER0_CTRL_COMMIT_ERROR BIT(11)
 #define   CXL_HDM_DECODER0_CTRL_HOSTONLY BIT(12)
 #define   CXL_HDM_DECODER0_CTRL_BI BIT(13)
+#define   CXL_HDM_DECODER0_CTRL_UIO BIT(14)
+#define   CXL_HDM_DECODER0_CTRL_UIG_MASK GENMASK(19, 16)
+#define   CXL_HDM_DECODER0_CTRL_UIW_MASK GENMASK(23, 20)
+#define   CXL_HDM_DECODER0_CTRL_ISP_MASK GENMASK(27, 24)
 #define CXL_HDM_DECODER0_TL_LOW(i) (0x20 * (i) + 0x24)
 #define CXL_HDM_DECODER0_TL_HIGH(i) (0x20 * (i) + 0x28)
 #define CXL_HDM_DECODER0_SKIP_LOW(i) CXL_HDM_DECODER0_TL_LOW(i)
@@ -388,6 +395,17 @@ struct cxl_endpoint_decoder {
  */
 struct cxl_switch_decoder {
 	struct cxl_decoder cxld;
+	/*
+	 * UIO Direct P2P reverse-decode state (CXL r4.0 Table 8-123,
+	 * sec 9.16.1.1): the aggregate interleave applied by decode
+	 * stages upstream of this port, and this port's position in
+	 * that upstream set. Programmed with the decoder UIO bit so
+	 * the component can tell whether a UIO target address belongs
+	 * below it or to a peer. Encoded (eig/eiw) values.
+	 */
+	u16 uio_uig;
+	u8 uio_uiw;
+	u8 uio_isp;
 	int nr_targets;
 	struct cxl_dport *target[];
 };
@@ -469,6 +487,8 @@ struct cxl_region_params {
 	struct cxl_endpoint_decoder *targets[CXL_DECODER_MAX_INTERLEAVE];
 	int nr_targets;
 	resource_size_t cache_size;
+	bool uio;
+	enum pci_uio_policy uio_policy;
 };
 
 /*
@@ -961,6 +981,8 @@ void cxl_coordinates_combine(struct access_coordinate *out,
 
 bool cxl_endpoint_decoder_reset_detected(struct cxl_port *port);
 int cxl_bi_setup(struct cxl_dev_state *cxlds);
+int cxl_hdm_uio_setup(struct cxl_dev_state *cxlds);
+int cxl_uio_segment_check(struct cxl_memdev *cxlmd);
 struct cxl_dport *devm_cxl_add_dport_by_dev(struct cxl_port *port,
 					    struct device *dport_dev);
 

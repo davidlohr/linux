@@ -372,6 +372,57 @@ static int queue_reset(struct cxl_region *cxlr)
 	return 0;
 }
 
+/*
+ * Commit-time gate for UIO Direct P2P eligibility (CXL r4.0 sec 9.16):
+ * every interleave target must be a BI+UIO capable HDM-DB endpoint,
+ * the interleave arrangement must be a {1,2,4,8,16}-way Standard
+ * Modulo decode (3/6/12-way and XOR arithmetic are ineligible), and
+ * each target's uplink segment must be UIO routable - the latter as a
+ * requester-independent fail-fast convenience; pci_uio_route_get()
+ * remains the authoritative gate.
+ */
+static int cxl_region_uio_validate(struct cxl_region *cxlr)
+{
+	struct cxl_region_params *p = &cxlr->params;
+	int i, rc;
+
+	if (!p->uio)
+		return 0;
+
+	if (cxlr->type != CXL_DECODER_DEVMEM ||
+	    !cxl_root_decoder_is_bi(cxlr->cxlrd)) {
+		dev_dbg(&cxlr->dev, "UIO requires an HDM-DB region\n");
+		return -EOPNOTSUPP;
+	}
+
+	if (cxlr->cxlrd->ops.hpa_to_spa) {
+		dev_dbg(&cxlr->dev, "UIO requires Standard Modulo decode\n");
+		return -EOPNOTSUPP;
+	}
+
+	if (!is_power_of_2(p->interleave_ways) || p->interleave_ways > 16) {
+		dev_dbg(&cxlr->dev, "UIO forbids %d-way interleave\n",
+			p->interleave_ways);
+		return -EOPNOTSUPP;
+	}
+
+	for (i = 0; i < p->nr_targets; i++) {
+		struct cxl_memdev *cxlmd = cxled_to_memdev(p->targets[i]);
+
+		if (!cxlmd->cxlds->bi || !cxlmd->cxlds->uio) {
+			dev_dbg(&cxlr->dev, "%s: not a UIO Direct P2P target\n",
+				dev_name(&cxlmd->dev));
+			return -EOPNOTSUPP;
+		}
+
+		rc = cxl_uio_segment_check(cxlmd);
+		if (rc)
+			return rc;
+	}
+
+	return 0;
+}
+
 static int __commit(struct cxl_region *cxlr)
 {
 	struct cxl_region_params *p = &cxlr->params;
@@ -388,6 +439,10 @@ static int __commit(struct cxl_region *cxlr)
 	/* Not ready to commit? */
 	if (p->state < CXL_CONFIG_ACTIVE)
 		return -ENXIO;
+
+	rc = cxl_region_uio_validate(cxlr);
+	if (rc)
+		return rc;
 
 	/*
 	 * Invalidate caches before region setup to drop any speculative
@@ -614,6 +669,110 @@ static ssize_t interleave_granularity_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(interleave_granularity);
 
+static ssize_t uio_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct cxl_region *cxlr = to_cxl_region(dev);
+	struct cxl_region_params *p = &cxlr->params;
+	ssize_t rc;
+
+	ACQUIRE(rwsem_read_intr, rwsem)(&cxl_rwsem.region);
+	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &rwsem)))
+		return rc;
+	return sysfs_emit(buf, "%d\n", p->uio);
+}
+
+static ssize_t uio_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t len)
+{
+	struct cxl_region *cxlr = to_cxl_region(dev);
+	struct cxl_region_params *p = &cxlr->params;
+	bool uio;
+	ssize_t rc;
+
+	rc = kstrtobool(buf, &uio);
+	if (rc)
+		return rc;
+
+	ACQUIRE(rwsem_write_kill, rwsem)(&cxl_rwsem.region);
+	if ((rc = ACQUIRE_ERR(rwsem_write_kill, &rwsem)))
+		return rc;
+
+	/*
+	 * Both COMMIT and RESET_PENDING count as committed here: the
+	 * teardown accounting (uio_decoders_committed) keys off p->uio,
+	 * which must not change once decoders were committed with it.
+	 */
+	if (p->state > CXL_CONFIG_ACTIVE)
+		return -EBUSY;
+
+	if (uio) {
+		/*
+		 * Coherent UIO Direct P2P requires HDM-DB: without
+		 * Back-Invalidate there is no mechanism to resolve a
+		 * coherence conflict on a device-to-device access.
+		 * Scoping rule, not structural: relaxations for
+		 * explicitly non-coherent uses need no API change.
+		 */
+		if (cxlr->type != CXL_DECODER_DEVMEM)
+			return -EOPNOTSUPP;
+		/*
+		 * UIO P2P targets require Standard Modulo interleave
+		 * arithmetic; XOR interleaved windows are ineligible.
+		 */
+		if (cxlr->cxlrd->ops.hpa_to_spa)
+			return -EOPNOTSUPP;
+	}
+
+	p->uio = uio;
+	return len;
+}
+static DEVICE_ATTR_RW(uio);
+
+static const char * const cxl_uio_policies[] = {
+	[PCI_UIO_FORBIDDEN] = "forbidden",
+	[PCI_UIO_PREFERRED] = "preferred",
+	[PCI_UIO_REQUIRED] = "required",
+};
+
+static ssize_t uio_policy_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct cxl_region *cxlr = to_cxl_region(dev);
+	struct cxl_region_params *p = &cxlr->params;
+	ssize_t rc;
+
+	ACQUIRE(rwsem_read_intr, rwsem)(&cxl_rwsem.region);
+	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &rwsem)))
+		return rc;
+	return sysfs_emit(buf, "%s\n", cxl_uio_policies[p->uio_policy]);
+}
+
+static ssize_t uio_policy_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct cxl_region *cxlr = to_cxl_region(dev);
+	struct cxl_region_params *p = &cxlr->params;
+	ssize_t rc;
+	int policy;
+
+	policy = sysfs_match_string(cxl_uio_policies, buf);
+	if (policy < 0)
+		return policy;
+
+	ACQUIRE(rwsem_write_kill, rwsem)(&cxl_rwsem.region);
+	if ((rc = ACQUIRE_ERR(rwsem_write_kill, &rwsem)))
+		return rc;
+
+	if (p->state > CXL_CONFIG_ACTIVE)
+		return -EBUSY;
+
+	p->uio_policy = policy;
+	return len;
+}
+static DEVICE_ATTR_RW(uio_policy);
+
 static ssize_t resource_show(struct device *dev, struct device_attribute *attr,
 			     char *buf)
 {
@@ -816,6 +975,8 @@ static struct attribute *cxl_region_attrs[] = {
 	&dev_attr_mode.attr,
 	&dev_attr_extended_linear_cache_size.attr,
 	&dev_attr_locked.attr,
+	&dev_attr_uio.attr,
+	&dev_attr_uio_policy.attr,
 	NULL,
 };
 
@@ -1539,6 +1700,29 @@ static int cxl_port_setup_targets(struct cxl_port *port,
 		return rc;
 	}
 
+	/*
+	 * UIO Direct P2P reverse-decode configuration (Table 8-123):
+	 * upstream decode stages consume contiguous HPA position bits
+	 * starting above the region granularity, so the aggregate
+	 * upstream interleave is UIG = region granularity and
+	 * UIW = the position-field bits consumed above it (each stage
+	 * multiplies granularity by its ways: this port's incoming
+	 * granularity is parent_ig * parent_iw). This port owns the
+	 * upstream positions congruent to its endpoint positions
+	 * modulo the upstream ways.
+	 */
+	if (p->uio) {
+		u16 region_eig;
+
+		rc = granularity_to_eig(p->interleave_granularity,
+					&region_eig);
+		if (rc)
+			return rc;
+		cxlsd->uio_uig = region_eig;
+		cxlsd->uio_uiw = peig + peiw - region_eig;
+		cxlsd->uio_isp = pos & ((1 << cxlsd->uio_uiw) - 1);
+	}
+
 	iw = cxl_rr->nr_targets;
 	rc = ways_to_eiw(iw, &eiw);
 	if (rc) {
@@ -2123,6 +2307,12 @@ static int cxl_region_attach(struct cxl_region *cxlr,
 		return -ENXIO;
 	}
 
+	if (cxlr->params.uio && !cxlds->uio) {
+		dev_err(&cxlr->dev, "%s:%s not a UIO Direct P2P target\n",
+			dev_name(&cxlmd->dev), dev_name(&cxled->cxld.dev));
+		return -ENXIO;
+	}
+
 	cxlhdm = dev_get_drvdata(&ep_port->dev);
 	if (!cxlhdm)
 		return -ENXIO;
@@ -2641,6 +2831,12 @@ static struct cxl_region *cxl_region_alloc(struct cxl_root_decoder *cxlrd, int i
 	get_device(dev->parent);
 	cxlr->cxlrd = cxlrd;
 	cxlr->id = id;
+	/*
+	 * For UIO regions the host-mediated ordered alternative usually
+	 * defeats the deployment's purpose; consumers read this to pick
+	 * their route policy default.
+	 */
+	cxlr->params.uio_policy = PCI_UIO_REQUIRED;
 
 	device_set_pm_not_required(dev);
 	dev->bus = &cxl_bus_type;

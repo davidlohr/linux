@@ -438,6 +438,51 @@ Description:
 		attached to, which is in turn set from the chosen root
 		decoder's CFMWS BI restriction (see cap_bi).
 
+What:		/sys/bus/cxl/devices/decoderX.Y/uio
+Date:		July, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) Shows '1' if this endpoint decoder is currently serving
+		a region committed as a PCIe Unordered IO (UIO) Direct P2P
+		target. Requires the device to be both BI and UIO capable
+		(see the region 'uio' attribute).
+
+What:		/sys/bus/cxl/devices/decoderX.Y/cap_uio
+Date:		July, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) Root decoder eligibility for UIO Direct P2P target
+		regions: '1' when the platform window uses Standard Modulo
+		interleave arithmetic (XOR windows are ineligible, CXL r4.0
+		sec 9.16) and permits HDM-DB.
+
+What:		/sys/bus/cxl/devices/regionZ/uio
+Date:		July, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RW) Write '1' before commit to provision the region as a
+		PCIe Unordered IO Direct P2P target. Requires an HDM-DB
+		region on a Standard Modulo window; commit then requires
+		every interleave target endpoint to be BI and UIO capable
+		with {1,2,4,8,16}-way interleave, verifies each endpoint's
+		uplink segment can route UIO (SVC present, flit mode links),
+		and programs the decoder UIO state. Writes after commit
+		return EBUSY; ineligible configurations return EOPNOTSUPP.
+
+What:		/sys/bus/cxl/devices/regionZ/uio_policy
+Date:		July, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RW) One of 'forbidden', 'preferred' or 'required' (default
+		'required'). Records whether ordered, host-mediated access
+		is an acceptable substitute for this region's users when a
+		UIO route cannot be established; consumers read it to choose
+		their route acquisition policy. Not writable after commit.
+
 What:		/sys/bus/cxl/devices/decoderX.Y/delete_region
 Date:		May, 2022
 KernelVersion:	v6.0

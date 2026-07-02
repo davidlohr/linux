@@ -89,6 +89,9 @@ static void parse_hdm_decoder_caps(struct cxl_hdm *cxlhdm)
 		cxlhdm->iw_cap_mask |= BIT(16);
 	cxlhdm->supported_coherency =
 		FIELD_GET(CXL_HDM_DECODER_SUPPORTED_COHERENCY_MASK, hdm_cap);
+	cxlhdm->uio_capable = FIELD_GET(CXL_HDM_DECODER_UIO, hdm_cap);
+	cxlhdm->uio_decoder_count =
+		FIELD_GET(CXL_HDM_DECODER_UIO_DECODER_COUNT_MASK, hdm_cap);
 }
 
 static bool should_emulate_decoders(struct cxl_endpoint_dvsec_info *info)
@@ -724,6 +727,66 @@ static void cxld_set_type(struct cxl_decoder *cxld, u32 *ctrl)
 			  !!(cxld->target_type == CXL_DECODER_HOSTONLYMEM),
 			  CXL_HDM_DECODER0_CTRL_HOSTONLY);
 	u32p_replace_bits(ctrl, bi, CXL_HDM_DECODER0_CTRL_BI);
+
+	/*
+	 * The decoder ISP field belongs to BI-capable devices (Table
+	 * 8-123: RWL for a BI-capable CXL.mem device, reserved
+	 * otherwise): BISnp addresses are HPAs - downstream ports
+	 * validate them against the USP's HDM decoders (Table 9-13) -
+	 * so an interleaved device needs its interleave set position
+	 * to resolve DPA->HPA for the snoops it originates. Program it
+	 * whenever the decoder commits with BI; the UIO Direct P2P
+	 * address match (sec 9.16.1.2) reuses the same field.
+	 */
+	if (bi && is_endpoint_decoder(&cxld->dev)) {
+		struct cxl_endpoint_decoder *cxled =
+			to_cxl_endpoint_decoder(&cxld->dev);
+
+		u32p_replace_bits(ctrl, cxled->pos,
+				  CXL_HDM_DECODER0_CTRL_ISP_MASK);
+	}
+}
+
+/*
+ * Program the decoder's UIO Direct P2P target state (CXL r4.0 Table
+ * 8-123, sec 9.16.1). Switch and host bridge decoders get the
+ * upstream-aggregate reverse-decode fields (UIG/UIW) and this port's
+ * position in the upstream interleave set (ISP), computed at target
+ * setup, so the component can tell whether a UIO target address
+ * belongs below it or to a peer. Endpoint decoders get ISP only -
+ * the device compares the region position field against it and
+ * Completer Aborts mismatches and boundary-straddling requests
+ * (UIG/UIW are reserved for devices). Endpoint eligibility was
+ * validated at region commit (cxlds->uio on every target); switch
+ * decoder count limits are enforced by the commit path before this
+ * point.
+ */
+static void cxld_set_uio(struct cxl_decoder *cxld, u32 *ctrl)
+{
+	bool uio = cxld->region && cxld->region->params.uio;
+
+	u32p_replace_bits(ctrl, uio, CXL_HDM_DECODER0_CTRL_UIO);
+	if (!uio)
+		return;
+
+	/*
+	 * Switch/host-bridge decoders get the upstream reverse-decode
+	 * fields; these are UIO-capable-component state (reserved for
+	 * devices). The endpoint's ISP is programmed with the BI bit in
+	 * cxld_set_type() - UIO regions require BI, so it is always in
+	 * place by the time the UIO bit commits.
+	 */
+	if (is_switch_decoder(&cxld->dev)) {
+		struct cxl_switch_decoder *cxlsd =
+			to_cxl_switch_decoder(&cxld->dev);
+
+		u32p_replace_bits(ctrl, cxlsd->uio_uig,
+				  CXL_HDM_DECODER0_CTRL_UIG_MASK);
+		u32p_replace_bits(ctrl, cxlsd->uio_uiw,
+				  CXL_HDM_DECODER0_CTRL_UIW_MASK);
+		u32p_replace_bits(ctrl, cxlsd->uio_isp,
+				  CXL_HDM_DECODER0_CTRL_ISP_MASK);
+	}
 }
 
 static void cxlsd_set_targets(struct cxl_switch_decoder *cxlsd, u64 *tgt)
@@ -784,6 +847,7 @@ static void setup_hw_decoder(struct cxl_decoder *cxld, void __iomem *hdm)
 	ctrl = readl(hdm + CXL_HDM_DECODER0_CTRL_OFFSET(cxld->id));
 	cxld_set_interleave(cxld, &ctrl);
 	cxld_set_type(cxld, &ctrl);
+	cxld_set_uio(cxld, &ctrl);
 	base = cxld->hpa_range.start;
 	size = range_len(&cxld->hpa_range);
 
@@ -820,6 +884,7 @@ static int cxl_decoder_commit(struct cxl_decoder *cxld)
 	struct cxl_port *port = to_cxl_port(cxld->dev.parent);
 	struct cxl_hdm *cxlhdm = dev_get_drvdata(&port->dev);
 	void __iomem *hdm = cxlhdm->regs.hdm_decoder;
+	bool uio = cxld->region && cxld->region->params.uio;
 	int id = cxld->id, rc;
 
 	if (cxld->flags & CXL_DECODER_F_ENABLE)
@@ -831,6 +896,24 @@ static int cxl_decoder_commit(struct cxl_decoder *cxld)
 			dev_name(&cxld->dev), port->id,
 			cxl_num_decoders_committed(port));
 		return -EBUSY;
+	}
+
+	/*
+	 * Switch and host bridge components may cap how many of their
+	 * decoders can set the UIO bit (UIO Capable Decoder Count);
+	 * exceeding the cap fails the decoder commit. UIO capable
+	 * devices must accept UIO on all decoders.
+	 */
+	if (uio && is_switch_decoder(&cxld->dev)) {
+		if (!cxlhdm->uio_capable ||
+		    (cxlhdm->uio_decoder_count &&
+		     cxlhdm->uio_decoders_committed >=
+				cxlhdm->uio_decoder_count)) {
+			dev_dbg(&port->dev,
+				"%s: no UIO capable decoder available\n",
+				dev_name(&cxld->dev));
+			return -ENXIO;
+		}
 	}
 
 	/*
@@ -863,6 +946,8 @@ static int cxl_decoder_commit(struct cxl_decoder *cxld)
 	}
 	port->commit_end++;
 	cxld->flags |= CXL_DECODER_F_ENABLE;
+	if (uio)
+		cxlhdm->uio_decoders_committed++;
 
 	return 0;
 }
@@ -933,6 +1018,10 @@ static void cxl_decoder_reset(struct cxl_decoder *cxld)
 	writel(0, hdm + CXL_HDM_DECODER0_SIZE_LOW_OFFSET(id));
 	writel(0, hdm + CXL_HDM_DECODER0_BASE_HIGH_OFFSET(id));
 	writel(0, hdm + CXL_HDM_DECODER0_BASE_LOW_OFFSET(id));
+
+	if (cxld->region && cxld->region->params.uio &&
+	    cxlhdm->uio_decoders_committed)
+		cxlhdm->uio_decoders_committed--;
 
 	cxld->flags &= ~CXL_DECODER_F_ENABLE;
 

@@ -6,6 +6,7 @@
 #include <linux/device.h>
 #include <linux/delay.h>
 #include <linux/pci.h>
+#include <linux/pci-uio.h>
 #include <linux/pci-doe.h>
 #include <linux/aer.h>
 #include <linux/string_choices.h>
@@ -1325,3 +1326,114 @@ err_rollback:
 	return rc;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_bi_setup, "CXL");
+
+/**
+ * cxl_hdm_uio_setup - latch UIO Direct P2P target capability
+ * @cxlds: device state to initialize
+ *
+ * Consumes the endpoint's PCIe UIO capability (DevCap3 Completer
+ * Supported) and the HDM Decoder Capability structure's UIO Capable
+ * bit - the CXL side declaration that the device's decoders can serve
+ * as UIO Direct P2P targets. Walks no paths and validates no
+ * requesters: none exist at probe. The companion of cxl_bi_setup(),
+ * and like the completer role itself, capability-static: there is
+ * nothing to enable here and nothing to tear down.
+ */
+int cxl_hdm_uio_setup(struct cxl_dev_state *cxlds)
+{
+	struct cxl_port *endpoint = cxlds->cxlmd->endpoint;
+	struct cxl_hdm *cxlhdm;
+	struct pci_dev *pdev;
+
+	cxlds->uio = false;
+
+	if (!dev_is_pci(cxlds->dev))
+		return 0;
+
+	pdev = to_pci_dev(cxlds->dev);
+	if (!pci_uio_completer_capable(pdev))
+		return 0;
+
+	cxlhdm = dev_get_drvdata(&endpoint->dev);
+	if (!cxlhdm || !cxlhdm->uio_capable)
+		return 0;
+
+	/*
+	 * UIO capable devices must accept UIO on all decoders (the UIO
+	 * Capable Decoder Count limit exists for switches and host
+	 * bridges only). Fail closed on a nonconformant limit.
+	 */
+	if (cxlhdm->uio_decoder_count &&
+	    cxlhdm->uio_decoder_count < cxlhdm->decoder_count) {
+		dev_dbg(cxlds->dev, "nonconformant UIO decoder count %u/%d\n",
+			cxlhdm->uio_decoder_count, cxlhdm->decoder_count);
+		return 0;
+	}
+
+	cxlds->uio = true;
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hdm_uio_setup, "CXL");
+
+/**
+ * cxl_uio_segment_check - fail-fast check of the endpoint uplink segment
+ * @cxlmd: memdev whose uplink to validate
+ *
+ * Requester-independent commit-time convenience: if the endpoint's own
+ * switch/root ports cannot route UIO (SVC with a UIO protocol VC) with
+ * every link in flit mode, no future requester will ever get a route,
+ * and the admin learns at provisioning rather than at first map.
+ * Necessary, not sufficient - pci_uio_route_get() remains the
+ * authoritative gate.
+ */
+int cxl_uio_segment_check(struct cxl_memdev *cxlmd)
+{
+	struct cxl_dport *dport_iter, *dport;
+	struct cxl_port *port_iter;
+	struct pci_dev *pdev;
+
+	if (!dev_is_pci(cxlmd->cxlds->dev))
+		return -ENODEV;
+
+	pdev = to_pci_dev(cxlmd->cxlds->dev);
+	struct cxl_port *port __free(put_cxl_port) =
+		cxl_pci_find_port(pdev, &dport);
+
+	if (!port)
+		return -ENODEV;
+
+	if (!cxl_pci_flit_256(pdev)) {
+		dev_dbg(&cxlmd->dev, "UIO: endpoint link not in flit mode\n");
+		return -EOPNOTSUPP;
+	}
+
+	port_iter = port;
+	dport_iter = dport;
+	while (!is_cxl_root(port_iter)) {
+		struct pci_dev *dp = to_pci_dev(dport_iter->dport_dev);
+
+		if (!pci_uio_routing_capable(dp) || !cxl_pci_flit_256(dp)) {
+			dev_dbg(&cxlmd->dev, "UIO: %s cannot route UIO\n",
+				pci_name(dp));
+			return -EOPNOTSUPP;
+		}
+
+		if (dev_is_pci(port_iter->uport_dev)) {
+			struct pci_dev *up = to_pci_dev(port_iter->uport_dev);
+
+			if (pci_pcie_type(up) == PCI_EXP_TYPE_UPSTREAM &&
+			    !pci_uio_routing_capable(up)) {
+				dev_dbg(&cxlmd->dev,
+					"UIO: %s cannot route UIO\n",
+					pci_name(up));
+				return -EOPNOTSUPP;
+			}
+		}
+
+		dport_iter = port_iter->parent_dport;
+		port_iter = dport_iter->port;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_uio_segment_check, "CXL");

@@ -869,6 +869,9 @@ struct cxl_hdm {
 	unsigned int interleave_mask;
 	unsigned long iw_cap_mask;
 	unsigned int supported_coherency;
+	bool uio_capable;
+	unsigned int uio_decoder_count;
+	unsigned int uio_decoders_committed;
 	struct cxl_port *port;
 };
 

@@ -946,6 +946,18 @@ static bool spa_maps_hpa(const struct cxl_region_params *p,
 		p->res->end == range->end;
 }
 
+/*
+ * No HDM decoder capability published (single dport host-bridges per
+ * 8.2.5.12): decode is passthrough via the sole dport and the port's
+ * decoder carries no hardware state to re-enumerate or validate.
+ */
+static bool is_passthrough_port(struct cxl_port *port)
+{
+	struct cxl_hdm *cxlhdm = dev_get_drvdata(&port->dev);
+
+	return port->nr_dports == 1 && cxlhdm && !cxlhdm->regs.hdm_decoder;
+}
+
 static int match_auto_decoder(struct device *dev, const void *data)
 {
 	const struct cxl_region_params *p = data;
@@ -959,6 +971,10 @@ static int match_auto_decoder(struct device *dev, const void *data)
 	r = &cxld->hpa_range;
 
 	if (spa_maps_hpa(p, r))
+		return 1;
+
+	/* a passthrough decoder has no committed range to match */
+	if (is_passthrough_port(to_cxl_port(dev->parent)))
 		return 1;
 
 	return 0;
@@ -1583,7 +1599,8 @@ static int cxl_port_setup_targets(struct cxl_port *port,
 		return -ENXIO;
 	}
 
-	if (test_bit(CXL_REGION_F_AUTO, &cxlr->flags)) {
+	if (test_bit(CXL_REGION_F_AUTO, &cxlr->flags) &&
+	    !is_passthrough_port(port)) {
 		if (cxld->interleave_ways != iw ||
 		    (iw > 1 && cxld->interleave_granularity != ig) ||
 		    !spa_maps_hpa(p, &cxld->hpa_range) ||
@@ -1628,7 +1645,8 @@ add_target:
 			dev_name(&cxlmd->dev), dev_name(&cxled->cxld.dev), pos);
 		return -ENXIO;
 	}
-	if (test_bit(CXL_REGION_F_AUTO, &cxlr->flags)) {
+	if (test_bit(CXL_REGION_F_AUTO, &cxlr->flags) &&
+	    !is_passthrough_port(port)) {
 		if (cxlsd->target[cxl_rr->nr_targets_set] != ep->dport) {
 			dev_dbg(&cxlr->dev, "%s:%s: %s expected %s at %d\n",
 				dev_name(port->uport_dev), dev_name(&port->dev),
@@ -1956,6 +1974,16 @@ static int find_pos_and_ways(struct cxl_port *port, struct range *range,
 	struct device *dev __free(put_device) =
 		device_find_child(&parent->dev, range, match_switch_decoder_by_range);
 	if (!dev) {
+		/*
+		 * A passthrough hop is decode-transparent: its decoder
+		 * carries no committed range to re-enumerate, but the
+		 * position through it is unambiguous.
+		 */
+		if (is_passthrough_port(parent)) {
+			*pos = 0;
+			*ways = 1;
+			return 0;
+		}
 		dev_err(port->uport_dev,
 			"failed to find decoder mapping %#llx-%#llx\n",
 			range->start, range->end);

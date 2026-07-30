@@ -956,6 +956,29 @@ static void __init pghot_src_enabled_init(void)
 		static_branch_enable(&pghot_src_hwhints);
 }
 
+/*
+ * The sysctl handler validates every value written to
+ * vm.pghot_target_nid, but the compiled-in default (node 0) never
+ * passes through it. On systems where node 0 is not a toptier node,
+ * promotions in the default tracking mode would target a lower tier
+ * until the sysctl is first written. Derive a valid default instead.
+ */
+static void __init pghot_target_nid_init(void)
+{
+	int nid;
+
+	if (node_online(sysctl_pghot_target_nid) &&
+	    node_is_toptier(sysctl_pghot_target_nid))
+		return;
+
+	for_each_node_state(nid, N_MEMORY) {
+		if (node_is_toptier(nid)) {
+			sysctl_pghot_target_nid = nid;
+			return;
+		}
+	}
+}
+
 static int __init pghot_init(void)
 {
 	pg_data_t *pgdat;
@@ -978,6 +1001,7 @@ static int __init pghot_init(void)
 	if (ret)
 		goto out_stop_kthread;
 
+	pghot_target_nid_init();
 	pghot_sysctl_init();
 	pghot_debug_init();
 	pghot_src_enabled_init();

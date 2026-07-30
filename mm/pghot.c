@@ -589,10 +589,15 @@ static int kmigrated(void *p)
 	return 0;
 }
 
+/* Serializes kmigrated thread creation and teardown */
+static DEFINE_MUTEX(kmigrated_lock);
+
 static int kmigrated_run(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
 	int ret;
+
+	guard(mutex)(&kmigrated_lock);
 
 	if (!pgdat->kmigrated) {
 		pgdat->kmigrated = kthread_create_on_node(kmigrated, pgdat, nid,
@@ -607,6 +612,20 @@ static int kmigrated_run(int nid)
 	}
 	wake_up_process(pgdat->kmigrated);
 	return 0;
+}
+
+static void kmigrated_stop(int nid)
+{
+	pg_data_t *pgdat = NODE_DATA(nid);
+	struct task_struct *t;
+
+	mutex_lock(&kmigrated_lock);
+	t = pgdat->kmigrated;
+	pgdat->kmigrated = NULL;
+	mutex_unlock(&kmigrated_lock);
+
+	if (t)
+		kthread_stop(t);
 }
 
 static void pghot_free_hot_map(struct mem_section *ms)
@@ -713,6 +732,66 @@ static struct notifier_block pghot_mem_notifier = {
 	.notifier_call = pghot_memhp_callback,
 	.priority = DEFAULT_CALLBACK_PRI,
 };
+
+/*
+ * The first memory block of a node is onlined before the node gets
+ * assigned to a memory tier (memory tiers react to
+ * NODE_ADDED_FIRST_MEMORY at MEMTIER_HOTPLUG_PRI), so at
+ * MEM_GOING_ONLINE time for that block node_is_toptier() still
+ * returns true and pghot_online_sec_hotmap() skips it. Backfill the
+ * hot maps once the node tier is known.
+ */
+static void pghot_alloc_node_hotmaps(int nid)
+{
+	unsigned long section_nr, s_begin, start_pfn;
+	struct mem_section *ms;
+	struct page *page;
+
+	s_begin = next_present_section_nr(-1);
+	for_each_present_section_nr(s_begin, section_nr) {
+		ms = __nr_to_section(section_nr);
+		start_pfn = section_nr_to_pfn(section_nr);
+
+		page = pfn_to_online_page(start_pfn);
+		if (!page || page_to_nid(page) != nid)
+			continue;
+
+		if (rcu_access_pointer(ms->hot_map))
+			continue;
+
+		if (pghot_alloc_hot_map(ms, nid))
+			pr_warn("pghot: no hot map for section %lu on node %d\n",
+				section_nr, nid);
+	}
+}
+
+/*
+ * Nodes that gain their first memory after boot (e.g., CXL memory
+ * onlined through dax_kmem) need a kmigrated thread to consume the
+ * hotness records, and nodes that lose their last memory no longer
+ * need one. Runs at priority 0, after the memory-tiers callback
+ * (MEMTIER_HOTPLUG_PRI), so that node_is_toptier() reflects the tier
+ * of the new node.
+ */
+static int pghot_node_callback(struct notifier_block *self,
+			       unsigned long action, void *arg)
+{
+	struct node_notify *nn = arg;
+
+	switch (action) {
+	case NODE_ADDED_FIRST_MEMORY:
+		if (node_is_toptier(nn->nid))
+			break;
+		pghot_alloc_node_hotmaps(nn->nid);
+		kmigrated_run(nn->nid);
+		break;
+	case NODE_REMOVED_LAST_MEMORY:
+		kmigrated_stop(nn->nid);
+		break;
+	}
+
+	return NOTIFY_OK;
+}
 
 static void pghot_destroy_hot_map(void)
 {
@@ -894,6 +973,11 @@ static int __init pghot_init(void)
 		if (ret)
 			goto out_stop_kthread;
 	}
+
+	ret = hotplug_node_notifier(pghot_node_callback, 0);
+	if (ret)
+		goto out_stop_kthread;
+
 	pghot_sysctl_init();
 	pghot_debug_init();
 	pghot_src_enabled_init();

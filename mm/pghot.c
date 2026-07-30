@@ -236,7 +236,18 @@ int pghot_record_access(unsigned long pfn, int nid, int src, unsigned long now)
 		return -EINVAL;
 	}
 
-	src_nid = pfn_to_nid(pfn);
+	/*
+	 * Reject invalid and non-migratable pages right away. This must
+	 * come before any struct page access: hwhints sources report
+	 * pfns from deferred contexts (e.g. a sample ring drained by a
+	 * workqueue), so the page may have been offlined or removed
+	 * since the sample was taken.
+	 */
+	page = pfn_to_online_page(pfn);
+	if (!page || is_zone_device_page(page))
+		return 0;
+
+	src_nid = page_to_nid(page);
 	if (src_nid == nid)
 		return 0;
 
@@ -244,13 +255,6 @@ int pghot_record_access(unsigned long pfn, int nid, int src, unsigned long now)
 	 * Record only accesses from lower tiers.
 	 */
 	if (node_is_toptier(src_nid))
-		return 0;
-
-	/*
-	 * Reject the non-migratable pages right away.
-	 */
-	page = pfn_to_online_page(pfn);
-	if (!page || is_zone_device_page(page))
 		return 0;
 
 	folio = page_folio(page);

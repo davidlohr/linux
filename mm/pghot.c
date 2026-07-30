@@ -525,6 +525,7 @@ static void kmigrated_do_work(pg_data_t *pgdat)
 	unsigned long section_nr, s_begin, start_pfn;
 	struct pghot_hot_map *hot_map;
 	struct mem_section *ms;
+	struct page *page;
 	bool hot;
 	int nid;
 
@@ -534,10 +535,16 @@ static void kmigrated_do_work(pg_data_t *pgdat)
 		start_pfn = section_nr_to_pfn(section_nr);
 		ms = __nr_to_section(section_nr);
 
-		if (!pfn_valid(start_pfn))
+		/*
+		 * Present but not yet onlined sections have an
+		 * uninitialized memmap; their struct pages must not be
+		 * read for the node id.
+		 */
+		page = pfn_to_online_page(start_pfn);
+		if (!page)
 			continue;
 
-		nid = pfn_to_nid(start_pfn);
+		nid = page_to_nid(page);
 		if (node_is_toptier(nid) || nid != pgdat->node_id)
 			continue;
 
@@ -721,6 +728,7 @@ static int pghot_setup_hot_map(void)
 {
 	unsigned long section_nr, s_begin, start_pfn;
 	struct mem_section *ms;
+	struct page *page;
 	int nid, ret;
 
 	ret = register_memory_notifier(&pghot_mem_notifier);
@@ -731,9 +739,22 @@ static int pghot_setup_hot_map(void)
 	for_each_present_section_nr(s_begin, section_nr) {
 		ms = __nr_to_section(section_nr);
 		start_pfn = section_nr_to_pfn(section_nr);
-		nid = pfn_to_nid(start_pfn);
 
-		if (node_is_toptier(nid) || !pfn_valid(start_pfn))
+		/*
+		 * Skip sections that are present but not yet online:
+		 * their memmap is uninitialized until onlining runs
+		 * memmap_init_range(), so neither the node id nor any
+		 * other struct page field can be read here. Hot maps
+		 * for them are allocated by the MEM_GOING_ONLINE
+		 * notifier once they are onlined, which is also the
+		 * point where they can start generating accesses.
+		 */
+		page = pfn_to_online_page(start_pfn);
+		if (!page)
+			continue;
+
+		nid = page_to_nid(page);
+		if (node_is_toptier(nid))
 			continue;
 
 		if (pghot_alloc_hot_map(ms, nid))

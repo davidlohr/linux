@@ -189,38 +189,15 @@ static inline void pghot_sysctl_init(void) { }
 
 static bool kmigrated_started __ro_after_init;
 
-/**
- * pghot_record_accesses() - Record page accesses from lower tier memory
- * for the purpose of tracking page hotness and subsequent promotion.
+/*
+ * Common entry validation and per-source accounting for the record
+ * functions.
  *
- * @pfn: PFN of the page
- * @nid: Target NID to where the page needs to be migrated in precision
- *       mode but unused in default mode
- * @src: The identifier of the sub-system that reports the access
- * @nr: Number of accesses being reported. Sources that only know that
- *      an access occurred (e.g. NUMA hint faults) pass 1; sources that
- *      count accesses in hardware (e.g. CXL HMU hotness counters) pass
- *      the measured count so a single report can carry the magnitude.
- *      The frequency accumulation saturates at PGHOT_FREQ_MAX.
- * @now: Access time in jiffies
- *
- * Updates the NID (in precision mode only), frequency and time of access
- * and marks the page as ready for migration if the frequency crosses a
- * threshold. The pages marked for migration are migrated by kmigrated
- * kernel thread.
- *
- * Return: 0 on success and -EINVAL on failure to record the access.
+ * Return: 1 to proceed with recording, 0 when recording is disabled
+ * and -EINVAL on invalid input.
  */
-int pghot_record_accesses(unsigned long pfn, int nid, int src, unsigned int nr,
-			  unsigned long now)
+static int pghot_record_common(int nid, int src, unsigned int nr)
 {
-	struct mem_section *ms;
-	struct folio *folio;
-	struct pghot_hot_map *hot_map;
-	phi_t *phi;
-	struct page *page;
-	int src_nid;
-
 	if (!kmigrated_started)
 		return 0;
 
@@ -235,15 +212,37 @@ int pghot_record_accesses(unsigned long pfn, int nid, int src, unsigned int nr,
 		if (!static_branch_unlikely(&pghot_src_hintfaults))
 			return 0;
 		count_vm_event(PGHOT_RECORDED_HINTFAULTS);
-		break;
+		return 1;
 	case PGHOT_HWHINTS:
 		if (!static_branch_unlikely(&pghot_src_hwhints))
 			return 0;
 		count_vm_event(PGHOT_RECORDED_HWHINTS);
-		break;
+		return 1;
 	default:
 		return -EINVAL;
 	}
+}
+
+/*
+ * Record @nr accesses against the folio backing @page.
+ *
+ * Sets *recorded when a hotness record was updated. Returns the number
+ * of pages from @page up to the end of its folio so a range walk can
+ * step to the next folio; invalid or unsuitable pages consume a single
+ * page step.
+ */
+static unsigned long pghot_record_page(struct page *page, int nid,
+				       unsigned int nr, unsigned long now,
+				       bool *recorded)
+{
+	struct mem_section *ms;
+	struct folio *folio;
+	struct pghot_hot_map *hot_map;
+	phi_t *phi;
+	unsigned long pfn, step = 1;
+	int src_nid;
+
+	*recorded = false;
 
 	/*
 	 * Reject invalid and non-migratable pages right away. This must
@@ -252,26 +251,27 @@ int pghot_record_accesses(unsigned long pfn, int nid, int src, unsigned int nr,
 	 * workqueue), so the page may have been offlined or removed
 	 * since the sample was taken.
 	 */
-	page = pfn_to_online_page(pfn);
 	if (!page || is_zone_device_page(page))
-		return 0;
+		return step;
 
 	src_nid = page_to_nid(page);
 	if (src_nid == nid)
-		return 0;
+		return step;
 
 	/*
 	 * Record only accesses from lower tiers.
 	 */
 	if (node_is_toptier(src_nid))
-		return 0;
+		return step;
 
 	folio = page_folio(page);
 	if (!folio_try_get(folio))
-		return 0;
+		return step;
 
 	if (unlikely(page_folio(page) != folio))
 		goto out;
+
+	step = folio_nr_pages(folio) - folio_page_idx(folio, page);
 
 	if (!folio_test_lru(folio))
 		goto out;
@@ -299,11 +299,102 @@ int pghot_record_accesses(unsigned long pfn, int nid, int src, unsigned int nr,
 		set_bit(PGDAT_KMIGRATED_ACTIVATE, &page_pgdat(page)->flags);
 	}
 	rcu_read_unlock();
+	*recorded = true;
 out:
 	folio_put(folio);
+	return step;
+}
+
+/**
+ * pghot_record_accesses() - Record page accesses from lower tier memory
+ * for the purpose of tracking page hotness and subsequent promotion.
+ *
+ * @pfn: PFN of the page
+ * @nid: Target NID to where the page needs to be migrated in precision
+ *       mode but unused in default mode
+ * @src: The identifier of the sub-system that reports the access
+ * @nr: Number of accesses being reported. Sources that only know that
+ *      an access occurred (e.g. NUMA hint faults) pass 1; sources that
+ *      count accesses in hardware (e.g. CXL HMU hotness counters) pass
+ *      the measured count so a single report can carry the magnitude.
+ *      The frequency accumulation saturates at PGHOT_FREQ_MAX.
+ * @now: Access time in jiffies
+ *
+ * Updates the NID (in precision mode only), frequency and time of access
+ * and marks the page as ready for migration if the frequency crosses a
+ * threshold. The pages marked for migration are migrated by kmigrated
+ * kernel thread.
+ *
+ * Return: 0 on success and -EINVAL on failure to record the access.
+ */
+int pghot_record_accesses(unsigned long pfn, int nid, int src, unsigned int nr,
+			  unsigned long now)
+{
+	bool recorded;
+	int rc;
+
+	rc = pghot_record_common(nid, src, nr);
+	if (rc <= 0)
+		return rc;
+
+	pghot_record_page(pfn_to_online_page(pfn), nid, nr, now, &recorded);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(pghot_record_accesses);
+
+/**
+ * pghot_record_range() - Record accesses against a contiguous pfn range.
+ *
+ * @pfn: First PFN of the range
+ * @nr_pages: Number of pages in the range
+ * @nid: Target NID to where the pages need to be migrated in precision
+ *       mode but unused in default mode
+ * @src: The identifier of the sub-system that reports the accesses
+ * @nr: Access count attributed to each folio in the range. Hardware
+ *      that counts accesses at a granularity larger than a folio
+ *      measures the whole unit, so every folio the unit covers
+ *      inherits the unit's count.
+ * @now: Access time in jiffies
+ *
+ * For sources that track physically contiguous extents larger than a
+ * page (e.g. CXL HMU tracking units): validates and accounts the report
+ * once and walks the range folio by folio internally, which also keeps
+ * the range/folio geometry handling in one place.
+ *
+ * May reschedule between folios; must be called from process context.
+ *
+ * Return: the number of folios recorded on success and -EINVAL on
+ * invalid input. A recorded folio is one whose hotness record was
+ * updated; folios that are not suitable for promotion (not on the LRU,
+ * already in the top tier, etc.) are skipped and not counted.
+ */
+int pghot_record_range(unsigned long pfn, unsigned long nr_pages, int nid,
+		       int src, unsigned int nr, unsigned long now)
+{
+	unsigned long end = pfn + nr_pages;
+	int nr_recorded = 0;
+	int rc;
+
+	might_sleep();
+
+	if (!nr_pages || end < pfn)
+		return -EINVAL;
+
+	rc = pghot_record_common(nid, src, nr);
+	if (rc <= 0)
+		return rc;
+
+	while (pfn < end) {
+		bool recorded;
+
+		pfn += pghot_record_page(pfn_to_online_page(pfn), nid, nr,
+					 now, &recorded);
+		nr_recorded += recorded;
+		cond_resched();
+	}
+	return nr_recorded;
+}
+EXPORT_SYMBOL_GPL(pghot_record_range);
 
 /*
  * For memory tiering mode, if there are enough free pages (more than

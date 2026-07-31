@@ -132,6 +132,8 @@ int pghot_get_record(phi_t *phi, int *nid, int *freq, unsigned long *time);
 
 int pghot_record_accesses(unsigned long pfn, int nid, int src, unsigned int nr,
 			  unsigned long now);
+int pghot_record_range(unsigned long pfn, unsigned long nr_pages, int nid,
+		       int src, unsigned int nr, unsigned long now);
 
 static inline int pghot_record_access(unsigned long pfn, int nid, int src,
 				      unsigned long now)
@@ -141,6 +143,13 @@ static inline int pghot_record_access(unsigned long pfn, int nid, int src,
 #else
 static inline int pghot_record_accesses(unsigned long pfn, int nid, int src,
 					unsigned int nr, unsigned long now)
+{
+	return 0;
+}
+
+static inline int pghot_record_range(unsigned long pfn, unsigned long nr_pages,
+				     int nid, int src, unsigned int nr,
+				     unsigned long now)
 {
 	return 0;
 }

@@ -127,11 +127,24 @@ struct pghot_hot_map {
 
 bool pghot_nid_valid(int nid);
 unsigned long pghot_access_latency(unsigned long old_time, unsigned long time);
-bool pghot_update_record(phi_t *phi, int nid, unsigned long now);
+bool pghot_update_record(phi_t *phi, int nid, unsigned int nr, unsigned long now);
 int pghot_get_record(phi_t *phi, int *nid, int *freq, unsigned long *time);
 
-int pghot_record_access(unsigned long pfn, int nid, int src, unsigned long now);
+int pghot_record_accesses(unsigned long pfn, int nid, int src, unsigned int nr,
+			  unsigned long now);
+
+static inline int pghot_record_access(unsigned long pfn, int nid, int src,
+				      unsigned long now)
+{
+	return pghot_record_accesses(pfn, nid, src, 1, now);
+}
 #else
+static inline int pghot_record_accesses(unsigned long pfn, int nid, int src,
+					unsigned int nr, unsigned long now)
+{
+	return 0;
+}
+
 static inline int pghot_record_access(unsigned long pfn, int nid, int src, unsigned long now)
 {
 	return 0;

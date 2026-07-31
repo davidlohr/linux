@@ -27,11 +27,17 @@ unsigned long pghot_access_latency(unsigned long old_time, unsigned long time)
 	return jiffies_to_msecs((time - old_time) & PGHOT_TIME_BUCKETS_MASK);
 }
 
-bool pghot_update_record(phi_t *phi, int nid, unsigned long now)
+bool pghot_update_record(phi_t *phi, int nid, unsigned int nr, unsigned long now)
 {
 	phi_t freq, old_freq, hotness, old_hotness, old_time;
 	phi_t time = now >> PGHOT_TIME_BUCKETS_SHIFT;
 
+	/*
+	 * The frequency accumulation saturates at PGHOT_FREQ_MAX, so larger
+	 * reports carry no additional information; clamping also keeps the
+	 * addition below free of overflow.
+	 */
+	nr = min_t(unsigned int, nr, PGHOT_FREQ_MAX);
 	old_hotness = READ_ONCE(*phi);
 	do {
 		bool new_window = false;
@@ -43,11 +49,9 @@ bool pghot_update_record(phi_t *phi, int nid, unsigned long now)
 			new_window = true;
 
 		if (new_window)
-			freq = 1;
-		else if (old_freq < PGHOT_FREQ_MAX)
-			freq = old_freq + 1;
+			freq = nr;
 		else
-			freq = old_freq;
+			freq = min_t(unsigned int, old_freq + nr, PGHOT_FREQ_MAX);
 
 		hotness = 0;
 		hotness |= (freq & PGHOT_FREQ_MASK) << PGHOT_FREQ_SHIFT;

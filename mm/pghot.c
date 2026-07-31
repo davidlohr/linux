@@ -190,13 +190,18 @@ static inline void pghot_sysctl_init(void) { }
 static bool kmigrated_started __ro_after_init;
 
 /**
- * pghot_record_access() - Record page accesses from lower tier memory
+ * pghot_record_accesses() - Record page accesses from lower tier memory
  * for the purpose of tracking page hotness and subsequent promotion.
  *
  * @pfn: PFN of the page
  * @nid: Target NID to where the page needs to be migrated in precision
  *       mode but unused in default mode
  * @src: The identifier of the sub-system that reports the access
+ * @nr: Number of accesses being reported. Sources that only know that
+ *      an access occurred (e.g. NUMA hint faults) pass 1; sources that
+ *      count accesses in hardware (e.g. CXL HMU hotness counters) pass
+ *      the measured count so a single report can carry the magnitude.
+ *      The frequency accumulation saturates at PGHOT_FREQ_MAX.
  * @now: Access time in jiffies
  *
  * Updates the NID (in precision mode only), frequency and time of access
@@ -206,7 +211,8 @@ static bool kmigrated_started __ro_after_init;
  *
  * Return: 0 on success and -EINVAL on failure to record the access.
  */
-int pghot_record_access(unsigned long pfn, int nid, int src, unsigned long now)
+int pghot_record_accesses(unsigned long pfn, int nid, int src, unsigned int nr,
+			  unsigned long now)
 {
 	struct mem_section *ms;
 	struct folio *folio;
@@ -217,6 +223,9 @@ int pghot_record_access(unsigned long pfn, int nid, int src, unsigned long now)
 
 	if (!kmigrated_started)
 		return 0;
+
+	if (!nr)
+		return -EINVAL;
 
 	if (!pghot_nid_valid(nid))
 		return -EINVAL;
@@ -280,12 +289,12 @@ int pghot_record_access(unsigned long pfn, int nid, int src, unsigned long now)
 
 	phi = &hot_map->phi[pfn % PAGES_PER_SECTION];
 
-	count_vm_event(PGHOT_RECORDED_ACCESSES);
+	count_vm_events(PGHOT_RECORDED_ACCESSES, nr);
 
 	/*
 	 * Update the hotness parameters.
 	 */
-	if (pghot_update_record(phi, nid, now)) {
+	if (pghot_update_record(phi, nid, nr, now)) {
 		set_bit(PGHOT_SECTION_HOT_BIT, &hot_map->flags);
 		set_bit(PGDAT_KMIGRATED_ACTIVATE, &page_pgdat(page)->flags);
 	}
@@ -294,7 +303,7 @@ out:
 	folio_put(folio);
 	return 0;
 }
-EXPORT_SYMBOL_GPL(pghot_record_access);
+EXPORT_SYMBOL_GPL(pghot_record_accesses);
 
 /*
  * For memory tiering mode, if there are enough free pages (more than

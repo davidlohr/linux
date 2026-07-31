@@ -804,10 +804,12 @@ static void cxl_hmu_pghot_pick_epoch(struct cxl_hmu_info *info, u64 cap0)
 	info->epoch_mult = min_mult;
 }
 
-static void cxl_hmu_pghot_report(struct cxl_hmu_info *info, u64 unit_id)
+static void cxl_hmu_pghot_report(struct cxl_hmu_info *info, u64 unit_id,
+				 u64 count)
 {
 	u64 dpa = unit_id << info->hot_gran;
 	u64 dpa_end = dpa + (1ULL << info->hot_gran);
+	unsigned int nr = min_t(u64, count, UINT_MAX);
 
 	count_vm_event(HWHINT_TOTAL_EVENTS);
 	while (dpa < dpa_end) {
@@ -821,10 +823,10 @@ static void cxl_hmu_pghot_report(struct cxl_hmu_info *info, u64 unit_id)
 				struct folio *folio = page_folio(page);
 
 				step = folio_size(folio);
-				if (!pghot_record_access(folio_pfn(folio),
-							 NUMA_NO_NODE,
-							 PGHOT_HWHINTS,
-							 jiffies))
+				if (!pghot_record_accesses(folio_pfn(folio),
+							   NUMA_NO_NODE,
+							   PGHOT_HWHINTS, nr,
+							   jiffies))
 					count_vm_event(HWHINT_USEFUL_EVENTS);
 			}
 		}
@@ -857,7 +859,14 @@ static irqreturn_t cxl_hmu_pghot_thread(int irq, void *data)
 	while (head != tail) {
 		u64 entry = readq(info->base + hl_off + head * 8);
 
-		cxl_hmu_pghot_report(info, entry >> width);
+		/*
+		 * Entry layout: [63:width] Unit ID, [width-1:0] the hotness
+		 * counter value. The counter carries how many (down-sampled)
+		 * accesses the unit saw, so pass the magnitude along instead
+		 * of discarding it.
+		 */
+		cxl_hmu_pghot_report(info, entry >> width,
+				     entry & (BIT_ULL(width) - 1));
 		head = (head + 1) % top;
 	}
 	writew(head, info->base + CHMU_INST0_HEAD_REG);

@@ -755,6 +755,11 @@ module_param(pghot_epoch_ms, uint, 0444);
 MODULE_PARM_DESC(pghot_epoch_ms,
 		 "Target epoch length in ms, clamped to the device's range");
 
+static unsigned int pghot_unit;
+module_param(pghot_unit, uint, 0444);
+MODULE_PARM_DESC(pghot_unit,
+		 "log2 of the tracking unit size in bytes, if supported by the device (0 = smallest supported unit of at least page size)");
+
 /* Epoch length is scale * multiplier; scale encodings from CXL r4.0 Table 8-193 */
 static const u32 chmu_epoch_scale_us[] = { 0, 100, 1000, 10000, 100000, 1000000 };
 #define CHMU_EPOCH_MULT_MAX	4095
@@ -810,28 +815,51 @@ static void cxl_hmu_pghot_report(struct cxl_hmu_info *info, u64 unit_id,
 	u64 dpa = unit_id << info->hot_gran;
 	u64 dpa_end = dpa + (1ULL << info->hot_gran);
 	unsigned int nr = min_t(u64, count, UINT_MAX);
+	u64 run_hpa = 0, run_len = 0;
+	bool useful = false;
 
 	count_vm_event(HWHINT_TOTAL_EVENTS);
-	while (dpa < dpa_end) {
-		u64 step = PAGE_SIZE;
+
+	/*
+	 * The unit is contiguous in DPA space but interleaving may break
+	 * it up in HPA space, so translate page by page and hand each
+	 * physically contiguous run to pghot as a single range. On a
+	 * non-interleaved region the whole unit is one run.
+	 *
+	 * A unit can span up to 2GB, half a million translations, and a
+	 * physically contiguous run defers the (rescheduling) pghot call
+	 * until the run ends, so yield explicitly on each iteration.
+	 */
+	for (; dpa < dpa_end; dpa += PAGE_SIZE) {
 		u64 hpa = cxl_memdev_dpa_to_hpa(info->cxlmd, dpa);
 
-		if (hpa != ULLONG_MAX) {
-			struct page *page = pfn_to_online_page(PHYS_PFN(hpa));
-
-			if (page) {
-				struct folio *folio = page_folio(page);
-
-				step = folio_size(folio);
-				if (!pghot_record_accesses(folio_pfn(folio),
-							   NUMA_NO_NODE,
-							   PGHOT_HWHINTS, nr,
-							   jiffies))
-					count_vm_event(HWHINT_USEFUL_EVENTS);
-			}
+		cond_resched();
+		if (run_len && hpa == run_hpa + run_len) {
+			run_len += PAGE_SIZE;
+			continue;
 		}
-		dpa += step;
+
+		if (run_len &&
+		    pghot_record_range(PHYS_PFN(run_hpa), run_len >> PAGE_SHIFT,
+				       NUMA_NO_NODE, PGHOT_HWHINTS, nr,
+				       jiffies) > 0)
+			useful = true;
+
+		if (hpa != ULLONG_MAX) {
+			run_hpa = hpa;
+			run_len = PAGE_SIZE;
+		} else {
+			run_len = 0;
+		}
 	}
+
+	if (run_len &&
+	    pghot_record_range(PHYS_PFN(run_hpa), run_len >> PAGE_SHIFT,
+			       NUMA_NO_NODE, PGHOT_HWHINTS, nr, jiffies) > 0)
+		useful = true;
+
+	if (useful)
+		count_vm_event(HWHINT_USEFUL_EVENTS);
 }
 
 static irqreturn_t cxl_hmu_pghot_thread(int irq, void *data)
@@ -910,7 +938,12 @@ static int cxl_hmu_pghot_attach(struct device *dev, struct cxl_hmu_info *info,
 {
 	u64 cap0 = readq(info->base + CHMU_INST0_CAP0_REG);
 	u64 cap1 = readq(info->base + CHMU_INST0_CAP1_REG);
-	unsigned long gran_sup = FIELD_GET(CHMU_INST0_CAP1_UNIT_SIZE_MSK, cap1);
+	/*
+	 * Valid unit sizes are 256B (bit 0) to 2GB (bit 23); the upper
+	 * bits of the Supported Unit Sizes field are reserved.
+	 */
+	unsigned long gran_sup = FIELD_GET(CHMU_INST0_CAP1_UNIT_SIZE_MSK, cap1) &
+				 GENMASK(23, 0);
 	u16 ds_sup = FIELD_GET(CHMU_INST0_CAP1_DOWNSAMP_MSK, cap1);
 	u64 hl_off = readq(info->base + CHMU_INST0_HOTLIST_OFFSET_REG);
 	u64 bm_off = readq(info->base + CHMU_INST0_RANGE_BITMAP_OFFSET_REG);
@@ -929,12 +962,23 @@ static int cxl_hmu_pghot_attach(struct device *dev, struct cxl_hmu_info *info,
 	else
 		return -ENODEV;
 
-	/* Smallest supported unit size of at least a page */
 	info->hot_gran = 0;
-	for_each_set_bit(b, &gran_sup, 32) {
-		if (8 + b >= PAGE_SHIFT) {
-			info->hot_gran = 8 + b;
-			break;
+	if (pghot_unit) {
+		if (pghot_unit >= PAGE_SHIFT && pghot_unit >= 8 &&
+		    pghot_unit < 8 + 24 && (gran_sup & BIT(pghot_unit - 8)))
+			info->hot_gran = pghot_unit;
+		else
+			dev_warn(dev, "unsupported pghot_unit %u (supported mask %lx), using default\n",
+				 pghot_unit, gran_sup);
+	}
+
+	/* Default to the smallest supported unit size of at least a page */
+	if (!info->hot_gran) {
+		for_each_set_bit(b, &gran_sup, 24) {
+			if (8 + b >= PAGE_SHIFT) {
+				info->hot_gran = 8 + b;
+				break;
+			}
 		}
 	}
 	if (!info->hot_gran)

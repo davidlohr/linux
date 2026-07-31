@@ -23,7 +23,11 @@
 #include <linux/math.h>
 #include <linux/pci.h>
 
+#include <linux/mm.h>
+#include <linux/pghot.h>
+
 #include "cxlpci.h"
+#include "cxlmem.h"
 #include "cxl.h"
 #include "hmu.h"
 
@@ -136,6 +140,7 @@ struct cxl_hmu_info {
 	struct pmu pmu;
 	struct perf_output_handle handle;
 	void __iomem *base;
+	struct cxl_memdev *cxlmd;
 	struct hlist_node node;
 	int irq;
 	int on_cpu;
@@ -456,41 +461,14 @@ static int cxl_hmu_update_aux(struct cxl_hmu_info *hmu, bool stop)
 	return 0;
 }
 
-static int __cxl_hmu_start(struct perf_event *event, int flags)
+static int cxl_hmu_hw_start(struct device *dev, struct cxl_hmu_info *hmu)
 {
-	struct cxl_hmu_info *hmu = pmu_to_cxl_hmu(event->pmu);
-	struct hw_perf_event *hwc = &event->hw;
-	struct device *dev = event->pmu->dev;
-	struct cxl_hmu_buf *buf;
-	int cpu = event->cpu;
 	u64 val, status, bitmap_base;
 	int ret, i;
 	u8 width;
 	u16 list_len = FIELD_GET(CHMU_INST0_CAP0_HOTLIST_SIZE_MSK,
 				 readq(hmu->base + CHMU_INST0_CAP0_REG));
 
-	hwc->state = 0;
-	status = readq(hmu->base + CHMU_INST0_STATUS_REG);
-	if (FIELD_GET(CHMU_INST0_STATUS_ENABLED, status)) {
-		dev_dbg(dev, "trace already started\n");
-		return -EBUSY;
-	}
-	/* TODO: Figure out what to do as very likely this is shared
-	 *  - Hopefully only with other HMU instances
-	 */
-	ret = irq_set_affinity(hmu->irq, cpumask_of(cpu));
-	if (ret)
-		dev_warn(dev, "failed to affinity of HMU interrupt\n");
-
-	hmu->on_cpu = cpu;
-
-	buf = perf_aux_output_begin(&hmu->handle, event);
-	if (!buf) {
-		dev_dbg(event->pmu->dev, "aux output begin failed\n");
-		return -EINVAL;
-	}
-
-	buf->pos = hmu->handle.head % buf->length;
 	/* Reset here disrupts samping with -F, should we avoid doing so? */
 	writeq(FIELD_PREP(CHMU_INST0_CFG0_RESET_COUNTERS, 1),
 		hmu->base + CHMU_INST0_CFG0_REG);
@@ -499,8 +477,8 @@ static int __cxl_hmu_start(struct perf_event *event, int flags)
 		(FIELD_GET(CHMU_INST0_STATUS_OP_INPROG_MSK, status) == 0),
 		10, 100000);
 	if (ret) {
-		dev_dbg(event->pmu->dev, "Reset timed out\n");
-		goto err_end_aux;
+		dev_dbg(dev, "Reset timed out\n");
+		return ret;
 	}
 	/* Setup what is being capured */
 	/* Type of capture, granularity etc */
@@ -535,15 +513,11 @@ static int __cxl_hmu_start(struct perf_event *event, int flags)
 	 */
 	status = readq(hmu->base + CHMU_INST0_STATUS_REG);
 	width = FIELD_GET(CHMU_INST0_STATUS_COUNTER_WIDTH_MSK, status);
-	if (!width || width >= 64) {
-		ret = -EINVAL;
-		goto err_end_aux;
-	}
+	if (!width || width >= 64)
+		return -EINVAL;
 	/* The threshold must be representable in the counter */
-	if (hmu->hot_thresh >= BIT_ULL(width)) {
-		ret = -EINVAL;
-		goto err_end_aux;
-	}
+	if (hmu->hot_thresh >= BIT_ULL(width))
+		return -EINVAL;
 	/* Start the unit up */
 	val = FIELD_PREP(CHMU_INST0_CFG0_WHAT_MSK, hmu->m2s_requests_to_track) |
 		FIELD_PREP(CHMU_INST0_CFG0_RAND_DOWNSAMP_EN,
@@ -559,19 +533,58 @@ static int __cxl_hmu_start(struct perf_event *event, int flags)
 		(FIELD_GET(CHMU_INST0_STATUS_OP_INPROG_MSK, status) == 0),
 		10, 100000);
 	if (ret) {
-		dev_info(event->pmu->dev, "Enable timed out\n");
-		goto err_end_aux;
+		dev_info(dev, "Enable timed out\n");
+		return ret;
 	}
 
 	return 0;
+}
 
-err_end_aux:
-	/*
-	 * Unwind the session: perf_aux_output_begin() nested the handle
-	 * and took references that only the matching end releases.
+static int __cxl_hmu_start(struct perf_event *event, int flags)
+{
+	struct cxl_hmu_info *hmu = pmu_to_cxl_hmu(event->pmu);
+	struct hw_perf_event *hwc = &event->hw;
+	struct device *dev = event->pmu->dev;
+	struct cxl_hmu_buf *buf;
+	int cpu = event->cpu;
+	u64 status;
+	int ret;
+
+	hwc->state = 0;
+	status = readq(hmu->base + CHMU_INST0_STATUS_REG);
+	if (FIELD_GET(CHMU_INST0_STATUS_ENABLED, status)) {
+		dev_dbg(dev, "trace already started\n");
+		return -EBUSY;
+	}
+	/* TODO: Figure out what to do as very likely this is shared
+	 *  - Hopefully only with other HMU instances
 	 */
-	perf_aux_output_end(&hmu->handle, 0);
-	return ret;
+	ret = irq_set_affinity(hmu->irq, cpumask_of(cpu));
+	if (ret)
+		dev_warn(dev, "failed to affinity of HMU interrupt\n");
+
+	hmu->on_cpu = cpu;
+
+	buf = perf_aux_output_begin(&hmu->handle, event);
+	if (!buf) {
+		dev_dbg(event->pmu->dev, "aux output begin failed\n");
+		return -EINVAL;
+	}
+
+	buf->pos = hmu->handle.head % buf->length;
+
+	ret = cxl_hmu_hw_start(dev, hmu);
+	if (ret) {
+		/*
+		 * Unwind the session: perf_aux_output_begin() nested the
+		 * handle and took references that only the matching end
+		 * releases.
+		 */
+		perf_aux_output_end(&hmu->handle, 0);
+		return ret;
+	}
+
+	return 0;
 }
 
 static void cxl_hmu_start(struct perf_event *event, int flags)
@@ -727,6 +740,244 @@ static void cxl_hmu_cpuhp_remove(void *_info)
 					    &info->node);
 }
 
+#ifdef CONFIG_CXL_HMU_PGHOT
+static bool pghot_mode;
+module_param(pghot_mode, bool, 0444);
+MODULE_PARM_DESC(pghot_mode,
+		 "Drive the first instance of each CHMU in-kernel and feed hot units to pghot");
+
+static unsigned int pghot_thresh = 16;
+module_param(pghot_thresh, uint, 0444);
+MODULE_PARM_DESC(pghot_thresh, "Accesses per epoch for a unit to be considered hot");
+
+static unsigned int pghot_epoch_ms = 1000;
+module_param(pghot_epoch_ms, uint, 0444);
+MODULE_PARM_DESC(pghot_epoch_ms,
+		 "Target epoch length in ms, clamped to the device's range");
+
+/* Epoch length is scale * multiplier; scale encodings from CXL r4.0 Table 8-193 */
+static const u32 chmu_epoch_scale_us[] = { 0, 100, 1000, 10000, 100000, 1000000 };
+#define CHMU_EPOCH_MULT_MAX	4095
+
+static u64 chmu_epoch_us(u8 scale, u16 mult)
+{
+	if (scale < 1 || scale >= ARRAY_SIZE(chmu_epoch_scale_us))
+		return 0;
+
+	return (u64)chmu_epoch_scale_us[scale] * mult;
+}
+
+/*
+ * Pick the epoch length. The hot-range threshold counts accesses within
+ * one epoch, so epoch length and threshold together set how sensitive
+ * detection is: too short an epoch and nothing reaches the threshold.
+ * Aim for pghot_epoch_ms, clamped to the range the device advertises,
+ * and encode it with the finest scale that fits the 12-bit multiplier.
+ */
+static void cxl_hmu_pghot_pick_epoch(struct cxl_hmu_info *info, u64 cap0)
+{
+	u8 min_scale = FIELD_GET(CHMU_INST0_CAP0_EPOCH_MIN_SCALE_MSK, cap0);
+	u16 min_mult = FIELD_GET(CHMU_INST0_CAP0_EPOCH_MIN_MULT_MSK, cap0);
+	u64 min_us = chmu_epoch_us(min_scale, min_mult);
+	u64 max_us = chmu_epoch_us(FIELD_GET(CHMU_INST0_CAP0_EPOCH_MAX_SCALE_MSK, cap0),
+				   FIELD_GET(CHMU_INST0_CAP0_EPOCH_MAX_MULT_MSK, cap0));
+	u64 want = (u64)pghot_epoch_ms * USEC_PER_MSEC;
+	int scale;
+
+	if (min_us && want < min_us)
+		want = min_us;
+	if (max_us && want > max_us)
+		want = max_us;
+
+	for (scale = 1; scale < ARRAY_SIZE(chmu_epoch_scale_us); scale++) {
+		u64 mult = want / chmu_epoch_scale_us[scale];
+
+		if (mult >= 1 && mult <= CHMU_EPOCH_MULT_MAX) {
+			info->epoch_scale = scale;
+			info->epoch_mult = mult;
+			return;
+		}
+	}
+
+	/* Nothing encodes cleanly, fall back to the device minimum */
+	info->epoch_scale = min_scale;
+	info->epoch_mult = min_mult;
+}
+
+static void cxl_hmu_pghot_report(struct cxl_hmu_info *info, u64 unit_id)
+{
+	u64 dpa = unit_id << info->hot_gran;
+	u64 dpa_end = dpa + (1ULL << info->hot_gran);
+
+	count_vm_event(HWHINT_TOTAL_EVENTS);
+	while (dpa < dpa_end) {
+		u64 step = PAGE_SIZE;
+		u64 hpa = cxl_memdev_dpa_to_hpa(info->cxlmd, dpa);
+
+		if (hpa != ULLONG_MAX) {
+			struct page *page = pfn_to_online_page(PHYS_PFN(hpa));
+
+			if (page) {
+				struct folio *folio = page_folio(page);
+
+				step = folio_size(folio);
+				if (!pghot_record_access(folio_pfn(folio),
+							 NUMA_NO_NODE,
+							 PGHOT_HWHINTS,
+							 jiffies))
+					count_vm_event(HWHINT_USEFUL_EVENTS);
+			}
+		}
+		dpa += step;
+	}
+}
+
+static irqreturn_t cxl_hmu_pghot_thread(int irq, void *data)
+{
+	struct cxl_hmu_info *info = data;
+	u64 hl_off = readq(info->base + CHMU_INST0_HOTLIST_OFFSET_REG);
+	u16 top = FIELD_GET(CHMU_INST0_CAP0_HOTLIST_SIZE_MSK,
+			    readq(info->base + CHMU_INST0_CAP0_REG));
+	u16 head, tail;
+	u64 status;
+	u8 width;
+
+	status = readq(info->base + CHMU_INST0_STATUS_REG);
+	if (!FIELD_GET(CHMU_INST0_STATUS_OVRFLW, status) &&
+	    !FIELD_GET(CHMU_INST0_STATUS_FILLTHRESH, status))
+		return IRQ_NONE;
+
+	if (FIELD_GET(CHMU_INST0_STATUS_OVRFLW, status))
+		count_vm_event(HWHINT_DROPPED_EVENTS);
+
+	width = FIELD_GET(CHMU_INST0_STATUS_COUNTER_WIDTH_MSK, status);
+	head = readw(info->base + CHMU_INST0_HEAD_REG);
+	tail = readw(info->base + CHMU_INST0_TAIL_REG);
+
+	while (head != tail) {
+		u64 entry = readq(info->base + hl_off + head * 8);
+
+		cxl_hmu_pghot_report(info, entry >> width);
+		head = (head + 1) % top;
+	}
+	writew(head, info->base + CHMU_INST0_HEAD_REG);
+
+	/*
+	 * Level interrupts so should trigger on next fill, hence no
+	 * problem with races (same protocol as the perf path).
+	 */
+	writeq(status, info->base + CHMU_INST0_STATUS_REG);
+
+	return IRQ_HANDLED;
+}
+
+static void cxl_hmu_pghot_stop(void *data)
+{
+	struct cxl_hmu_info *info = data;
+	u64 status, val;
+
+	guard(raw_spinlock)(&info->lock);
+	status = readq(info->base + CHMU_INST0_STATUS_REG);
+	if (!FIELD_GET(CHMU_INST0_STATUS_ENABLED, status))
+		return;
+
+	val = readq(info->base + CHMU_INST0_CFG0_REG);
+	val &= ~CHMU_INST0_CFG0_ENABLE;
+	writeq(val, info->base + CHMU_INST0_CFG0_REG);
+	readq_poll_timeout_atomic(info->base + CHMU_INST0_STATUS_REG, status,
+		(FIELD_GET(CHMU_INST0_STATUS_OP_INPROG_MSK, status) == 0),
+		10, 100000);
+}
+
+/*
+ * Claim an instance for in-kernel consumption: program it with defaults
+ * derived from the capabilities and feed each reported hot unit to pghot
+ * as a hardware hints source. Returns -ENODEV when pghot mode is not
+ * requested or the instance cannot support it, in which case the caller
+ * falls back to registering the perf PMU.
+ */
+static int cxl_hmu_pghot_attach(struct device *dev, struct cxl_hmu_info *info,
+				const char *name)
+{
+	u64 cap0 = readq(info->base + CHMU_INST0_CAP0_REG);
+	u64 cap1 = readq(info->base + CHMU_INST0_CAP1_REG);
+	unsigned long gran_sup = FIELD_GET(CHMU_INST0_CAP1_UNIT_SIZE_MSK, cap1);
+	u16 ds_sup = FIELD_GET(CHMU_INST0_CAP1_DOWNSAMP_MSK, cap1);
+	u64 hl_off = readq(info->base + CHMU_INST0_HOTLIST_OFFSET_REG);
+	u64 bm_off = readq(info->base + CHMU_INST0_RANGE_BITMAP_OFFSET_REG);
+	int rc, b;
+
+	if (!pghot_mode)
+		return -ENODEV;
+
+	if (!gran_sup)
+		return -ENODEV;
+
+	if (FIELD_GET(CHMU_INST0_CAP1_EPOCH_SUP, cap1))
+		info->reporting_mode = CHMU_MODE_EPOCH;
+	else if (FIELD_GET(CHMU_INST0_CAP1_ALWAYS_ON_SUP, cap1))
+		info->reporting_mode = CHMU_MODE_ALWAYS_ON;
+	else
+		return -ENODEV;
+
+	/* Smallest supported unit size of at least a page */
+	info->hot_gran = 0;
+	for_each_set_bit(b, &gran_sup, 32) {
+		if (8 + b >= PAGE_SHIFT) {
+			info->hot_gran = 8 + b;
+			break;
+		}
+	}
+	if (!info->hot_gran)
+		return -ENODEV;
+
+	info->m2s_requests_to_track = CHMU_INST0_CFG0_WHAT_NONTEE_RW;
+	info->ds_factor_pow2 = ds_sup ? ffs(ds_sup) - 1 : 0;
+	info->randomized_ds = false;
+	cxl_hmu_pghot_pick_epoch(info, cap0);
+	if (!info->epoch_mult)
+		return -ENODEV;
+	info->hot_thresh = pghot_thresh;
+	info->range_base = 0;
+	info->range_num = (hl_off - bm_off) * 8;
+
+	rc = devm_request_threaded_irq(dev, info->irq, NULL,
+				       cxl_hmu_pghot_thread, IRQF_ONESHOT,
+				       name, info);
+	if (rc)
+		return rc;
+
+	scoped_guard(raw_spinlock, &info->lock)
+		rc = cxl_hmu_hw_start(dev, info);
+	if (rc)
+		goto err_free_irq;
+
+	rc = devm_add_action_or_reset(dev, cxl_hmu_pghot_stop, info);
+	if (rc)
+		goto err_free_irq;
+
+	dev_info(dev, "%s: feeding pghot (unit 2^%u, threshold %u, epoch %llu ms)\n",
+		 name, info->hot_gran, info->hot_thresh,
+		 chmu_epoch_us(info->epoch_scale, info->epoch_mult) / USEC_PER_MSEC);
+	return 0;
+
+err_free_irq:
+	/*
+	 * Release the vector: the perf fallback requests the same one
+	 * without IRQF_SHARED, so leaving it registered turns any claim
+	 * failure into a flags mismatch that fails the whole probe.
+	 */
+	devm_free_irq(dev, info->irq, info);
+	return rc;
+}
+#else
+static int cxl_hmu_pghot_attach(struct device *dev, struct cxl_hmu_info *info,
+				const char *name)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_CXL_HMU_PGHOT */
+
 static int cxl_hmu_probe(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev->parent);
@@ -750,6 +1001,7 @@ static int cxl_hmu_probe(struct device *dev)
 
 		dev_set_drvdata(dev, info);
 		info->on_cpu = -1;
+		info->cxlmd = hmu->cxlmd;
 		info->base = hmu->base + 0x10 + inst_len * i;
 
 		val = readq(info->base + CHMU_INST0_CAP0_REG);
@@ -790,6 +1042,21 @@ static int cxl_hmu_probe(struct device *dev)
 		if (rc < 0)
 			return rc;
 		info->irq = rc;
+
+		/*
+		 * When pghot mode is enabled, the first instance of each
+		 * CHMU is driven by the kernel and its hot units feed the
+		 * pghot subsystem; remaining instances stay available to
+		 * perf. Fall back to perf on any failure.
+		 */
+		if (i == 0) {
+			rc = cxl_hmu_pghot_attach(dev, info, pmu_name);
+			if (!rc)
+				continue;
+			if (rc != -ENODEV)
+				dev_warn(dev, "CHMU pghot mode failed (%d), using perf\n",
+					 rc);
+		}
 
 		/*
 		 * Whilst there is a 'strong' recomendation that the interrupt

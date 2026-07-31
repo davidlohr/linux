@@ -937,7 +937,7 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			break;
 		}
 
-		rc = devm_cxl_hmu_add(cxlds->dev, &hmu_regs, cxlmd->id, i);
+		rc = devm_cxl_hmu_add(cxlds->dev, &hmu_regs, cxlmd, i);
 		if (rc) {
 			dev_dbg(&pdev->dev, "Could not add HMU instance\n");
 			break;

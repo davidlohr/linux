@@ -251,4 +251,15 @@ config CXL_HMU
 	  via the perf auxbuffer framework.
 
 	  If unsure say N.
+
+config CXL_HMU_PGHOT
+	def_bool CXL_HMU && PGHOT && CXL_REGION
+	select HWMEM_PROFILER
+	help
+	  Compiled-in support for driving CHMU instances in the kernel
+	  and reporting the hot device ranges they find to the pghot hot
+	  page tracking and promotion subsystem as a hardware hints
+	  source. Activation is a runtime decision: load the driver with
+	  cxl_hmu.pghot_mode=1 and enable the hardware hints bit (0x2) in
+	  /proc/sys/vm/pghot_enabled_sources.
 endif

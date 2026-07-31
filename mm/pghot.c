@@ -294,6 +294,7 @@ out:
 	folio_put(folio);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(pghot_record_access);
 
 /*
  * For memory tiering mode, if there are enough free pages (more than

@@ -3440,6 +3440,33 @@ skip_aligned:
 	return hpa;
 }
 
+/**
+ * cxl_memdev_dpa_to_hpa() - translate a DPA on @cxlmd to a host physical address
+ * @cxlmd: memdev that owns @dpa
+ * @dpa: device physical address to translate
+ *
+ * Wrapper for endpoint drivers that only hold the memdev: resolves the
+ * region backing @dpa and translates through the region's decode. Holds
+ * the region rwsem across lookup and translation so the region cannot be
+ * torn down in between. Must be called from sleepable context.
+ *
+ * Returns ULLONG_MAX if @dpa is not mapped by any committed region.
+ */
+u64 cxl_memdev_dpa_to_hpa(struct cxl_memdev *cxlmd, u64 dpa)
+{
+	struct cxl_region *cxlr;
+
+	guard(rwsem_read)(&cxl_rwsem.region);
+	guard(rwsem_read)(&cxl_rwsem.dpa);
+
+	cxlr = cxl_dpa_to_region(cxlmd, dpa);
+	if (!cxlr)
+		return ULLONG_MAX;
+
+	return cxl_dpa_to_hpa(cxlr, cxlmd, dpa);
+}
+EXPORT_SYMBOL_NS_GPL(cxl_memdev_dpa_to_hpa, "CXL");
+
 struct dpa_result {
 	struct cxl_memdev *cxlmd;
 	u64 dpa;

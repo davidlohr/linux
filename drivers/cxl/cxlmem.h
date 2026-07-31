@@ -812,6 +812,14 @@ int cxl_get_dirty_count(struct cxl_memdev_state *mds, u32 *count);
 int cxl_arm_dirty_shutdown(struct cxl_memdev_state *mds);
 int cxl_set_timestamp(struct cxl_memdev_state *mds);
 int cxl_poison_state_init(struct cxl_memdev_state *mds);
+#ifdef CONFIG_CXL_REGION
+u64 cxl_memdev_dpa_to_hpa(struct cxl_memdev *cxlmd, u64 dpa);
+#else
+static inline u64 cxl_memdev_dpa_to_hpa(struct cxl_memdev *cxlmd, u64 dpa)
+{
+	return ULLONG_MAX;
+}
+#endif
 int cxl_mem_get_poison(struct cxl_memdev *cxlmd, u64 offset, u64 len,
 		       struct cxl_region *cxlr);
 int cxl_trigger_poison_list(struct cxl_memdev *cxlmd);

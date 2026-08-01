@@ -43,9 +43,13 @@ DECLARE_STATIC_KEY_FALSE(pghot_src_hwhints);
 
 /*
  * Bits 0-26 are used to store nid, frequency and time.
- * Bits 27-30 are unused now.
+ * Bit 27 indicates the stored nid came from a source that knows which
+ * node accesses the page; without it the reader falls back to the
+ * default promotion target.
+ * Bits 28-30 are unused now.
  * Bit 31 is used to indicate the page is ready for migration.
  */
+#define PGHOT_NID_KNOWN			27
 #define PGHOT_MIGRATE_READY		31
 
 #define PGHOT_NID_WIDTH			10
@@ -67,6 +71,9 @@ DECLARE_STATIC_KEY_FALSE(pghot_src_hwhints);
 #define PGHOT_FREQ_WINDOW_MAX		PGHOT_TIME_MAX
 
 typedef u32 phi_t;
+
+static_assert(MAX_NUMNODES <= (1 << PGHOT_NID_WIDTH),
+	      "pghot precise nid field too narrow for MAX_NUMNODES");
 
 #else	/* !CONFIG_PGHOT_PRECISE */
 #define PGHOT_FREQ_WINDOW_MIN		(1 * MSEC_PER_SEC)

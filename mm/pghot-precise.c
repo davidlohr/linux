@@ -27,10 +27,8 @@ unsigned long pghot_access_latency(unsigned long old_time, unsigned long time)
 
 bool pghot_update_record(phi_t *phi, int nid, unsigned int nr, unsigned long now)
 {
-	phi_t freq, old_freq, hotness, old_hotness, old_time;
+	phi_t freq, old_freq, hotness, old_hotness, old_time, nid_bits;
 	phi_t time = now & PGHOT_TIME_MASK;
-
-	nid = (nid == NUMA_NO_NODE) ? sysctl_pghot_target_nid : nid;
 
 	/*
 	 * The frequency accumulation saturates at PGHOT_FREQ_MAX, so larger
@@ -46,6 +44,24 @@ bool pghot_update_record(phi_t *phi, int nid, unsigned int nr, unsigned long now
 		old_freq = (old_hotness >> PGHOT_FREQ_SHIFT) & PGHOT_FREQ_MASK;
 		old_time = (old_hotness >> PGHOT_TIME_SHIFT) & PGHOT_TIME_MASK;
 
+		/*
+		 * A source that does not know which node accesses the page
+		 * (NUMA_NO_NODE, e.g. device-side hotness trackers) must not
+		 * overwrite locality recorded by one that does (hint faults,
+		 * CPU sampling); carry a known NID forward and leave the
+		 * record unresolved otherwise, so that pghot_get_record()
+		 * falls back to the default promotion target at read time.
+		 */
+		if (nid != NUMA_NO_NODE)
+			nid_bits = ((nid & PGHOT_NID_MASK) << PGHOT_NID_SHIFT) |
+				   BIT(PGHOT_NID_KNOWN);
+		else if (old_hotness & BIT(PGHOT_NID_KNOWN))
+			nid_bits = old_hotness &
+				   ((PGHOT_NID_MASK << PGHOT_NID_SHIFT) |
+				    BIT(PGHOT_NID_KNOWN));
+		else
+			nid_bits = 0;
+
 		if (pghot_access_latency(old_time, time) > sysctl_pghot_freq_window)
 			new_window = true;
 
@@ -54,8 +70,7 @@ bool pghot_update_record(phi_t *phi, int nid, unsigned int nr, unsigned long now
 		else
 			freq = min_t(unsigned int, old_freq + nr, PGHOT_FREQ_MAX);
 
-		hotness = 0;
-		hotness |= (nid & PGHOT_NID_MASK) << PGHOT_NID_SHIFT;
+		hotness = nid_bits;
 		hotness |= (freq & PGHOT_FREQ_MASK) << PGHOT_FREQ_SHIFT;
 		hotness |= (time & PGHOT_TIME_MASK) << PGHOT_TIME_SHIFT;
 
@@ -75,7 +90,10 @@ int pghot_get_record(phi_t *phi, int *nid, int *freq, unsigned long *time)
 			return -EINVAL;
 	} while (unlikely(!try_cmpxchg(phi, &old_hotness, hotness)));
 
-	*nid = (old_hotness >> PGHOT_NID_SHIFT) & PGHOT_NID_MASK;
+	if (old_hotness & BIT(PGHOT_NID_KNOWN))
+		*nid = (old_hotness >> PGHOT_NID_SHIFT) & PGHOT_NID_MASK;
+	else
+		*nid = sysctl_pghot_target_nid;
 	*freq = (old_hotness >> PGHOT_FREQ_SHIFT) & PGHOT_FREQ_MASK;
 	*time = (old_hotness >> PGHOT_TIME_SHIFT) & PGHOT_TIME_MASK;
 	return 0;

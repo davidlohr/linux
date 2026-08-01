@@ -48,10 +48,13 @@ Path: /proc/sys/vm/pghot_enabled_sources
 
 Path: /proc/sys/vm/pghot_target_nid
 
-- Toptier NUMA node ID to which hot pages should be promoted when source
-  does not provide nid. Used when hotness source can't provide accessing
-  NID or when the tracking mode is default.
-- Default: 0
+- Promotion target for hot pages whose source does not provide the
+  accessing NID (or when the tracking mode is default). The default of
+  -1 derives the target per node from the topology: the closest
+  toptier node to the page's node by NUMA distance, recomputed on node
+  hotplug. Writing a toptier node ID overrides this globally; writing
+  -1 returns to the topology-derived behaviour.
+- Default: -1 (topology-derived)
 - Example:
   # echo 1 > /proc/sys/vm/pghot_target_nid
 

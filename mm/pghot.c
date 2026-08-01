@@ -36,7 +36,60 @@ unsigned int kmigrated_sleep_ms = KMIGRATED_SLEEP_MS_DEFAULT;
 unsigned int kmigrated_batch_nr = KMIGRATED_BATCH_NR_DEFAULT;
 
 unsigned int sysctl_pghot_src_enabled = PGHOT_HINTFAULTS_ENABLED;
-unsigned int sysctl_pghot_target_nid = PGHOT_DEFAULT_NODE;
+
+/*
+ * Promotion target for records without locality: NUMA_NO_NODE selects
+ * the topology-derived per-node default (nearest top-tier node to the
+ * page's node); any other value is an explicit global override.
+ */
+int sysctl_pghot_target_nid = NUMA_NO_NODE;
+
+/* Nearest top-tier node for each node, by node_distance() */
+static int pghot_topo_target[MAX_NUMNODES] = {
+	[0 ... MAX_NUMNODES - 1] = NUMA_NO_NODE
+};
+
+/*
+ * Recompute the per-node topology-derived promotion target: the
+ * closest top-tier node by node_distance(), ties broken towards the
+ * lowest node id. Called at init and on node hotplug, after the
+ * memory tiers have been updated.
+ */
+static void pghot_topo_targets_update(void)
+{
+	int nid, tnid;
+
+	for_each_node(nid) {
+		int best = NUMA_NO_NODE, best_dist = INT_MAX;
+
+		for_each_node_state(tnid, N_MEMORY) {
+			if (!node_is_toptier(tnid))
+				continue;
+			if (node_distance(nid, tnid) < best_dist) {
+				best_dist = node_distance(nid, tnid);
+				best = tnid;
+			}
+		}
+		WRITE_ONCE(pghot_topo_target[nid], best);
+	}
+}
+
+/*
+ * Resolve the promotion target for a record whose source did not know
+ * the accessing node. Promoting to the nearest top-tier node never
+ * increases the access latency of any possible accessor, unlike a
+ * fixed global target which can move memory further away from its
+ * users than where it started.
+ */
+static int pghot_promotion_target(int src_nid)
+{
+	int nid = READ_ONCE(sysctl_pghot_target_nid);
+
+	if (nid != NUMA_NO_NODE)
+		return nid;
+
+	return READ_ONCE(pghot_topo_target[src_nid]);
+}
 unsigned int sysctl_pghot_freq_window = PGHOT_FREQ_WINDOW_DEFAULT;
 unsigned int sysctl_pghot_freq_threshold = PGHOT_FREQ_THRESHOLD_DEFAULT;
 
@@ -100,7 +153,7 @@ static int sysctl_target_nid_handler(const struct ctl_table *table, int write,
 {
 	struct ctl_table t;
 	int err;
-	unsigned int nid;
+	int nid;
 
 	guard(mutex)(&pghot_tunables_lock);
 
@@ -112,8 +165,9 @@ static int sysctl_target_nid_handler(const struct ctl_table *table, int write,
 		return err;
 
 	if (write) {
-		if (!numa_valid_node(nid) || nid > PGHOT_NID_MAX ||
-		    !node_online(nid) || !node_is_toptier(nid))
+		if (nid != NUMA_NO_NODE &&
+		    (!numa_valid_node(nid) || nid > PGHOT_NID_MAX ||
+		     !node_online(nid) || !node_is_toptier(nid)))
 			return -EINVAL;
 		sysctl_pghot_target_nid = nid;
 	}
@@ -577,6 +631,17 @@ static void kmigrated_walk_zone(unsigned long start_pfn, unsigned long end_pfn,
 			goto out_next;
 		}
 
+		/*
+		 * Records without locality resolve to the topology-derived
+		 * (or overridden) promotion target at consume time.
+		 */
+		if (nid == NUMA_NO_NODE)
+			nid = pghot_promotion_target(src_nid);
+		if (nid == NUMA_NO_NODE) {
+			folio_put(folio);
+			goto out_next;
+		}
+
 		if (folio_nid(folio) == nid) {
 			folio_put(folio);
 			goto out_next;
@@ -881,12 +946,14 @@ static int pghot_node_callback(struct notifier_block *self,
 
 	switch (action) {
 	case NODE_ADDED_FIRST_MEMORY:
+		pghot_topo_targets_update();
 		if (node_is_toptier(nn->nid))
 			break;
 		pghot_alloc_node_hotmaps(nn->nid);
 		kmigrated_run(nn->nid);
 		break;
 	case NODE_REMOVED_LAST_MEMORY:
+		pghot_topo_targets_update();
 		kmigrated_stop(nn->nid);
 		break;
 	}
@@ -1057,29 +1124,6 @@ static void __init pghot_src_enabled_init(void)
 		static_branch_enable(&pghot_src_hwhints);
 }
 
-/*
- * The sysctl handler validates every value written to
- * vm.pghot_target_nid, but the compiled-in default (node 0) never
- * passes through it. On systems where node 0 is not a toptier node,
- * promotions in the default tracking mode would target a lower tier
- * until the sysctl is first written. Derive a valid default instead.
- */
-static void __init pghot_target_nid_init(void)
-{
-	int nid;
-
-	if (node_online(sysctl_pghot_target_nid) &&
-	    node_is_toptier(sysctl_pghot_target_nid))
-		return;
-
-	for_each_node_state(nid, N_MEMORY) {
-		if (node_is_toptier(nid)) {
-			sysctl_pghot_target_nid = nid;
-			return;
-		}
-	}
-}
-
 static int __init pghot_init(void)
 {
 	pg_data_t *pgdat;
@@ -1102,7 +1146,7 @@ static int __init pghot_init(void)
 	if (ret)
 		goto out_stop_kthread;
 
-	pghot_target_nid_init();
+	pghot_topo_targets_update();
 	pghot_sysctl_init();
 	pghot_debug_init();
 	pghot_src_enabled_init();

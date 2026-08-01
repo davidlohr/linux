@@ -4,7 +4,8 @@
  *
  * 1 byte hotness record per PFN.
  * Bucketed time and frequency tracked as part of the record.
- * Promotion to @sysctl_pghot_target_nid by default.
+ * No locality is stored; the consumer resolves the promotion target
+ * (topology-derived, or the vm.pghot_target_nid override).
  */
 
 #include <linux/pghot.h>
@@ -73,7 +74,7 @@ int pghot_get_record(phi_t *phi, int *nid, int *freq, unsigned long *time)
 			return -EINVAL;
 	} while (unlikely(!try_cmpxchg(phi, &old_hotness, hotness)));
 
-	*nid = sysctl_pghot_target_nid;
+	*nid = NUMA_NO_NODE;
 	*freq = (old_hotness >> PGHOT_FREQ_SHIFT) & PGHOT_FREQ_MASK;
 	*time = (old_hotness >> PGHOT_TIME_SHIFT) & PGHOT_TIME_MASK;
 	return 0;

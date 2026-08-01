@@ -13,7 +13,7 @@ enum pghot_src {
 #include <linux/static_key.h>
 #include <linux/mutex.h>
 
-extern unsigned int sysctl_pghot_target_nid;
+extern int sysctl_pghot_target_nid;
 extern unsigned int sysctl_pghot_freq_window;
 extern unsigned int sysctl_pghot_freq_threshold;
 extern struct mutex pghot_tunables_lock;
@@ -34,8 +34,6 @@ DECLARE_STATIC_KEY_FALSE(pghot_src_hwhints);
 #define KMIGRATED_BATCH_NR_MIN		64
 #define KMIGRATED_BATCH_NR_DEFAULT	512
 #define KMIGRATED_BATCH_NR_MAX		1024
-
-#define PGHOT_DEFAULT_NODE		0
 
 #if defined(CONFIG_PGHOT_PRECISE)
 #define PGHOT_FREQ_WINDOW_MIN		(1 * MSEC_PER_SEC)

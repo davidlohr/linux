@@ -90,10 +90,14 @@ int pghot_get_record(phi_t *phi, int *nid, int *freq, unsigned long *time)
 			return -EINVAL;
 	} while (unlikely(!try_cmpxchg(phi, &old_hotness, hotness)));
 
+	/*
+	 * NUMA_NO_NODE reports that no source knew the accessing node;
+	 * the consumer resolves the promotion target.
+	 */
 	if (old_hotness & BIT(PGHOT_NID_KNOWN))
 		*nid = (old_hotness >> PGHOT_NID_SHIFT) & PGHOT_NID_MASK;
 	else
-		*nid = sysctl_pghot_target_nid;
+		*nid = NUMA_NO_NODE;
 	*freq = (old_hotness >> PGHOT_FREQ_SHIFT) & PGHOT_FREQ_MASK;
 	*time = (old_hotness >> PGHOT_TIME_SHIFT) & PGHOT_TIME_MASK;
 	return 0;

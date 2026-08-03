@@ -822,35 +822,54 @@ static void cxl_hmu_pghot_report(struct cxl_hmu_info *info, u64 unit_id,
 
 	/*
 	 * The unit is contiguous in DPA space but interleaving may break
-	 * it up in HPA space, so translate page by page and hand each
-	 * physically contiguous run to pghot as a single range. On a
-	 * non-interleaved region the whole unit is one run.
+	 * it up in HPA space. Translate by contiguous extent - the whole
+	 * remaining span on a non-interleaved region, one interleave
+	 * granule otherwise - and hand each physically contiguous run to
+	 * pghot as a single range.
 	 *
-	 * A unit can span up to 2GB, half a million translations, and a
-	 * physically contiguous run defers the (rescheduling) pghot call
-	 * until the run ends, so yield explicitly on each iteration.
+	 * A unit can span up to 2GB and a physically contiguous run
+	 * defers the (rescheduling) pghot call until the run ends, so
+	 * yield explicitly on each iteration.
 	 */
-	for (; dpa < dpa_end; dpa += PAGE_SIZE) {
-		u64 hpa = cxl_memdev_dpa_to_hpa(info->cxlmd, dpa);
+	while (dpa < dpa_end) {
+		u64 len;
+		u64 hpa = cxl_memdev_dpa_to_hpa_range(info->cxlmd, dpa, &len);
 
 		cond_resched();
-		if (run_len && hpa == run_hpa + run_len) {
-			run_len += PAGE_SIZE;
+		if (hpa == ULLONG_MAX) {
+			if (run_len &&
+			    pghot_record_range(PHYS_PFN(run_hpa),
+					       run_len >> PAGE_SHIFT,
+					       NUMA_NO_NODE, PGHOT_HWHINTS, nr,
+					       jiffies) > 0)
+				useful = true;
+			run_len = 0;
+			dpa += PAGE_SIZE;
 			continue;
 		}
 
-		if (run_len &&
-		    pghot_record_range(PHYS_PFN(run_hpa), run_len >> PAGE_SHIFT,
-				       NUMA_NO_NODE, PGHOT_HWHINTS, nr,
-				       jiffies) > 0)
-			useful = true;
+		/*
+		 * An interleave granularity below page size cannot extend
+		 * a pfn run; record the page the extent lands in and step
+		 * a page of DPA, as the page-wise walk did.
+		 */
+		if (len < PAGE_SIZE)
+			len = PAGE_SIZE;
+		len = min(len, dpa_end - dpa);
 
-		if (hpa != ULLONG_MAX) {
-			run_hpa = hpa;
-			run_len = PAGE_SIZE;
+		if (run_len && hpa == run_hpa + run_len) {
+			run_len += len;
 		} else {
-			run_len = 0;
+			if (run_len &&
+			    pghot_record_range(PHYS_PFN(run_hpa),
+					       run_len >> PAGE_SHIFT,
+					       NUMA_NO_NODE, PGHOT_HWHINTS, nr,
+					       jiffies) > 0)
+				useful = true;
+			run_hpa = hpa;
+			run_len = len;
 		}
+		dpa += len;
 	}
 
 	if (run_len &&

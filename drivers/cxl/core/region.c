@@ -3467,6 +3467,78 @@ u64 cxl_memdev_dpa_to_hpa(struct cxl_memdev *cxlmd, u64 dpa)
 }
 EXPORT_SYMBOL_NS_GPL(cxl_memdev_dpa_to_hpa, "CXL");
 
+/**
+ * cxl_memdev_dpa_to_hpa_range() - translate a DPA and report how far the
+ *				   translation stays contiguous
+ * @cxlmd: memdev that owns @dpa
+ * @dpa: device physical address to translate
+ * @len: on success, the number of bytes from @dpa (inclusive) that are
+ *	 guaranteed to map to host physical addresses contiguous with the
+ *	 returned one
+ *
+ * Every decode keeps the address bits below the interleave granularity
+ * intact - the aligned modulo math, the unaligned MOD3 reconstruction
+ * and root decoder address translation all select targets from bits at
+ * or above the granularity shift - so a translation is always contiguous
+ * to the end of the interleave granule the DPA falls in. Only the plain
+ * linear decode (a single way, no root decoder address translation, an
+ * aligned modulo decode) is contiguous beyond that, out to the end of
+ * the region.
+ *
+ * Callers that walk a DPA span can advance by *len per translation
+ * instead of translating page by page.  Same locking and context rules
+ * as cxl_memdev_dpa_to_hpa().
+ *
+ * Returns ULLONG_MAX (and *len == 0) if @dpa is not mapped by any
+ * committed region.
+ */
+u64 cxl_memdev_dpa_to_hpa_range(struct cxl_memdev *cxlmd, u64 dpa, u64 *len)
+{
+	struct cxl_endpoint_decoder *cxled = NULL;
+	struct cxl_region_params *p;
+	struct cxl_region *cxlr;
+	u64 hpa, base, gran;
+
+	*len = 0;
+
+	guard(rwsem_read)(&cxl_rwsem.region);
+	guard(rwsem_read)(&cxl_rwsem.dpa);
+
+	cxlr = cxl_dpa_to_region(cxlmd, dpa);
+	if (!cxlr)
+		return ULLONG_MAX;
+
+	hpa = cxl_dpa_to_hpa(cxlr, cxlmd, dpa);
+	if (hpa == ULLONG_MAX)
+		return ULLONG_MAX;
+
+	p = &cxlr->params;
+	if (p->interleave_ways == 1 && !cxlr->cxlrd->ops.hpa_to_spa &&
+	    !region_is_unaligned_mod3(cxlr)) {
+		*len = p->res->end - hpa + 1;
+		return hpa;
+	}
+
+	for (int i = 0; i < p->nr_targets; i++) {
+		if (cxlmd == cxled_to_memdev(p->targets[i])) {
+			cxled = p->targets[i];
+			break;
+		}
+	}
+	if (!cxled)
+		return ULLONG_MAX;
+
+	base = cxl_dpa_resource_start(cxled);
+	if (base == RESOURCE_SIZE_MAX)
+		return ULLONG_MAX;
+
+	/* The granule phase follows the decoder-relative DPA offset */
+	gran = p->interleave_granularity;
+	*len = gran - ((dpa - base) & (gran - 1));
+	return hpa;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_memdev_dpa_to_hpa_range, "CXL");
+
 struct dpa_result {
 	struct cxl_memdev *cxlmd;
 	u64 dpa;

@@ -814,9 +814,17 @@ int cxl_set_timestamp(struct cxl_memdev_state *mds);
 int cxl_poison_state_init(struct cxl_memdev_state *mds);
 #ifdef CONFIG_CXL_REGION
 u64 cxl_memdev_dpa_to_hpa(struct cxl_memdev *cxlmd, u64 dpa);
+u64 cxl_memdev_dpa_to_hpa_range(struct cxl_memdev *cxlmd, u64 dpa, u64 *len);
 #else
 static inline u64 cxl_memdev_dpa_to_hpa(struct cxl_memdev *cxlmd, u64 dpa)
 {
+	return ULLONG_MAX;
+}
+
+static inline u64 cxl_memdev_dpa_to_hpa_range(struct cxl_memdev *cxlmd,
+					      u64 dpa, u64 *len)
+{
+	*len = 0;
 	return ULLONG_MAX;
 }
 #endif

@@ -430,18 +430,85 @@ static const struct attribute_group *cxl_decoder_switch_attribute_groups[] = {
 	NULL,
 };
 
+static const char * const cxl_media_op_policies[] = {
+	[CXL_MEDIA_OP_POLICY_NONE] = "none",
+	[CXL_MEDIA_OP_POLICY_ZERO] = "zero",
+	[CXL_MEDIA_OP_POLICY_SANITIZE] = "sanitize",
+};
+
+static ssize_t cleanup_on_free_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct cxl_endpoint_decoder *cxled = to_cxl_endpoint_decoder(dev);
+
+	return sysfs_emit(buf, "%s\n",
+			  cxl_media_op_policies[cxled->cleanup_on_free]);
+}
+
+static ssize_t cleanup_on_free_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t len)
+{
+	struct cxl_endpoint_decoder *cxled = to_cxl_endpoint_decoder(dev);
+	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlmd->cxlds);
+	int policy, rc;
+
+	policy = sysfs_match_string(cxl_media_op_policies, buf);
+	if (policy < 0)
+		return policy;
+
+	if (policy == CXL_MEDIA_OP_POLICY_ZERO &&
+	    !mds->media_op.zero_supported)
+		return -EOPNOTSUPP;
+	if (policy == CXL_MEDIA_OP_POLICY_SANITIZE &&
+	    !mds->media_op.sanitize_supported)
+		return -EOPNOTSUPP;
+	/* dpa_size allocations are 256M aligned */
+	if (policy != CXL_MEDIA_OP_POLICY_NONE &&
+	    mds->media_op.granularity > SZ_256M)
+		return -EOPNOTSUPP;
+
+	ACQUIRE(rwsem_write_kill, rwsem)(&cxl_rwsem.dpa);
+	if ((rc = ACQUIRE_ERR(rwsem_write_kill, &rwsem)))
+		return rc;
+
+	cxled->cleanup_on_free = policy;
+	return len;
+}
+static DEVICE_ATTR_RW(cleanup_on_free);
+
 static struct attribute *cxl_decoder_endpoint_attrs[] = {
 	&dev_attr_target_type.attr,
 	&dev_attr_mode.attr,
 	&dev_attr_back_invalidate.attr,
 	&dev_attr_dpa_size.attr,
 	&dev_attr_dpa_resource.attr,
+	&dev_attr_cleanup_on_free.attr,
 	SET_CXL_REGION_ATTR(region)
 	NULL,
 };
 
+static umode_t cxl_decoder_endpoint_visible(struct kobject *kobj,
+					    struct attribute *a, int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct cxl_endpoint_decoder *cxled = to_cxl_endpoint_decoder(dev);
+	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlmd->cxlds);
+
+	/* only where the device reported a media operation to apply */
+	if (a == &dev_attr_cleanup_on_free.attr &&
+	    (!mds || (!mds->media_op.zero_supported &&
+		      !mds->media_op.sanitize_supported)))
+		return 0;
+
+	return a->mode;
+}
+
 static struct attribute_group cxl_decoder_endpoint_attribute_group = {
 	.attrs = cxl_decoder_endpoint_attrs,
+	.is_visible = cxl_decoder_endpoint_visible,
 };
 
 static const struct attribute_group *cxl_decoder_endpoint_attribute_groups[] = {

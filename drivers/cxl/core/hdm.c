@@ -543,24 +543,78 @@ bool cxl_resource_contains_addr(const struct resource *res, const resource_size_
 
 int cxl_dpa_free(struct cxl_endpoint_decoder *cxled)
 {
+	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlmd->cxlds);
 	struct cxl_port *port = cxled_to_port(cxled);
 	struct device *dev = &cxled->cxld.dev;
+	resource_size_t start, len;
+	u8 subclass;
+	int rc;
+
+	scoped_guard(rwsem_write, &cxl_rwsem.dpa) {
+		if (!cxled->dpa_res)
+			return 0;
+		if (cxled->cxld.region) {
+			dev_dbg(dev, "decoder assigned to: %s\n",
+				dev_name(&cxled->cxld.region->dev));
+			return -EBUSY;
+		}
+		if (cxled->cxld.flags & CXL_DECODER_F_ENABLE) {
+			dev_dbg(dev, "decoder enabled\n");
+			return -EBUSY;
+		}
+		if (cxled->cxld.id != port->hdm_end) {
+			dev_dbg(dev, "expected decoder%d.%d\n", port->id,
+				port->hdm_end);
+			return -EBUSY;
+		}
+		if (cxled->cleanup_state == CXL_CLEANUP_ACTIVE) {
+			dev_dbg(dev, "cleanup in progress\n");
+			return -EBUSY;
+		}
+
+		if (cxled->cleanup_on_free == CXL_MEDIA_OP_POLICY_NONE ||
+		    !mds) {
+			/* only a successful cleanup frees a dirty range */
+			if (cxled->cleanup_state == CXL_CLEANUP_DIRTY) {
+				dev_dbg(dev, "dirty, retry with a policy\n");
+				return -EBUSY;
+			}
+			devm_cxl_dpa_release(cxled);
+			return 0;
+		}
+
+		if (cxled->cleanup_on_free == CXL_MEDIA_OP_POLICY_SANITIZE)
+			subclass = CXL_MEDIA_OP_SANITIZE_SANITIZE;
+		else
+			subclass = CXL_MEDIA_OP_SANITIZE_ZERO;
+
+		/* the decoder keeps the range until the device is done */
+		start = cxled->dpa_res->start;
+		len = resource_size(cxled->dpa_res);
+		cxled->cleanup_state = CXL_CLEANUP_ACTIVE;
+	}
+
+	rc = cxl_media_op_run(mds, CXL_MEDIA_OP_CLASS_SANITIZE, subclass,
+			      start, len);
 
 	guard(rwsem_write)(&cxl_rwsem.dpa);
+	cxled->cleanup_state = CXL_CLEANUP_IDLE;
+
+	/* port teardown released it underneath */
 	if (!cxled->dpa_res)
-		return 0;
-	if (cxled->cxld.region) {
-		dev_dbg(dev, "decoder assigned to: %s\n",
-			dev_name(&cxled->cxld.region->dev));
-		return -EBUSY;
+		return -ENODEV;
+
+	/* unknown media state: hold the range until a retry succeeds */
+	if (rc) {
+		cxled->cleanup_state = CXL_CLEANUP_DIRTY;
+		dev_warn(dev, "cleanup failed: %d, DPA held dirty\n", rc);
+		return rc;
 	}
-	if (cxled->cxld.flags & CXL_DECODER_F_ENABLE) {
-		dev_dbg(dev, "decoder enabled\n");
-		return -EBUSY;
-	}
+
+	/* a decoder allocated above in the meantime pins this one */
 	if (cxled->cxld.id != port->hdm_end) {
-		dev_dbg(dev, "expected decoder%d.%d\n", port->id,
-			port->hdm_end);
+		dev_warn(dev, "clean, not freed: higher decoder allocated\n");
 		return -EBUSY;
 	}
 

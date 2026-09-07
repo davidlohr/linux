@@ -2134,6 +2134,12 @@ static int cxl_region_attach(struct cxl_region *cxlr,
 		return -ENODEV;
 	}
 
+	if (cxled->cleanup_state != CXL_CLEANUP_IDLE) {
+		dev_dbg(&cxlr->dev, "%s cleanup pending\n",
+			dev_name(&cxled->cxld.dev));
+		return -EBUSY;
+	}
+
 	if (cxlds->part[cxled->part].mode != cxlr->mode) {
 		dev_dbg(&cxlr->dev, "%s region mode: %d mismatch\n",
 			dev_name(&cxled->cxld.dev), cxlr->mode);

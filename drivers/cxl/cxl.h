@@ -357,6 +357,20 @@ enum cxl_decoder_state {
 	CXL_DECODER_STATE_AUTO_STAGED,
 };
 
+/* Media operation applied to a decoder's freed DPA */
+enum cxl_media_op_policy {
+	CXL_MEDIA_OP_POLICY_NONE = 0,
+	CXL_MEDIA_OP_POLICY_ZERO,
+	CXL_MEDIA_OP_POLICY_SANITIZE,
+};
+
+/* a failed cleanup-on-free holds the range until a retry succeeds */
+enum cxl_cleanup_state {
+	CXL_CLEANUP_IDLE = 0,
+	CXL_CLEANUP_ACTIVE,
+	CXL_CLEANUP_DIRTY,
+};
+
 /**
  * struct cxl_endpoint_decoder - Endpoint  / SPA to DPA decoder
  * @cxld: base cxl_decoder_object
@@ -365,12 +379,16 @@ enum cxl_decoder_state {
  * @state: autodiscovery state
  * @part: partition index this decoder maps
  * @pos: interleave position in @cxld.region
+ * @cleanup_on_free: media operation applied to the DPA when freed
+ * @cleanup_state: cleanup-on-free in flight, or failed and holding the range
  */
 struct cxl_endpoint_decoder {
 	struct cxl_decoder cxld;
 	struct resource *dpa_res;
 	resource_size_t skip;
 	enum cxl_decoder_state state;
+	enum cxl_media_op_policy cleanup_on_free;
+	enum cxl_cleanup_state cleanup_state;
 	int part;
 	int pos;
 };

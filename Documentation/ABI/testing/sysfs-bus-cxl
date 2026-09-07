@@ -387,8 +387,39 @@ Description:
 		instance number disabled decoder with non-zero size. I.e.
 		allocations are enforced to occur in increasing 'decoderX.Y/id'
 		order and frees are enforced to occur in decreasing
-		'decoderX.Y/id' order.
+		'decoderX.Y/id' order. With 'decoderX.Y/cleanup_on_free' set,
+		releasing the previous allocation waits for the device to
+		clean it; see that attribute.
 
+What:		/sys/bus/cxl/devices/decoderX.Y/cleanup_on_free
+Date:		September, 2026
+KernelVersion:	v7.4
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RW) Selects the Media Operation applied to an endpoint
+		decoder's DPA when that DPA is freed via 'dpa_size': 'none',
+		'zero' or 'sanitize'. With a policy set, a 'dpa_size' write
+		keeps the range allocated and blocks until the device has
+		completed the operation over it, and only then frees it. The
+		operation is issued in chunks and the write can be interrupted
+		by a fatal signal between them.
+
+		If the operation fails or is interrupted, the range stays
+		allocated and is held dirty: the decoder cannot be attached to
+		a region and cannot be freed with the policy set to 'none'. A
+		further free with a policy set retries the operation, and the
+		range is freed once a retry succeeds. If a higher decoder was
+		allocated while the operation ran, the range was cleaned but
+		stays allocated until that decoder is freed; freeing it again
+		runs the operation again.
+
+		The policy applies only to 'dpa_size' writes: driver unbind
+		and device removal release the range without it, and do not
+		preserve the policy. Writing an operation the device did not
+		report as supported fails, as does writing a policy when the
+		device's operation granularity exceeds the alignment of
+		'dpa_size' allocations. If this file is not present, the
+		device does not support media operations.
 
 What:		/sys/bus/cxl/devices/decoderX.Y/interleave_ways
 Date:		May, 2022

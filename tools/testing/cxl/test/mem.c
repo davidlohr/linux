@@ -112,6 +112,11 @@ static struct cxl_cel_entry mock_cel[] = {
 				      EFFECT(SECURITY_CHANGE_IMMEDIATE) |
 				      EFFECT(BACKGROUND_OP)),
 	},
+	{
+		.opcode = cpu_to_le16(CXL_MBOX_OP_MEDIA_OPERATION),
+		.effect = cpu_to_le16(EFFECT(DATA_CHANGE_IMMEDIATE) |
+				      EFFECT(BACKGROUND_OP)),
+	},
 };
 
 /* See CXL 2.0 Table 181 Get Health Info Output Payload */
@@ -180,6 +185,7 @@ struct cxl_mockmem_data {
 	u8 event_buf[SZ_4K];
 	u64 timestamp;
 	unsigned long sanitize_timeout;
+	unsigned long media_op_timeout;
 	struct vendor_test_feat test_feat;
 	u8 shutdown_state;
 };
@@ -731,6 +737,114 @@ static int mock_secure_erase(struct cxl_mockmem_data *mdata,
 	}
 
 	return 0;
+}
+
+/* CXL 4.0 Table 8-333: power of 2 and a multiple of 40h */
+#define MOCK_MEDIA_OP_GRANULARITY SZ_64
+
+static const struct {
+	u8 class;
+	u8 subclass;
+} mock_media_ops[] = {
+	{ CXL_MEDIA_OP_CLASS_SANITIZE, CXL_MEDIA_OP_SANITIZE_SANITIZE },
+	{ CXL_MEDIA_OP_CLASS_SANITIZE, CXL_MEDIA_OP_SANITIZE_ZERO },
+};
+
+static int mock_media_op_discovery(struct cxl_mbox_cmd *cmd)
+{
+	struct cxl_mbox_media_op_discovery_in *in = cmd->payload_in;
+	struct cxl_mbox_media_op_discovery_out *out = cmd->payload_out;
+	u16 start, num, i;
+
+	if (cmd->size_in != sizeof(*in))
+		return -EINVAL;
+
+	start = le16_to_cpu(in->start_index);
+	num = le16_to_cpu(in->num_ops);
+
+	/* Table 8-331: no ranges, and Start Index within the list */
+	if (in->dpa_range_count || start >= ARRAY_SIZE(mock_media_ops)) {
+		cmd->return_code = CXL_MBOX_CMD_RC_INPUT;
+		return -EINVAL;
+	}
+
+	num = min_t(u16, num, ARRAY_SIZE(mock_media_ops) - start);
+	if (cmd->size_out < struct_size(out, ops, num))
+		return -EINVAL;
+
+	out->granularity = cpu_to_le64(MOCK_MEDIA_OP_GRANULARITY);
+	out->total_supported = cpu_to_le16(ARRAY_SIZE(mock_media_ops));
+	out->num_returned = cpu_to_le16(num);
+	for (i = 0; i < num; i++) {
+		out->ops[i].class = mock_media_ops[start + i].class;
+		out->ops[i].subclass = mock_media_ops[start + i].subclass;
+	}
+	cmd->size_out = struct_size(out, ops, num);
+
+	return 0;
+}
+
+static int mock_media_op_sanitize(struct cxl_mockmem_data *mdata,
+				  struct cxl_mbox_cmd *cmd)
+{
+	struct cxl_memdev_state *mds = mdata->mds;
+	struct cxl_mbox_media_op_input *in = cmd->payload_in;
+	u32 count, i;
+
+	if (cmd->size_out != 0)
+		return -EINVAL;
+
+	count = le32_to_cpu(in->dpa_range_count);
+	if (cmd->size_in != struct_size(in, dpa_range_list, count))
+		return -EINVAL;
+
+	for (i = 0; i < count; i++) {
+		u64 dpa = le64_to_cpu(in->dpa_range_list[i].starting_dpa);
+		u64 len = le64_to_cpu(in->dpa_range_list[i].length);
+
+		/* 8.2.10.9.5.3: unaligned or invalid media locations */
+		if (!IS_ALIGNED(dpa, MOCK_MEDIA_OP_GRANULARITY) ||
+		    !IS_ALIGNED(len, MOCK_MEDIA_OP_GRANULARITY) ||
+		    dpa >= DEV_SIZE || len > DEV_SIZE - dpa) {
+			cmd->return_code = CXL_MBOX_CMD_RC_INPUT;
+			return -EINVAL;
+		}
+	}
+
+	if (mds->security.sanitize_active) {
+		cmd->return_code = CXL_MBOX_CMD_RC_BUSY;
+		return -EBUSY;
+	}
+
+	if (mdata->media_op_timeout)
+		msleep(mdata->media_op_timeout);
+
+	dev_dbg(mds->cxlds.dev, "media operation %u.%u: %u range(s)\n",
+		in->class, in->subclass, count);
+
+	return 0;
+}
+
+static int mock_media_operation(struct cxl_mockmem_data *mdata,
+				struct cxl_mbox_cmd *cmd)
+{
+	struct cxl_mbox_media_op_input *in = cmd->payload_in;
+
+	if (cmd->size_in < sizeof(*in))
+		return -EINVAL;
+
+	if (in->class == CXL_MEDIA_OP_CLASS_GENERAL &&
+	    in->subclass == CXL_MEDIA_OP_GENERAL_DISCOVERY)
+		return mock_media_op_discovery(cmd);
+
+	if (in->class == CXL_MEDIA_OP_CLASS_SANITIZE &&
+	    (in->subclass == CXL_MEDIA_OP_SANITIZE_SANITIZE ||
+	     in->subclass == CXL_MEDIA_OP_SANITIZE_ZERO))
+		return mock_media_op_sanitize(mdata, cmd);
+
+	/* 8.2.10.9.5.3: an unsupported operation is Invalid Input */
+	cmd->return_code = CXL_MBOX_CMD_RC_INPUT;
+	return -EINVAL;
 }
 
 static int mock_get_security_state(struct cxl_mockmem_data *mdata,
@@ -1604,6 +1718,9 @@ static int cxl_mock_mbox_send(struct cxl_mailbox *cxl_mbox,
 	case CXL_MBOX_OP_SECURE_ERASE:
 		rc = mock_secure_erase(mdata, cmd);
 		break;
+	case CXL_MBOX_OP_MEDIA_OPERATION:
+		rc = mock_media_operation(mdata, cmd);
+		break;
 	case CXL_MBOX_OP_GET_SECURITY_STATE:
 		rc = mock_get_security_state(mdata, cmd);
 		break;
@@ -1800,6 +1917,10 @@ static int cxl_mock_mem_probe(struct platform_device *pdev)
 	if (rc)
 		dev_dbg(dev, "No CXL Features discovered\n");
 
+	rc = cxl_media_op_discover(mds);
+	if (rc)
+		dev_dbg(dev, "No Media Operations discovered\n");
+
 	cxl_mock_add_event_logs(&mdata->mes);
 
 	cxlmd = devm_cxl_add_classdev(cxlds);
@@ -1897,11 +2018,39 @@ static ssize_t sanitize_timeout_store(struct device *dev,
 
 static DEVICE_ATTR_RW(sanitize_timeout);
 
+static ssize_t media_op_timeout_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct cxl_mockmem_data *mdata = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%lu\n", mdata->media_op_timeout);
+}
+
+static ssize_t media_op_timeout_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct cxl_mockmem_data *mdata = dev_get_drvdata(dev);
+	unsigned long val;
+	int rc;
+
+	rc = kstrtoul(buf, 0, &val);
+	if (rc)
+		return rc;
+
+	mdata->media_op_timeout = val;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(media_op_timeout);
+
 static struct attribute *cxl_mock_mem_attrs[] = {
 	&dev_attr_security_lock.attr,
 	&dev_attr_event_trigger.attr,
 	&dev_attr_fw_buf_checksum.attr,
 	&dev_attr_sanitize_timeout.attr,
+	&dev_attr_media_op_timeout.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(cxl_mock_mem);

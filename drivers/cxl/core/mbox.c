@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright(c) 2020 Intel Corporation. All rights reserved. */
+#include <linux/sched/signal.h>
 #include <linux/security.h>
 #include <linux/debugfs.h>
 #include <linux/ktime.h>
@@ -1376,6 +1377,113 @@ int cxl_media_op_discover(struct cxl_memdev_state *mds)
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_media_op_discover, "CXL");
+
+static int __cxl_mem_media_op(struct cxl_memdev_state *mds, u8 class,
+			      u8 subclass, u64 dpa_start, u64 dpa_length)
+{
+	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
+	int rc;
+
+	struct cxl_mbox_media_op_input *payload __free(kfree) =
+		kzalloc_flex(*payload, dpa_range_list, 1);
+	if (!payload)
+		return -ENOMEM;
+
+	payload->class = class;
+	payload->subclass = subclass;
+	payload->dpa_range_count = cpu_to_le32(1);
+	payload->dpa_range_list[0].starting_dpa = cpu_to_le64(dpa_start);
+	payload->dpa_range_list[0].length = cpu_to_le64(dpa_length);
+
+	struct cxl_mbox_cmd mbox_cmd = (struct cxl_mbox_cmd) {
+		.opcode = CXL_MBOX_OP_MEDIA_OPERATION,
+		.payload_in = payload,
+		.size_in = struct_size(payload, dpa_range_list, 1),
+		.poll_count = 30,
+		.poll_interval_ms = 1000,
+	};
+
+	rc = cxl_internal_send_cmd(cxl_mbox, &mbox_cmd);
+	if (rc < 0) {
+		dev_dbg(cxl_mbox->host,
+			"Media Operation (class=%u sub=%u) failed: %d\n",
+			class, subclass, rc);
+		return rc;
+	}
+
+	return 0;
+}
+
+/* bounds how long one command monopolizes the mailbox */
+#define CXL_MEDIA_OP_CHUNK	SZ_512M
+
+static bool cxl_media_op_supported(struct cxl_memdev_state *mds, u8 class,
+				   u8 subclass)
+{
+	if (class != CXL_MEDIA_OP_CLASS_SANITIZE)
+		return false;
+
+	switch (subclass) {
+	case CXL_MEDIA_OP_SANITIZE_SANITIZE:
+		return mds->media_op.sanitize_supported;
+	case CXL_MEDIA_OP_SANITIZE_ZERO:
+		return mds->media_op.zero_supported;
+	default:
+		return false;
+	}
+}
+
+/**
+ * cxl_media_op_run() - Run a media operation on a DPA range
+ * @mds: The device for the operation
+ * @class: Media operation class
+ * @subclass: Media operation subclass
+ * @dpa_start: Starting DPA in bytes
+ * @dpa_length: Length of the DPA range in bytes
+ *
+ * The caller owns the range: it must not be reachable by new
+ * allocations or decodes for the duration. The range is processed in
+ * chunks so that no single command monopolizes the mailbox; each chunk
+ * is a synchronously polled background command with a 30s timeout, and
+ * no locks are held across chunks.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int cxl_media_op_run(struct cxl_memdev_state *mds, u8 class, u8 subclass,
+		     u64 dpa_start, u64 dpa_length)
+{
+	u64 granularity = mds->media_op.granularity;
+	u64 chunk;
+	int rc;
+
+	if (!granularity || !cxl_media_op_supported(mds, class, subclass))
+		return -EOPNOTSUPP;
+
+	if (!dpa_length || !IS_ALIGNED(dpa_start, granularity) ||
+	    !IS_ALIGNED(dpa_length, granularity))
+		return -EINVAL;
+
+	chunk = max_t(u64, rounddown(CXL_MEDIA_OP_CHUNK, granularity),
+		      granularity);
+
+	while (dpa_length) {
+		u64 len = min_t(u64, dpa_length, chunk);
+
+		if (fatal_signal_pending(current))
+			return -EINTR;
+
+		rc = __cxl_mem_media_op(mds, class, subclass, dpa_start, len);
+		if (rc)
+			return rc;
+
+		dpa_start += len;
+		dpa_length -= len;
+		cond_resched();
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_media_op_run, "CXL");
 
 /**
  * cxl_mem_sanitize() - Send a sanitization command to the device.

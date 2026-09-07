@@ -427,6 +427,15 @@ struct cxl_media_op_dpa_range {
 	__le64 length;
 } __packed;
 
+/* Media Operation Input Payload (CXL 4.0 Table 8-329) */
+struct cxl_mbox_media_op_input {
+	u8 class;
+	u8 subclass;
+	u8 rsvd[2];
+	__le32 dpa_range_count;
+	struct cxl_media_op_dpa_range dpa_range_list[] __counted_by_le(dpa_range_count);
+} __packed;
+
 /* Discovery Input Payload (CXL 4.0 Table 8-329 + Table 8-332) */
 struct cxl_mbox_media_op_discovery_in {
 	u8 class;
@@ -903,6 +912,8 @@ static inline void cxl_mem_active_dec(void)
 
 int cxl_mem_sanitize(struct cxl_memdev *cxlmd, u16 cmd);
 int cxl_media_op_discover(struct cxl_memdev_state *mds);
+int cxl_media_op_run(struct cxl_memdev_state *mds, u8 class, u8 subclass,
+		     u64 dpa_start, u64 dpa_length);
 
 /**
  * struct cxl_hdm - HDM Decoder registers and cached / decoded capabilities

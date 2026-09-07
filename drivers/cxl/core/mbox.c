@@ -143,6 +143,10 @@ static void cxl_set_security_cmd_enabled(struct cxl_security_state *security,
 		set_bit(CXL_SEC_ENABLED_SECURE_ERASE,
 			security->enabled_cmds);
 		break;
+	case CXL_MBOX_OP_MEDIA_OPERATION:
+		set_bit(CXL_SEC_ENABLED_MEDIA_OPERATIONS,
+			security->enabled_cmds);
+		break;
 	case CXL_MBOX_OP_GET_SECURITY_STATE:
 		set_bit(CXL_SEC_ENABLED_GET_SECURITY_STATE,
 			security->enabled_cmds);
@@ -818,7 +822,6 @@ static struct cxl_mbox_get_supported_logs *cxl_get_gsl(struct cxl_memdev_state *
 		return ERR_PTR(rc);
 	}
 
-
 	return ret;
 }
 
@@ -1276,6 +1279,103 @@ static int __cxl_mem_sanitize(struct cxl_memdev_state *mds, u16 cmd)
 	return 0;
 }
 
+#define CXL_MEDIA_OP_MAX_OPS 16
+
+/**
+ * cxl_media_op_discover() - Discover supported media operations
+ * @mds: The device for the operation
+ *
+ * Run the Media Operations Discovery operation to record the device's
+ * DPA range granularity and which operations it supports.
+ *
+ * Return: 0 on success or if Media Operations is not supported,
+ * negative error code on failure.
+ */
+int cxl_media_op_discover(struct cxl_memdev_state *mds)
+{
+	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
+	u16 num_returned;
+	u64 granularity;
+	int rc, i;
+
+	if (!test_bit(CXL_SEC_ENABLED_MEDIA_OPERATIONS,
+		      mds->security.enabled_cmds))
+		return 0;
+
+	struct cxl_mbox_media_op_discovery_in *disc_in __free(kfree) =
+		kzalloc_obj(*disc_in);
+	if (!disc_in)
+		return -ENOMEM;
+
+	disc_in->class = CXL_MEDIA_OP_CLASS_GENERAL;
+	disc_in->subclass = CXL_MEDIA_OP_GENERAL_DISCOVERY;
+	disc_in->dpa_range_count = 0;
+	disc_in->start_index = 0;
+	disc_in->num_ops = cpu_to_le16(CXL_MEDIA_OP_MAX_OPS);
+
+	struct cxl_mbox_media_op_discovery_out *disc_out __free(kfree) =
+		kzalloc_flex(*disc_out, ops, CXL_MEDIA_OP_MAX_OPS);
+	if (!disc_out)
+		return -ENOMEM;
+
+	struct cxl_mbox_cmd mbox_cmd = (struct cxl_mbox_cmd) {
+		.opcode = CXL_MBOX_OP_MEDIA_OPERATION,
+		.payload_in = disc_in,
+		.size_in = sizeof(*disc_in),
+		.payload_out = disc_out,
+		.size_out = struct_size(disc_out, ops, CXL_MEDIA_OP_MAX_OPS),
+		.min_out = sizeof(*disc_out),
+		.poll_count = 1,
+		.poll_interval_ms = 1000,
+	};
+
+	rc = cxl_internal_send_cmd(cxl_mbox, &mbox_cmd);
+	if (rc < 0) {
+		dev_dbg(cxl_mbox->host,
+			"Media Operation Discovery failed: %d\n", rc);
+		return rc;
+	}
+
+	granularity = le64_to_cpu(disc_out->granularity);
+	/* spec requires granularity to be a power of 2 and a multiple of 0x40 */
+	if (!is_power_of_2(granularity) || !IS_ALIGNED(granularity, SZ_64)) {
+		dev_dbg(cxl_mbox->host,
+			"Discovery returned invalid granularity: %llu\n",
+			granularity);
+		return -EINVAL;
+	}
+	mds->media_op.granularity = granularity;
+
+	/* a device never returns more entries than were asked for */
+	num_returned = le16_to_cpu(disc_out->num_returned);
+	if (num_returned > CXL_MEDIA_OP_MAX_OPS) {
+		dev_dbg(cxl_mbox->host,
+			"Discovery returned %u ops, expected max %u\n",
+			num_returned, CXL_MEDIA_OP_MAX_OPS);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < num_returned; i++) {
+		u8 sub = disc_out->ops[i].subclass;
+
+		if (disc_out->ops[i].class != CXL_MEDIA_OP_CLASS_SANITIZE)
+			continue;
+
+		if (sub == CXL_MEDIA_OP_SANITIZE_SANITIZE)
+			mds->media_op.sanitize_supported = true;
+		else if (sub == CXL_MEDIA_OP_SANITIZE_ZERO)
+			mds->media_op.zero_supported = true;
+	}
+
+	dev_dbg(cxl_mbox->host,
+		"Media Operation: granularity=%llu sanitize=%d zero=%d\n",
+		mds->media_op.granularity,
+		mds->media_op.sanitize_supported,
+		mds->media_op.zero_supported);
+
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_media_op_discover, "CXL");
 
 /**
  * cxl_mem_sanitize() - Send a sanitization command to the device.

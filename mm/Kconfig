@@ -696,6 +696,24 @@ config NUMA_MIGRATION
 config MIGRATE_MISPLACED
 	bool
 
+config HOT_PAGE_PROMOTION
+	bool "Promotion for counting hotness sources"
+	depends on MIGRATION && NUMA
+	select MIGRATE_MISPLACED
+	help
+	  Promotion path for hotness sources that count accesses in hardware
+	  over a bounded region and report an already-aggregated list once per
+	  epoch, such as a CXL Hotness Monitoring Unit.
+
+	  Extents are ranked by access density - accesses per page per second -
+	  and admitted against the target node's headroom, so a small hot
+	  subrange cannot drag a large cold region into top-tier memory. No
+	  per-page metadata is kept.
+
+	  This does not need the NUMA balancing scanner: a device that counts
+	  accesses in hardware has no use for one that samples them in
+	  software.
+
 config MIGRATION
 	bool
 	depends on MMU

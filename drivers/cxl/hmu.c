@@ -23,7 +23,11 @@
 #include <linux/math.h>
 #include <linux/pci.h>
 
+#include <linux/mm.h>
+#include <linux/promote.h>
+
 #include "cxlpci.h"
+#include "cxlmem.h"
 #include "cxl.h"
 #include "hmu.h"
 
@@ -136,10 +140,14 @@ struct cxl_hmu_info {
 	struct pmu pmu;
 	struct perf_output_handle handle;
 	void __iomem *base;
+	struct cxl_memdev *cxlmd;
 	struct hlist_node node;
 	int irq;
 	int on_cpu;
 	u32 hot_thresh;
+	struct promote_extent *extents;
+	unsigned int nr_extents;
+	unsigned int max_extents;
 	u32 hot_gran; /* power of 2, 256 to 2 GiB */
 	/* For now use a range rather than a bitmap, chunks of 256MiB */
 	u32 range_base;
@@ -456,41 +464,14 @@ static int cxl_hmu_update_aux(struct cxl_hmu_info *hmu, bool stop)
 	return 0;
 }
 
-static int __cxl_hmu_start(struct perf_event *event, int flags)
+static int cxl_hmu_hw_start(struct device *dev, struct cxl_hmu_info *hmu)
 {
-	struct cxl_hmu_info *hmu = pmu_to_cxl_hmu(event->pmu);
-	struct hw_perf_event *hwc = &event->hw;
-	struct device *dev = event->pmu->dev;
-	struct cxl_hmu_buf *buf;
-	int cpu = event->cpu;
 	u64 val, status, bitmap_base;
 	int ret, i;
 	u8 width;
 	u16 list_len = FIELD_GET(CHMU_INST0_CAP0_HOTLIST_SIZE_MSK,
 				 readq(hmu->base + CHMU_INST0_CAP0_REG));
 
-	hwc->state = 0;
-	status = readq(hmu->base + CHMU_INST0_STATUS_REG);
-	if (FIELD_GET(CHMU_INST0_STATUS_ENABLED, status)) {
-		dev_dbg(dev, "trace already started\n");
-		return -EBUSY;
-	}
-	/* TODO: Figure out what to do as very likely this is shared
-	 *  - Hopefully only with other HMU instances
-	 */
-	ret = irq_set_affinity(hmu->irq, cpumask_of(cpu));
-	if (ret)
-		dev_warn(dev, "failed to affinity of HMU interrupt\n");
-
-	hmu->on_cpu = cpu;
-
-	buf = perf_aux_output_begin(&hmu->handle, event);
-	if (!buf) {
-		dev_dbg(event->pmu->dev, "aux output begin failed\n");
-		return -EINVAL;
-	}
-
-	buf->pos = hmu->handle.head % buf->length;
 	/* Reset here disrupts samping with -F, should we avoid doing so? */
 	writeq(FIELD_PREP(CHMU_INST0_CFG0_RESET_COUNTERS, 1),
 		hmu->base + CHMU_INST0_CFG0_REG);
@@ -499,8 +480,8 @@ static int __cxl_hmu_start(struct perf_event *event, int flags)
 		(FIELD_GET(CHMU_INST0_STATUS_OP_INPROG_MSK, status) == 0),
 		10, 100000);
 	if (ret) {
-		dev_dbg(event->pmu->dev, "Reset timed out\n");
-		goto err_end_aux;
+		dev_dbg(dev, "Reset timed out\n");
+		return ret;
 	}
 	/* Setup what is being capured */
 	/* Type of capture, granularity etc */
@@ -543,15 +524,11 @@ static int __cxl_hmu_start(struct perf_event *event, int flags)
 	 */
 	status = readq(hmu->base + CHMU_INST0_STATUS_REG);
 	width = FIELD_GET(CHMU_INST0_STATUS_COUNTER_WIDTH_MSK, status);
-	if (!width || width >= 64) {
-		ret = -EINVAL;
-		goto err_end_aux;
-	}
+	if (!width || width >= 64)
+		return -EINVAL;
 	/* The threshold must be representable in the counter */
-	if (hmu->hot_thresh >= BIT_ULL(width)) {
-		ret = -EINVAL;
-		goto err_end_aux;
-	}
+	if (hmu->hot_thresh >= BIT_ULL(width))
+		return -EINVAL;
 	/* Start the unit up */
 	val = FIELD_PREP(CHMU_INST0_CFG0_WHAT_MSK, hmu->m2s_requests_to_track) |
 		FIELD_PREP(CHMU_INST0_CFG0_RAND_DOWNSAMP_EN,
@@ -567,19 +544,58 @@ static int __cxl_hmu_start(struct perf_event *event, int flags)
 		(FIELD_GET(CHMU_INST0_STATUS_OP_INPROG_MSK, status) == 0),
 		10, 100000);
 	if (ret) {
-		dev_info(event->pmu->dev, "Enable timed out\n");
-		goto err_end_aux;
+		dev_info(dev, "Enable timed out\n");
+		return ret;
 	}
 
 	return 0;
+}
 
-err_end_aux:
-	/*
-	 * Unwind the session: perf_aux_output_begin() nested the handle
-	 * and took references that only the matching end releases.
+static int __cxl_hmu_start(struct perf_event *event, int flags)
+{
+	struct cxl_hmu_info *hmu = pmu_to_cxl_hmu(event->pmu);
+	struct hw_perf_event *hwc = &event->hw;
+	struct device *dev = event->pmu->dev;
+	struct cxl_hmu_buf *buf;
+	int cpu = event->cpu;
+	u64 status;
+	int ret;
+
+	hwc->state = 0;
+	status = readq(hmu->base + CHMU_INST0_STATUS_REG);
+	if (FIELD_GET(CHMU_INST0_STATUS_ENABLED, status)) {
+		dev_dbg(dev, "trace already started\n");
+		return -EBUSY;
+	}
+	/* TODO: Figure out what to do as very likely this is shared
+	 *  - Hopefully only with other HMU instances
 	 */
-	perf_aux_output_end(&hmu->handle, 0);
-	return ret;
+	ret = irq_set_affinity(hmu->irq, cpumask_of(cpu));
+	if (ret)
+		dev_warn(dev, "failed to affinity of HMU interrupt\n");
+
+	hmu->on_cpu = cpu;
+
+	buf = perf_aux_output_begin(&hmu->handle, event);
+	if (!buf) {
+		dev_dbg(event->pmu->dev, "aux output begin failed\n");
+		return -EINVAL;
+	}
+
+	buf->pos = hmu->handle.head % buf->length;
+
+	ret = cxl_hmu_hw_start(dev, hmu);
+	if (ret) {
+		/*
+		 * Unwind the session: perf_aux_output_begin() nested the
+		 * handle and took references that only the matching end
+		 * releases.
+		 */
+		perf_aux_output_end(&hmu->handle, 0);
+		return ret;
+	}
+
+	return 0;
 }
 
 static void cxl_hmu_start(struct perf_event *event, int flags)
@@ -735,6 +751,376 @@ static void cxl_hmu_cpuhp_remove(void *_info)
 					    &info->node);
 }
 
+#ifdef CONFIG_CXL_HMU_KERNEL
+static unsigned int hot_thresh = 16;
+module_param(hot_thresh, uint, 0444);
+MODULE_PARM_DESC(hot_thresh,
+		 "Device hot-range threshold: accesses per epoch for a unit to be reported");
+
+static unsigned int epoch_ms = 1000;
+module_param(epoch_ms, uint, 0444);
+MODULE_PARM_DESC(epoch_ms,
+		 "Target epoch length in ms, clamped to the device's range");
+
+static bool kernel_mode;
+module_param(kernel_mode, bool, 0444);
+MODULE_PARM_DESC(kernel_mode,
+		 "Drive the first instance of each CHMU in-kernel and report its hot units");
+
+static unsigned int unit_shift;
+module_param(unit_shift, uint, 0444);
+MODULE_PARM_DESC(unit_shift,
+		 "log2 of the tracking unit size in bytes, if supported by the device (0 = smallest supported unit of at least page size)");
+
+/* Epoch length is scale * multiplier; scale encodings from CXL r4.0 Table 8-193 */
+static const u32 chmu_epoch_scale_us[] = { 0, 100, 1000, 10000, 100000, 1000000 };
+#define CHMU_EPOCH_MULT_MAX	4095
+
+static u64 chmu_epoch_us(u8 scale, u16 mult)
+{
+	if (scale < 1 || scale >= ARRAY_SIZE(chmu_epoch_scale_us))
+		return 0;
+
+	return (u64)chmu_epoch_scale_us[scale] * mult;
+}
+
+/*
+ * Pick the epoch length. The hot-range threshold counts accesses within
+ * one epoch, so epoch length and threshold together set how sensitive
+ * detection is: too short an epoch and nothing reaches the threshold.
+ * Aim for epoch_ms, clamped to the range the device advertises,
+ * and encode it with the finest scale that fits the 12-bit multiplier.
+ */
+static void cxl_hmu_pick_epoch(struct cxl_hmu_info *info, u64 cap0)
+{
+	u8 min_scale = FIELD_GET(CHMU_INST0_CAP0_EPOCH_MIN_SCALE_MSK, cap0);
+	u16 min_mult = FIELD_GET(CHMU_INST0_CAP0_EPOCH_MIN_MULT_MSK, cap0);
+	u64 min_us = chmu_epoch_us(min_scale, min_mult);
+	u64 max_us = chmu_epoch_us(FIELD_GET(CHMU_INST0_CAP0_EPOCH_MAX_SCALE_MSK, cap0),
+				   FIELD_GET(CHMU_INST0_CAP0_EPOCH_MAX_MULT_MSK, cap0));
+	u64 want = (u64)epoch_ms * USEC_PER_MSEC;
+	int scale;
+
+	if (min_us && want < min_us)
+		want = min_us;
+	if (max_us && want > max_us)
+		want = max_us;
+
+	for (scale = 1; scale < ARRAY_SIZE(chmu_epoch_scale_us); scale++) {
+		u64 mult = want / chmu_epoch_scale_us[scale];
+
+		if (mult >= 1 && mult <= CHMU_EPOCH_MULT_MAX) {
+			info->epoch_scale = scale;
+			info->epoch_mult = mult;
+			return;
+		}
+	}
+
+	/* Nothing encodes cleanly, fall back to the device minimum */
+	info->epoch_scale = min_scale;
+	info->epoch_mult = min_mult;
+}
+
+/*
+ * Buffer one physically contiguous run as an extent. The whole epoch's
+ * worth is ranked by density and submitted when the drain completes.
+ */
+static int cxl_hmu_emit(struct cxl_hmu_info *info, u64 hpa, u64 len,
+			unsigned int nr, unsigned long unit_pages)
+{
+	struct promote_extent *e;
+
+	if (info->nr_extents >= info->max_extents)
+		return 0;
+
+	e = &info->extents[info->nr_extents++];
+	e->pfn = PHYS_PFN(hpa);
+	e->nr_pages = len >> PAGE_SHIFT;
+	e->nr_counted = unit_pages;
+	e->weight = nr;
+	return e->nr_pages ? 1 : 0;
+}
+
+static void cxl_hmu_report_unit(struct cxl_hmu_info *info, u64 unit_id,
+				 u64 count)
+{
+	u64 dpa = unit_id << info->hot_gran;
+	u64 dpa_end = dpa + (1ULL << info->hot_gran);
+	unsigned long unit_pages = max_t(unsigned long, 1,
+					 (dpa_end - dpa) >> PAGE_SHIFT);
+	u64 run_hpa = 0, run_len = 0;
+	unsigned int nr;
+
+	/*
+	 * Only epoch mode counts for a whole epoch and reports the total,
+	 * so only there does the entry carry an exact magnitude. Under
+	 * always-on reporting a unit is reported the moment its counter
+	 * reaches the hot-range threshold and the counter is then freed,
+	 * and CXL r4.0 Table 8-198 defines the entry's counter value as
+	 * invalid there. The threshold remains a known floor - the device
+	 * reported the unit precisely because it reached it - so report
+	 * that rather than discarding the magnitude altogether.
+	 */
+	if (info->reporting_mode == CHMU_MODE_EPOCH)
+		nr = min_t(u64, count, UINT_MAX);
+	else
+		nr = info->hot_thresh;
+
+	/*
+	 * The unit is contiguous in DPA space but interleaving may break
+	 * it up in HPA space. Translate by contiguous extent - the whole
+	 * remaining span on a non-interleaved region, one interleave
+	 * granule otherwise - and hand each physically contiguous run to
+	 * the promotion path as a single range. The count is the unit's,
+	 * not the run's: every run says so through unit_pages, so a unit
+	 * split into several runs is not ranked as if each had been
+	 * counted on its own.
+	 *
+	 * A unit can span up to 2GB and a physically contiguous run
+	 * defers the (rescheduling) submission until the run ends, so
+	 * yield explicitly on each iteration.
+	 */
+	while (dpa < dpa_end) {
+		u64 len;
+		u64 hpa = cxl_memdev_dpa_to_hpa_range(info->cxlmd, dpa, &len);
+
+		cond_resched();
+		if (hpa == ULLONG_MAX) {
+			if (run_len)
+				cxl_hmu_emit(info, run_hpa, run_len, nr, unit_pages);
+			run_len = 0;
+			dpa += PAGE_SIZE;
+			continue;
+		}
+
+		/*
+		 * An interleave granularity below page size cannot extend
+		 * a pfn run; record the page the extent lands in and step
+		 * a page of DPA, as the page-wise walk did.
+		 */
+		if (len < PAGE_SIZE)
+			len = PAGE_SIZE;
+		len = min(len, dpa_end - dpa);
+
+		if (run_len && hpa == run_hpa + run_len) {
+			run_len += len;
+		} else {
+			if (run_len)
+				cxl_hmu_emit(info, run_hpa, run_len, nr, unit_pages);
+			run_hpa = hpa;
+			run_len = len;
+		}
+		dpa += len;
+	}
+
+	if (run_len)
+		cxl_hmu_emit(info, run_hpa, run_len, nr, unit_pages);
+}
+
+static irqreturn_t cxl_hmu_drain_thread(int irq, void *data)
+{
+	struct cxl_hmu_info *info = data;
+	u64 hl_off = readq(info->base + CHMU_INST0_HOTLIST_OFFSET_REG);
+	u16 top = FIELD_GET(CHMU_INST0_CAP0_HOTLIST_SIZE_MSK,
+			    readq(info->base + CHMU_INST0_CAP0_REG));
+	u16 head, tail;
+	u64 status;
+	u8 width;
+
+	status = readq(info->base + CHMU_INST0_STATUS_REG);
+	if (!FIELD_GET(CHMU_INST0_STATUS_OVRFLW, status) &&
+	    !FIELD_GET(CHMU_INST0_STATUS_FILLTHRESH, status))
+		return IRQ_NONE;
+
+	width = FIELD_GET(CHMU_INST0_STATUS_COUNTER_WIDTH_MSK, status);
+	head = readw(info->base + CHMU_INST0_HEAD_REG);
+	tail = readw(info->base + CHMU_INST0_TAIL_REG);
+
+	info->nr_extents = 0;
+
+	while (head != tail) {
+		u64 entry = readq(info->base + hl_off + head * 8);
+
+		/*
+		 * Entry layout: [63:width] Unit ID, [width-1:0] the hotness
+		 * counter value. The counter carries how many (down-sampled)
+		 * accesses the unit saw, so pass the magnitude along instead
+		 * of discarding it.
+		 */
+		cxl_hmu_report_unit(info, entry >> width,
+				     entry & (BIT_ULL(width) - 1));
+		head = (head + 1) % top;
+	}
+	writew(head, info->base + CHMU_INST0_HEAD_REG);
+
+	/*
+	 * Hand the epoch's reports over and return: promotion migrates pages
+	 * and must not run on this thread, which has a device ring to drain.
+	 * The promotion worker ranks and migrates asynchronously.
+	 */
+	if (info->nr_extents) {
+		struct promote_batch b = {
+			.extents = info->extents,
+			.nr_extents = info->nr_extents,
+			.epoch_ms = max_t(unsigned int, 1,
+					  chmu_epoch_us(info->epoch_scale,
+							info->epoch_mult) / USEC_PER_MSEC),
+			.src = PROMOTE_SRC_CXL_HMU,
+			.ranked = info->reporting_mode == CHMU_MODE_EPOCH,
+			.truncated = info->nr_extents >= info->max_extents,
+		};
+
+		promote_queue_extents(&b);
+	}
+
+	/*
+	 * Level interrupts so should trigger on next fill, hence no
+	 * problem with races (same protocol as the perf path).
+	 */
+	writeq(status, info->base + CHMU_INST0_STATUS_REG);
+
+	return IRQ_HANDLED;
+}
+
+static void cxl_hmu_kernel_stop(void *data)
+{
+	struct cxl_hmu_info *info = data;
+	u64 status, val;
+
+	guard(raw_spinlock)(&info->lock);
+	status = readq(info->base + CHMU_INST0_STATUS_REG);
+	if (!FIELD_GET(CHMU_INST0_STATUS_ENABLED, status))
+		return;
+
+	val = readq(info->base + CHMU_INST0_CFG0_REG);
+	val &= ~CHMU_INST0_CFG0_ENABLE;
+	writeq(val, info->base + CHMU_INST0_CFG0_REG);
+	readq_poll_timeout_atomic(info->base + CHMU_INST0_STATUS_REG, status,
+		(FIELD_GET(CHMU_INST0_STATUS_OP_INPROG_MSK, status) == 0),
+		10, 100000);
+}
+
+/*
+ * Claim an instance for in-kernel consumption: program it with defaults
+ * derived from the capabilities and report each hot unit it finds.
+ * Returns -ENODEV when kernel mode is not
+ * requested or the instance cannot support it, in which case the caller
+ * falls back to registering the perf PMU.
+ */
+static int cxl_hmu_kernel_attach(struct device *dev, struct cxl_hmu_info *info,
+				const char *name)
+{
+	u64 cap0 = readq(info->base + CHMU_INST0_CAP0_REG);
+	u64 cap1 = readq(info->base + CHMU_INST0_CAP1_REG);
+	/*
+	 * Valid unit sizes are 256B (bit 0) to 2GB (bit 23); the upper
+	 * bits of the Supported Unit Sizes field are reserved.
+	 */
+	unsigned long gran_sup = FIELD_GET(CHMU_INST0_CAP1_UNIT_SIZE_MSK, cap1) &
+				 GENMASK(23, 0);
+	u16 ds_sup = FIELD_GET(CHMU_INST0_CAP1_DOWNSAMP_MSK, cap1);
+	u64 hl_off = readq(info->base + CHMU_INST0_HOTLIST_OFFSET_REG);
+	u64 bm_off = readq(info->base + CHMU_INST0_RANGE_BITMAP_OFFSET_REG);
+	int rc, b;
+
+	if (!kernel_mode)
+		return -ENODEV;
+
+	if (!gran_sup)
+		return -ENODEV;
+
+	if (FIELD_GET(CHMU_INST0_CAP1_EPOCH_SUP, cap1))
+		info->reporting_mode = CHMU_MODE_EPOCH;
+	else if (FIELD_GET(CHMU_INST0_CAP1_ALWAYS_ON_SUP, cap1))
+		info->reporting_mode = CHMU_MODE_ALWAYS_ON;
+	else
+		return -ENODEV;
+
+	info->hot_gran = 0;
+	if (unit_shift) {
+		if (unit_shift >= PAGE_SHIFT && unit_shift >= 8 &&
+		    unit_shift < 8 + 24 && (gran_sup & BIT(unit_shift - 8)))
+			info->hot_gran = unit_shift;
+		else
+			dev_warn(dev, "unsupported unit_shift %u (supported mask %lx), using default\n",
+				 unit_shift, gran_sup);
+	}
+
+	/* Default to the smallest supported unit size of at least a page */
+	if (!info->hot_gran) {
+		for_each_set_bit(b, &gran_sup, 24) {
+			if (8 + b >= PAGE_SHIFT) {
+				info->hot_gran = 8 + b;
+				break;
+			}
+		}
+	}
+	if (!info->hot_gran)
+		return -ENODEV;
+
+	info->m2s_requests_to_track = CHMU_INST0_CFG0_WHAT_NONTEE_RW;
+	info->ds_factor_pow2 = ds_sup ? ffs(ds_sup) - 1 : 0;
+	info->randomized_ds = false;
+	cxl_hmu_pick_epoch(info, cap0);
+	if (!info->epoch_mult)
+		return -ENODEV;
+	info->hot_thresh = hot_thresh;
+	info->range_base = 0;
+	info->range_num = (hl_off - bm_off) * 8;
+
+	if (kernel_mode) {
+		u16 list_len = FIELD_GET(CHMU_INST0_CAP0_HOTLIST_SIZE_MSK,
+					 readq(info->base + CHMU_INST0_CAP0_REG));
+
+		/*
+		 * One entry can fragment into several runs under interleaving;
+		 * anything beyond the buffer is dropped rather than grown in
+		 * the drain path.
+		 */
+		info->max_extents = max_t(unsigned int, list_len, 1) * 4;
+		info->extents = kvcalloc(info->max_extents,
+					 sizeof(*info->extents), GFP_KERNEL);
+		if (!info->extents)
+			return -ENOMEM;
+	}
+
+	rc = devm_request_threaded_irq(dev, info->irq, NULL,
+				       cxl_hmu_drain_thread, IRQF_ONESHOT,
+				       name, info);
+	if (rc)
+		return rc;
+
+	scoped_guard(raw_spinlock, &info->lock)
+		rc = cxl_hmu_hw_start(dev, info);
+	if (rc)
+		goto err_free_irq;
+
+	rc = devm_add_action_or_reset(dev, cxl_hmu_kernel_stop, info);
+	if (rc)
+		goto err_free_irq;
+
+	dev_info(dev, "%s: promoting hot units (unit 2^%u, threshold %u, epoch %llu ms)\n",
+		 name, info->hot_gran, info->hot_thresh,
+		 chmu_epoch_us(info->epoch_scale, info->epoch_mult) / USEC_PER_MSEC);
+	return 0;
+
+err_free_irq:
+	/*
+	 * Release the vector: the perf fallback requests the same one
+	 * without IRQF_SHARED, so leaving it registered turns any claim
+	 * failure into a flags mismatch that fails the whole probe.
+	 */
+	devm_free_irq(dev, info->irq, info);
+	return rc;
+}
+#else
+static int cxl_hmu_kernel_attach(struct device *dev, struct cxl_hmu_info *info,
+				const char *name)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_CXL_HMU_KERNEL */
+
 static int cxl_hmu_probe(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev->parent);
@@ -758,6 +1144,7 @@ static int cxl_hmu_probe(struct device *dev)
 
 		dev_set_drvdata(dev, info);
 		info->on_cpu = -1;
+		info->cxlmd = hmu->cxlmd;
 		info->base = hmu->base + 0x10 + inst_len * i;
 
 		val = readq(info->base + CHMU_INST0_CAP0_REG);
@@ -798,6 +1185,21 @@ static int cxl_hmu_probe(struct device *dev)
 		if (rc < 0)
 			return rc;
 		info->irq = rc;
+
+		/*
+		 * When kernel mode is enabled, the first instance of each
+		 * CHMU is driven by the kernel and its hot units feed the
+		 * the promotion path subsystem; remaining instances stay available to
+		 * perf. Fall back to perf on any failure.
+		 */
+		if (i == 0) {
+			rc = cxl_hmu_kernel_attach(dev, info, pmu_name);
+			if (!rc)
+				continue;
+			if (rc != -ENODEV)
+				dev_warn(dev, "CHMU kernel mode failed (%d), using perf\n",
+					 rc);
+		}
 
 		/*
 		 * Whilst there is a 'strong' recomendation that the interrupt

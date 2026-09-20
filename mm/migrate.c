@@ -2712,7 +2712,15 @@ int migrate_misplaced_folio_prepare(struct folio *folio,
 	if (!migrate_balanced_pgdat(pgdat, nr_pages)) {
 		int z;
 
-		if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING))
+		/*
+		 * Promotion into a faster tier is worth making room for, so
+		 * wake kswapd to demote and let the next report retry. A plain
+		 * NUMA balancing migration is only a locality hint and gives up
+		 * instead. A NULL vma means a hotness source asked for this,
+		 * which is always a promotion.
+		 */
+		if (vma &&
+		    !(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING))
 			return -EAGAIN;
 		for (z = pgdat->nr_zones - 1; z >= 0; z--) {
 			if (managed_zone(pgdat->node_zones + z))
@@ -2786,8 +2794,8 @@ int migrate_misplaced_folio(struct folio *folio, int node)
  * Caller is expected to have isolated the folios by calling
  * migrate_misplaced_folio_prepare(), which will result in an
  * elevated reference count on the folios. All the isolated folios
- * in the list must belong to the same memcg so that NUMA_PAGE_MIGRATE
- * stat can be attributed correctly to the memcg.
+ * in the list must belong to the same memcg so that PGPROMOTE_SUCCESS
+ * can be attributed correctly to the memcg.
  *
  * This function will un-isolate the folios, drop the elevated reference
  * and remove them from the list before returning. This should be called
@@ -2823,12 +2831,9 @@ int promote_misplaced_memcg_folios(struct list_head *folio_list, int node)
 	if (nr_remaining)
 		putback_movable_pages(folio_list);
 
-	if (nr_succeeded) {
-		count_vm_numa_events(NUMA_PAGE_MIGRATE, nr_succeeded);
-		count_memcg_events(memcg, NUMA_PAGE_MIGRATE, nr_succeeded);
+	if (nr_succeeded)
 		mod_lruvec_state(mem_cgroup_lruvec(memcg, NODE_DATA(node)),
 				 PGPROMOTE_SUCCESS, nr_succeeded);
-	}
 
 	mem_cgroup_put(memcg);
 	WARN_ON(!list_empty(folio_list));

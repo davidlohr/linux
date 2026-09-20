@@ -693,6 +693,9 @@ config NUMA_MIGRATION
 	  and mbind(). Selecting this option also enables support for page
 	  demotion for memory tiering.
 
+config MIGRATE_MISPLACED
+	bool
+
 config MIGRATION
 	bool
 	depends on MMU

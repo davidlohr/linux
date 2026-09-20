@@ -288,8 +288,10 @@ enum node_stat_item {
 #ifdef CONFIG_SWAP
 	NR_SWAPCACHE,
 #endif
-#ifdef CONFIG_NUMA_BALANCING
+#ifdef CONFIG_MIGRATE_MISPLACED
 	PGPROMOTE_SUCCESS,	/* promote successfully */
+#endif
+#ifdef CONFIG_NUMA_BALANCING
 	/**
 	 * Candidate pages for promotion based on hint fault latency.  This
 	 * counter is used to control the promotion rate and adjust the hot

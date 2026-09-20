@@ -2628,7 +2628,7 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
 }
 #endif /* CONFIG_NUMA_MIGRATION */
 
-#ifdef CONFIG_NUMA_BALANCING
+#ifdef CONFIG_MIGRATE_MISPLACED
 /*
  * Returns true if this is a safe migration target node for misplaced NUMA
  * pages. Currently it only checks the watermarks which is crude.
@@ -2734,6 +2734,7 @@ int migrate_misplaced_folio_prepare(struct folio *folio,
 	return 0;
 }
 
+#ifdef CONFIG_NUMA_BALANCING
 /*
  * Attempt to migrate a misplaced folio to the specified destination
  * node. Caller is expected to have isolated the folio by calling
@@ -2769,3 +2770,4 @@ int migrate_misplaced_folio(struct folio *folio, int node)
 	return nr_remaining ? -EAGAIN : 0;
 }
 #endif /* CONFIG_NUMA_BALANCING */
+#endif /* CONFIG_MIGRATE_MISPLACED */

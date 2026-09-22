@@ -106,6 +106,29 @@ static unsigned long promote_headroom(int nid)
 	return headroom;
 }
 
+/*
+ * Ask reclaim to make room on @nid.
+ *
+ * This only achieves anything because pgdat_balanced() aims at the promotion
+ * watermark while promote_active is on. Without that, kswapd considers the
+ * node balanced at the high watermark - below what promote_headroom() needs -
+ * and wakeup_kswapd() returns having done nothing, so promotion could never
+ * drive its own recovery once the top tier filled.
+ */
+static void promote_wake_kswapd(int nid)
+{
+	pg_data_t *pgdat = NODE_DATA(nid);
+	int z;
+
+	for (z = pgdat->nr_zones - 1; z >= 0; z--) {
+		struct zone *zone = pgdat->node_zones + z;
+
+		if (!managed_zone(zone))
+			continue;
+		wakeup_kswapd(zone, 0, 0, ZONE_MOVABLE);
+		return;
+	}
+}
 
 /* Nearest top-tier node to @src_nid, honouring @allowed. */
 static int promote_target_node(int src_nid, const nodemask_t *allowed)
@@ -264,6 +287,8 @@ struct promote_queue {
 static struct promote_queue *promote_queues[MAX_NUMNODES];
 static DEFINE_MUTEX(promote_queue_lock);
 
+DEFINE_STATIC_KEY_FALSE(promote_active);
+
 static int promote_worker(void *data)
 {
 	struct promote_queue *q = data;
@@ -382,6 +407,14 @@ int promote_queue_extents(struct promote_batch *b)
 	if (!q)
 		return -ENOMEM;
 
+	/*
+	 * A counting source is now driving promotion into the top tier, so
+	 * reclaim there has to aim at the promotion watermark rather than the
+	 * high one. Outside the queue mutex: enabling a static key sleeps.
+	 */
+	if (!static_branch_unlikely(&promote_active))
+		static_branch_enable(&promote_active);
+
 	spin_lock(&q->lock);
 	q->epoch_ms = b->epoch_ms;
 	for (i = 0; i < b->nr_extents; i++) {
@@ -442,8 +475,17 @@ static int promote_pass(struct promote_batch *b, struct promote_stats *st,
 	 * enough to divide by.
 	 */
 	seed_nid = promote_target_node(src_nid, &node_states[N_MEMORY]);
-	if (seed_nid != NUMA_NO_NODE)
+	if (seed_nid != NUMA_NO_NODE) {
 		budget = promote_headroom(seed_nid);
+		/*
+		 * Nothing to promote into. Reclaim is the only thing that can
+		 * change that, and it will not act on its own until the node
+		 * falls below the high watermark, which is lower than what we
+		 * need. Ask now so the next report has somewhere to go.
+		 */
+		if (!budget)
+			promote_wake_kswapd(seed_nid);
+	}
 
 	st->nr_extents = b->nr_extents;
 

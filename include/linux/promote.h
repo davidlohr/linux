@@ -3,6 +3,7 @@
 #define _LINUX_PROMOTE_H
 
 #include <linux/errno.h>
+#include <linux/jump_label.h>
 #include <linux/types.h>
 
 /*
@@ -75,10 +76,28 @@ struct promote_stats {
  */
 #ifdef CONFIG_HOT_PAGE_PROMOTION
 int promote_queue_extents(struct promote_batch *b);
+
+DECLARE_STATIC_KEY_FALSE(promote_active);
+
+/*
+ * True once a counting source has reported. Reclaim asks this because a node
+ * it would otherwise call balanced at the high watermark still has no room to
+ * promote into: the promotion watermark sits above it. Enabled on the first
+ * report and never disabled, since queues and their workers are not torn down.
+ */
+static inline bool promote_wants_headroom(void)
+{
+	return static_branch_unlikely(&promote_active);
+}
 #else
 static inline int promote_queue_extents(struct promote_batch *b)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline bool promote_wants_headroom(void)
+{
+	return false;
 }
 #endif
 

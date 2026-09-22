@@ -43,6 +43,7 @@
 #include <linux/delayacct.h>
 #include <linux/sysctl.h>
 #include <linux/memory-tiers.h>
+#include <linux/promote.h>
 #include <linux/oom.h>
 #include <linux/folio_batch.h>
 #include <linux/prefetch.h>
@@ -6878,7 +6879,16 @@ static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx)
 		enum zone_stat_item item;
 		unsigned long free_pages;
 
-		if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING)
+		/*
+		 * A node balanced at the high watermark still has no room to
+		 * promote into, because WMARK_PROMO sits above it. Aim there
+		 * whenever something is actually promoting - the NUMA
+		 * balancing scanner, or a counting hotness source that has
+		 * reported. Otherwise kswapd stops short of what promotion
+		 * needs and the promoter can never drive its own recovery.
+		 */
+		if ((sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) ||
+		    promote_wants_headroom())
 			mark = promo_wmark_pages(zone);
 		else
 			mark = high_wmark_pages(zone);

@@ -2737,9 +2737,9 @@ int migrate_misplaced_folio_check(struct folio *folio,
 }
 
 /*
- * Prepare for calling migrate_misplaced_folio() by isolating the folio if
- * permitted. Must be called with the PTL still held if called with a non-NULL
- * vma.
+ * Prepare for calling promote_misplaced_memcg_folios() by isolating the
+ * folio if permitted. Must be called with the PTL still held if called with
+ * a non-NULL vma.
  *
  * When called with a NULL vma (e.g., kernel thread initiated migration),
  * migrate_misplaced_folio_prepare() will allow shared executable folios
@@ -2763,44 +2763,9 @@ int migrate_misplaced_folio_prepare(struct folio *folio,
 	return 0;
 }
 
-/*
- * Attempt to migrate a misplaced folio to the specified destination
- * node. Caller is expected to have isolated the folio by calling
- * migrate_misplaced_folio_prepare(), which will result in an
- * elevated reference count on the folio. This function will un-isolate the
- * folio, dereferencing the folio before returning.
- */
-int migrate_misplaced_folio(struct folio *folio, int node)
-{
-	pg_data_t *pgdat = NODE_DATA(node);
-	int nr_remaining;
-	unsigned int nr_succeeded;
-	LIST_HEAD(migratepages);
-	struct mem_cgroup *memcg = get_mem_cgroup_from_folio(folio);
-	struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
-
-	list_add(&folio->lru, &migratepages);
-	nr_remaining = migrate_pages(&migratepages, alloc_misplaced_dst_folio,
-				     NULL, node, MIGRATE_ASYNC,
-				     MR_NUMA_MISPLACED, &nr_succeeded);
-	if (nr_remaining && !list_empty(&migratepages))
-		putback_movable_pages(&migratepages);
-	if (nr_succeeded) {
-		count_vm_numa_events(NUMA_PAGE_MIGRATE, nr_succeeded);
-		count_memcg_events(memcg, NUMA_PAGE_MIGRATE, nr_succeeded);
-		if ((sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING)
-		    && !node_is_toptier(folio_nid(folio))
-		    && node_is_toptier(node))
-			mod_lruvec_state(lruvec, PGPROMOTE_SUCCESS, nr_succeeded);
-	}
-	mem_cgroup_put(memcg);
-	BUG_ON(!list_empty(&migratepages));
-	return nr_remaining ? -EAGAIN : 0;
-}
-
 /**
- * promote_misplaced_memcg_folios() - Batch variant of migrate_misplaced_folio
- * Attempts to promote a folio list to the specified destination.
+ * promote_misplaced_memcg_folios() - Migrate a list of misplaced folios
+ * Attempts to migrate a folio list to the specified destination.
  * @folio_list: Isolated list of folios to be batch-promoted.
  * @node: The NUMA node ID to where the folios should be promoted.
  *

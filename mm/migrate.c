@@ -2672,19 +2672,22 @@ static struct folio *alloc_misplaced_dst_folio(struct folio *src,
 	return __folio_alloc_node(gfp, order, nid);
 }
 
-/*
- * Prepare for calling migrate_misplaced_folio() by isolating the folio if
- * permitted. Must be called with the PTL still held if called with a non-NULL
- * vma.
+/**
+ * migrate_misplaced_folio_check() - Would a misplaced folio be migrated?
+ * @folio: the folio NUMA balancing wants to move
+ * @vma: the VMA it was found through, or NULL from a kernel thread
+ * @node: the destination node
  *
- * When called with a NULL vma (e.g., kernel thread initiated migration),
- * migrate_misplaced_folio_prepare() will allow shared executable folios
- * to be migrated.
+ * The policy and capacity checks of migrate_misplaced_folio_prepare(),
+ * without the isolation, so that a caller that migrates later can refuse
+ * at fault time, and report it, whatever the migration would refuse.
+ * Safe under the PTL; may wake kswapd on @node in memory tiering mode.
+ *
+ * Return: 0 if the folio may be migrated, or a negative errno.
  */
-int migrate_misplaced_folio_prepare(struct folio *folio,
+int migrate_misplaced_folio_check(struct folio *folio,
 		struct vm_area_struct *vma, int node)
 {
-	int nr_pages = folio_nr_pages(folio);
 	pg_data_t *pgdat = NODE_DATA(node);
 
 	if (folio_is_file_lru(folio)) {
@@ -2709,7 +2712,7 @@ int migrate_misplaced_folio_prepare(struct folio *folio,
 	}
 
 	/* Avoid migrating to a node that is nearly full */
-	if (!migrate_balanced_pgdat(pgdat, nr_pages)) {
+	if (!migrate_balanced_pgdat(pgdat, folio_nr_pages(folio))) {
 		int z;
 
 		if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING))
@@ -2730,6 +2733,27 @@ int migrate_misplaced_folio_prepare(struct folio *folio,
 			      folio_order(folio), ZONE_MOVABLE);
 		return -EAGAIN;
 	}
+	return 0;
+}
+
+/*
+ * Prepare for calling migrate_misplaced_folio() by isolating the folio if
+ * permitted. Must be called with the PTL still held if called with a non-NULL
+ * vma.
+ *
+ * When called with a NULL vma (e.g., kernel thread initiated migration),
+ * migrate_misplaced_folio_prepare() will allow shared executable folios
+ * to be migrated.
+ */
+int migrate_misplaced_folio_prepare(struct folio *folio,
+		struct vm_area_struct *vma, int node)
+{
+	int nr_pages = folio_nr_pages(folio);
+	int rc;
+
+	rc = migrate_misplaced_folio_check(folio, vma, node);
+	if (rc)
+		return rc;
 
 	if (!folio_isolate_lru(folio))
 		return -EAGAIN;

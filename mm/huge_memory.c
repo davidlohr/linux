@@ -2237,27 +2237,11 @@ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf)
 					&last_cpupid);
 	if (target_nid == NUMA_NO_NODE)
 		goto out_map;
-	if (migrate_misplaced_folio_prepare(folio, vma, target_nid)) {
-		flags |= TNF_MIGRATE_FAIL;
-		goto out_map;
-	}
-	/* The folio is isolated and isolation code holds a folio reference. */
-	spin_unlock(vmf->ptl);
-	writable = false;
-
-	if (!migrate_misplaced_folio(folio, target_nid)) {
-		flags |= TNF_MIGRATED;
+	/* As in do_numa_page(): hand it to numabd and map the PMD back. */
+	if (numab_queue(folio, vma, target_nid))
 		nid = target_nid;
-		task_numa_fault(last_cpupid, nid, HPAGE_PMD_NR, flags);
-		return 0;
-	}
-
-	flags |= TNF_MIGRATE_FAIL;
-	vmf->ptl = pmd_lock(vma->vm_mm, vmf->pmd);
-	if (unlikely(!pmd_same(pmdp_get(vmf->pmd), vmf->orig_pmd))) {
-		spin_unlock(vmf->ptl);
-		return 0;
-	}
+	else
+		flags |= TNF_MIGRATE_FAIL;
 out_map:
 	/* Restore the PMD */
 	pmd = pmd_modify(pmdp_get(vmf->pmd), vma->vm_page_prot);

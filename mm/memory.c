@@ -6069,7 +6069,7 @@ static void numa_rebuild_single_mapping(struct vm_fault *vmf, struct vm_area_str
 
 static void numa_rebuild_large_mapping(struct vm_fault *vmf, struct vm_area_struct *vma,
 				       struct folio *folio, pte_t fault_pte,
-				       bool ignore_writable, bool pte_write_upgrade)
+				       bool pte_write_upgrade)
 {
 	int nr = pte_pfn(fault_pte) - folio_pfn(folio);
 	unsigned long start, end, addr = vmf->address;
@@ -6094,13 +6094,11 @@ static void numa_rebuild_large_mapping(struct vm_fault *vmf, struct vm_area_stru
 		if (pfn_folio(pte_pfn(ptent)) != folio)
 			continue;
 
-		if (!ignore_writable) {
-			ptent = pte_modify(ptent, vma->vm_page_prot);
-			writable = pte_write(ptent);
-			if (!writable && pte_write_upgrade &&
-			    can_change_pte_writable(vma, addr, ptent))
-				writable = true;
-		}
+		ptent = pte_modify(ptent, vma->vm_page_prot);
+		writable = pte_write(ptent);
+		if (!writable && pte_write_upgrade &&
+		    can_change_pte_writable(vma, addr, ptent))
+			writable = true;
 
 		numa_rebuild_single_mapping(vmf, vma, addr, start_ptep, writable);
 	}
@@ -6111,8 +6109,8 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *folio = NULL;
 	int nid = NUMA_NO_NODE;
-	bool writable = false, ignore_writable = false;
 	bool pte_write_upgrade = vma_wants_manual_pte_write_upgrade(vma);
+	bool writable = false;
 	int last_cpupid;
 	int target_nid;
 	pte_t pte, old_pte;
@@ -6153,39 +6151,25 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 					writable, &last_cpupid);
 	if (target_nid == NUMA_NO_NODE)
 		goto out_map;
-	if (migrate_misplaced_folio_prepare(folio, vma, target_nid)) {
-		flags |= TNF_MIGRATE_FAIL;
-		goto out_map;
-	}
-	/* The folio is isolated and isolation code holds a folio reference. */
-	pte_unmap_unlock(vmf->pte, vmf->ptl);
-	writable = false;
-	ignore_writable = true;
-
-	/* Migrate to the requested node */
-	if (!migrate_misplaced_folio(folio, target_nid)) {
+	/*
+	 * The decision is made; the migration is numabd's. A queued fault
+	 * is reported against the target, as a migrated one was, so task
+	 * placement sees where the memory is going and tiering mode keeps
+	 * promotion faults in the task's statistics. The outcome is not
+	 * known yet, so there is no TNF_MIGRATED. A refused enqueue is a
+	 * failed migration, which backs the scan rate off.
+	 */
+	if (numab_queue(folio, vma, target_nid))
 		nid = target_nid;
-		flags |= TNF_MIGRATED;
-		task_numa_fault(last_cpupid, nid, nr_pages, flags);
-		return 0;
-	}
-
-	flags |= TNF_MIGRATE_FAIL;
-	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
-				       vmf->address, &vmf->ptl);
-	if (unlikely(!vmf->pte))
-		return 0;
-	if (unlikely(!pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
-		pte_unmap_unlock(vmf->pte, vmf->ptl);
-		return 0;
-	}
+	else
+		flags |= TNF_MIGRATE_FAIL;
 out_map:
 	/*
 	 * Make it present again, depending on how arch implements
 	 * non-accessible ptes, some can allow access by kernel mode.
 	 */
 	if (folio && folio_test_large(folio))
-		numa_rebuild_large_mapping(vmf, vma, folio, pte, ignore_writable,
+		numa_rebuild_large_mapping(vmf, vma, folio, pte,
 					   pte_write_upgrade);
 	else
 		numa_rebuild_single_mapping(vmf, vma, vmf->address, vmf->pte,

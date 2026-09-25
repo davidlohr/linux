@@ -742,7 +742,9 @@ performance penalty if remote memory is accessed by a CPU. When this
 feature is enabled the kernel samples what task thread is accessing
 memory by periodically unmapping pages and later trapping a page
 fault. At the time of the page fault, it is determined if the data
-being accessed should be migrated to a local memory node.
+being accessed should be migrated to a local memory node. The migration
+itself is done by a per-node kernel thread, numabd, not by the faulting
+task.
 
 The unmapping of pages and trapping faults incur additional overhead that
 ideally is offset by improved memory locality but there is no universal

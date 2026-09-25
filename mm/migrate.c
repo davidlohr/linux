@@ -2784,11 +2784,11 @@ int migrate_misplaced_folio(struct folio *folio, int node)
  * migrate_misplaced_folio_prepare(), which will result in an
  * elevated reference count on the folios. All the isolated folios
  * in the list must belong to the same memcg so that NUMA_PAGE_MIGRATE
- * stat can be attributed correctly to the memcg.
+ * stat can be attributed correctly to the memcg, and to the same source
+ * node so that PGPROMOTE_SUCCESS is counted only for what is a promotion.
  *
  * This function will un-isolate the folios, drop the elevated reference
- * and remove them from the list before returning. This should be called
- * only for batched promotion of hot pages from lower tier nodes.
+ * and remove them from the list before returning.
  *
  * Return: 0 on success and -EAGAIN on failure or partial promotion.
  *         On return, @folio_list will be empty regardless of success/failure.
@@ -2799,17 +2799,23 @@ int promote_misplaced_memcg_folios(struct list_head *folio_list, int node)
 	unsigned int nr_succeeded = 0;
 	struct folio *first;
 	int nr_remaining;
+	int src_nid;
 
 	if (list_empty(folio_list))
 		return 0;
 
 	first = list_first_entry(folio_list, struct folio, lru);
+	src_nid = folio_nid(first);
 #ifdef CONFIG_DEBUG_VM
 	{
 		struct folio *f;
 
-		list_for_each_entry(f, folio_list, lru)
+		rcu_read_lock();
+		list_for_each_entry(f, folio_list, lru) {
 			VM_WARN_ON_ONCE(folio_memcg(f) != folio_memcg(first));
+			VM_WARN_ON_ONCE(folio_nid(f) != src_nid);
+		}
+		rcu_read_unlock();
 	}
 #endif
 	memcg = get_mem_cgroup_from_folio(first);
@@ -2823,8 +2829,11 @@ int promote_misplaced_memcg_folios(struct list_head *folio_list, int node)
 	if (nr_succeeded) {
 		count_vm_numa_events(NUMA_PAGE_MIGRATE, nr_succeeded);
 		count_memcg_events(memcg, NUMA_PAGE_MIGRATE, nr_succeeded);
-		mod_lruvec_state(mem_cgroup_lruvec(memcg, NODE_DATA(node)),
-				 PGPROMOTE_SUCCESS, nr_succeeded);
+		if ((sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING)
+		    && !node_is_toptier(src_nid)
+		    && node_is_toptier(node))
+			mod_lruvec_state(mem_cgroup_lruvec(memcg, NODE_DATA(node)),
+					 PGPROMOTE_SUCCESS, nr_succeeded);
 	}
 
 	mem_cgroup_put(memcg);

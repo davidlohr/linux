@@ -1569,9 +1569,17 @@ static inline bool vma_is_single_threaded_private(struct vm_area_struct *vma)
 bool folio_can_map_prot_numa(struct folio *folio, struct vm_area_struct *vma,
 		bool is_private_single_threaded);
 
+/* mm/numab.c: hint-fault migrations executed by numabd */
+bool numab_queue(struct folio *folio, struct vm_area_struct *vma,
+		 int target_nid);
 #else
 static inline bool folio_can_map_prot_numa(struct folio *folio,
 		struct vm_area_struct *vma, bool is_private_single_threaded)
+{
+	return false;
+}
+static inline bool numab_queue(struct folio *folio, struct vm_area_struct *vma,
+			       int target_nid)
 {
 	return false;
 }

@@ -434,6 +434,7 @@ putback:
 	damos_putback_folios(&folios);
 	return err;
 }
+EXPORT_SYMBOL_FOR_MODULES(damos_add_paddr_range, "cxl_hmu");
 
 /*
  * Migrate the pushed folios that fit the budget, counting in bytes so that

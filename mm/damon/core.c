@@ -114,6 +114,7 @@ int damon_select_ops(struct damon_ctx *ctx, enum damon_ops_id id)
 	mutex_unlock(&damon_ops_lock);
 	return err;
 }
+EXPORT_SYMBOL_FOR_MODULES(damon_select_ops, "cxl_hmu");
 
 struct damon_filter *damon_new_filter(enum damon_filter_type type,
 		bool matching, bool allow)
@@ -603,6 +604,7 @@ struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
 
 	return scheme;
 }
+EXPORT_SYMBOL_FOR_MODULES(damon_new_scheme, "cxl_hmu");
 
 static void damos_set_next_apply_sis(struct damos *s, struct damon_ctx *ctx)
 {
@@ -868,6 +870,7 @@ struct damon_ctx *damon_new_ctx(void)
 
 	return ctx;
 }
+EXPORT_SYMBOL_FOR_MODULES(damon_new_ctx, "cxl_hmu");
 
 static void damon_destroy_targets(struct damon_ctx *ctx)
 {
@@ -892,6 +895,7 @@ void damon_destroy_ctx(struct damon_ctx *ctx)
 
 	kfree(ctx);
 }
+EXPORT_SYMBOL_FOR_MODULES(damon_destroy_ctx, "cxl_hmu");
 
 static bool damon_attrs_equals(const struct damon_attrs *attrs1,
 		const struct damon_attrs *attrs2)
@@ -1072,6 +1076,7 @@ int damon_set_attrs(struct damon_ctx *ctx, struct damon_attrs *attrs)
 
 	return 0;
 }
+EXPORT_SYMBOL_FOR_MODULES(damon_set_attrs, "cxl_hmu");
 
 /**
  * damon_set_schemes() - Set data access monitoring based operation schemes.
@@ -1093,6 +1098,7 @@ void damon_set_schemes(struct damon_ctx *ctx, struct damos **schemes,
 	for (i = 0; i < nr_schemes; i++)
 		damon_add_scheme(ctx, schemes[i]);
 }
+EXPORT_SYMBOL_FOR_MODULES(damon_set_schemes, "cxl_hmu");
 
 static struct damos_quota_goal *damos_nth_quota_goal(
 		int n, struct damos_quota *q)
@@ -1907,6 +1913,7 @@ int damon_start(struct damon_ctx **ctxs, int nr_ctxs, bool exclusive)
 
 	return err;
 }
+EXPORT_SYMBOL_FOR_MODULES(damon_start, "cxl_hmu");
 
 /*
  * __damon_stop() - Stops monitoring of a given context.
@@ -1950,6 +1957,7 @@ int damon_stop(struct damon_ctx **ctxs, int nr_ctxs)
 	}
 	return err;
 }
+EXPORT_SYMBOL_FOR_MODULES(damon_stop, "cxl_hmu");
 
 /**
  * damon_is_running() - Returns if a given DAMON context is running.
@@ -1966,6 +1974,7 @@ bool damon_is_running(struct damon_ctx *ctx)
 	mutex_unlock(&ctx->kdamond_lock);
 	return running;
 }
+EXPORT_SYMBOL_FOR_MODULES(damon_is_running, "cxl_hmu");
 
 /**
  * damon_kdamond_pid() - Return pid of a given DAMON context's worker thread.

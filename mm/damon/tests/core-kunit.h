@@ -1201,6 +1201,65 @@ static void damon_test_commit_ctx(struct kunit *test)
 	damon_destroy_ctx(dst);
 }
 
+static void damos_test_add_folios(struct kunit *test)
+{
+	struct damos_access_pattern pattern = {};
+	struct damos_quota quota = {};
+	struct damos_watermarks wmarks = {};
+	struct folio *f[3], *folio, *next;
+	struct damos *s;
+	LIST_HEAD(folios);
+	LIST_HEAD(one);
+	int i;
+
+	s = damon_new_scheme(&pattern, DAMOS_MIGRATE_HOT, 0, &quota, &wmarks,
+			NUMA_NO_NODE);
+	KUNIT_ASSERT_NOT_NULL(test, s);
+
+	/* no kdamond: refused, and the list is untouched */
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(s), -EBUSY);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(s, &folios), -EBUSY);
+	KUNIT_EXPECT_TRUE(test, list_empty(&s->folios));
+
+	/* accepting: taken */
+	s->accepting_folios = true;
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(s), 0);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(s, &folios), 0);
+
+	/* the quota of this interval is used up: refused until the next */
+	s->quota.esz = 1024;
+	s->quota.charged_sz = 1024;
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(s), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(s, &folios), -ENOSPC);
+	s->quota.charged_sz = 0;
+	KUNIT_EXPECT_EQ(test, damos_add_folios(s, &folios), 0);
+
+	/* with a quota, the queue holds at most the interval's remaining budget */
+	for (i = 0; i < ARRAY_SIZE(f); i++) {
+		f[i] = folio_alloc(GFP_KERNEL, 0);
+		KUNIT_ASSERT_NOT_NULL(test, f[i]);
+	}
+	s->quota.esz = 2 * PAGE_SIZE;
+	list_add_tail(&f[0]->lru, &one);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(s, &one), 0);
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(s), 0);
+	list_add_tail(&f[1]->lru, &one);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(s, &one), 0);
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(s), -ENOSPC);
+	list_add_tail(&f[2]->lru, &one);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(s, &one), -ENOSPC);
+	KUNIT_EXPECT_FALSE(test, list_empty(&one));
+
+	/* taking the queue with accept false refuses again */
+	damos_take_folios(s, &folios, false);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(s, &folios), -EBUSY);
+	list_for_each_entry_safe(folio, next, &folios, lru)
+		folio_put(folio);
+	list_for_each_entry_safe(folio, next, &one, lru)
+		folio_put(folio);
+	damon_destroy_scheme(s);
+}
+
 static void damos_test_filter_out(struct kunit *test)
 {
 	struct damon_target *t;
@@ -1481,6 +1540,7 @@ static struct kunit_case damon_test_cases[] = {
 	KUNIT_CASE(damon_test_commit_target_regions),
 	KUNIT_CASE(damon_test_commit_ctx),
 	KUNIT_CASE(damos_test_filter_out),
+	KUNIT_CASE(damos_test_add_folios),
 	KUNIT_CASE(damon_test_feed_loop_next_input),
 	KUNIT_CASE(damon_test_set_filters_default_reject),
 	KUNIT_CASE(damon_test_apply_min_nr_regions),

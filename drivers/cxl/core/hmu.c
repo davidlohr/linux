@@ -40,6 +40,8 @@ int devm_cxl_hmu_add(struct device *parent, struct cxl_hmu_regs *regs,
 	hmu->assoc_id = assoc_id;
 	hmu->index = index;
 	hmu->base = regs->hmu;
+	hmu->cxlmd = ((struct cxl_dev_state *)dev_get_drvdata(parent))->cxlmd;
+	raw_spin_lock_init(&hmu->lock);
 	dev = &hmu->dev;
 	device_initialize(dev);
 	device_set_pm_not_required(dev);

@@ -15,6 +15,7 @@
 #include <linux/bitfield.h>
 #include <linux/spinlock.h>
 #include <linux/cleanup.h>
+#include <linux/smp.h>
 #include <linux/vmalloc.h>
 #include <linux/device.h>
 #include <linux/iopoll.h>
@@ -22,8 +23,8 @@
 #include <linux/list.h>
 #include <linux/math.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
 
-#include "../cxlpci.h"
 #include "../cxl.h"
 #include "../hmu.h"
 #include "hmu.h"
@@ -43,35 +44,26 @@
 #define CXL_HMU_ATTR_CONFIG2_DPA_BASE_MASK GENMASK(31, 0)
 #define CXL_HMU_ATTR_CONFIG2_DPA_SIZE_MASK GENMASK_ULL(63, 32)
 
-/* Range bitmap registers at offset 0x10 + Range Config Bitmap offset */
-/* Hotlist registers at offset 0x10 + Hotlist Register offset */
 static int cxl_hmu_cpuhp_state_num;
-
-enum cxl_hmu_reporting_mode {
-	CHMU_MODE_EPOCH = 0,
-	CHMU_MODE_ALWAYS_ON = 1,
-};
 
 struct cxl_hmu_info {
 	struct pmu pmu;
 	struct perf_output_handle handle;
-	void __iomem *base;
+	struct cxl_hmu_inst *inst;
 	struct hlist_node node;
-	int irq;
 	int on_cpu;
-	u32 hot_thresh;
-	u32 hot_gran; /* power of 2, 256 to 2 GiB */
-	/* For now use a range rather than a bitmap, chunks of 256MiB */
-	u32 range_base;
-	u32 range_num;
-	enum cxl_hmu_reporting_mode reporting_mode;
-	u8 m2s_requests_to_track;
-	u8 ds_factor_pow2;
-	u8 epoch_scale;
-	u16 epoch_mult;
-	bool randomized_ds;
+	/*
+	 * A hotlist delivered on another CPU (a shared vector another instance
+	 * pointed elsewhere, a failed affinity change) is handed to the
+	 * event's CPU, where the AUX buffer must be written from.
+	 */
+	call_single_data_t csd;
+	u64 *pending;		/* twice the hotlist, for a batch and a late one */
+	unsigned int nr_pending;
+	u8 pending_width;
+	bool pending_overflowed;
 
-	/* Protect both the device state for RMW and the pmu state */
+	/* Protect the pmu state; the device state has the instance lock */
 	raw_spinlock_t lock;
 };
 
@@ -82,13 +74,12 @@ struct cxl_hmu_buf {
 	size_t length;
 	int nr_pages;
 	void *base;
-	long pos;
 };
 
 static ssize_t cpumask_show(struct device *dev, struct device_attribute *attr,
 			    char *buf)
 {
-	struct cxl_hmu_info *hmu = dev_get_drvdata(dev);
+	struct cxl_hmu_info *hmu = pmu_to_cxl_hmu((struct pmu *)dev_get_drvdata(dev));
 
 	return cpumap_print_to_pagebuf(true, buf, cpumask_of(hmu->on_cpu));
 }
@@ -142,16 +133,25 @@ static const struct attribute_group *cxl_hmu_groups[] = {
 	NULL
 };
 
+static void cxl_hmu_event_destroy(struct perf_event *event)
+{
+	kfree(event->pmu_private);
+	event->pmu_private = NULL;
+}
+
+/*
+ * The configuration is the event's, decoded once here and programmed when
+ * the event starts, so another open on the PMU cannot change it.
+ */
 static int cxl_hmu_event_init(struct perf_event *event)
 {
 	struct cxl_hmu_info *hmu = pmu_to_cxl_hmu(event->pmu);
+	struct cxl_hmu_inst *inst = hmu->inst;
+	const struct cxl_hmu_caps *caps = &inst->caps;
 	struct device *dev = event->pmu->dev;
-	u32 gran_sup;
-	u16 ds_sup;
-	u64 cap0, cap1;
-	u64 epoch_min, epoch_max, epoch;
-	u64 hotlist_offset = readq(hmu->base + CHMU_INST0_HOTLIST_OFFSET_REG);
-	u64 bitmap_offset = readq(hmu->base + CHMU_INST0_RANGE_BITMAP_OFFSET_REG);
+	struct cxl_hmu_config *cfg;
+	u64 gran;
+	int rc;
 
 	if (event->attr.type != hmu->pmu.type)
 		return -ENOENT;
@@ -168,145 +168,109 @@ static int cxl_hmu_event_init(struct perf_event *event)
 	if (event->attach_state & PERF_ATTACH_TASK)
 		return -EOPNOTSUPP;
 
-	cap0 = readq(hmu->base + CHMU_INST0_CAP0_REG);
-	cap1 = readq(hmu->base + CHMU_INST0_CAP1_REG);
+	cfg = kzalloc_obj(*cfg);
+	if (!cfg)
+		return -ENOMEM;
+	event->pmu_private = cfg;
+	event->destroy = cxl_hmu_event_destroy;
 
 	switch (FIELD_GET(CXL_HMU_ATTR_CONFIG_EPOCH_TYPE_MASK,
 		event->attr.config)) {
 	case 0:
-		if (!FIELD_GET(CHMU_INST0_CAP1_EPOCH_SUP, cap1))
-			return -EOPNOTSUPP;
-		hmu->reporting_mode = CHMU_MODE_EPOCH;
+		cfg->mode = CXL_HMU_MODE_EPOCH;
 		break;
 	case 1:
-		if (!FIELD_GET(CHMU_INST0_CAP1_ALWAYS_ON_SUP, cap1))
-			return -EOPNOTSUPP;
-		hmu->reporting_mode = CHMU_MODE_ALWAYS_ON;
+		cfg->mode = CXL_HMU_MODE_ALWAYS_ON;
 		break;
 	default:
 		dev_dbg(dev, "Tried for a non existent type\n");
 		return -EINVAL;
 	}
-	hmu->randomized_ds = FIELD_GET(CXL_HMU_ATTR_CONFIG_RANDOM_DS_MASK,
-				      event->attr.config);
-	if (hmu->randomized_ds && !FIELD_GET(CHMU_INST0_CAP1_RAND_DOWNSAMP_SUP, cap1)) {
-		dev_info(dev, "Randomized downsampling not supported\n");
-		return -EOPNOTSUPP;
-	}
-
-	/* RFC: sanity check against currently defined or not? */
-	hmu->m2s_requests_to_track = FIELD_GET(CXL_HMU_ATTR_CONFIG_ACCESS_TYPE_MASK,
-					       event->attr.config);
-	if (hmu->m2s_requests_to_track < CHMU_INST0_CFG0_WHAT_NONTEE_R ||
-	    hmu->m2s_requests_to_track > CHMU_INST0_CFG0_WHAT_RW) {
-		dev_dbg(dev, "Requested a reserved type to track\n");
-		return -EINVAL;
-	}
-
-	hmu->hot_thresh = FIELD_GET(CXL_HMU_ATTR_CONFIG1_HOTNESS_THRESH_MASK,
+	cfg->randomized_ds = FIELD_GET(CXL_HMU_ATTR_CONFIG_RANDOM_DS_MASK,
+				       event->attr.config);
+	cfg->access_type = FIELD_GET(CXL_HMU_ATTR_CONFIG_ACCESS_TYPE_MASK,
+				     event->attr.config);
+	cfg->hotness_threshold = FIELD_GET(CXL_HMU_ATTR_CONFIG1_HOTNESS_THRESH_MASK,
 					   event->attr.config1);
 
-	hmu->hot_gran = FIELD_GET(CXL_HMU_ATTR_CONFIG1_HOTNESS_GRANUAL_MASK,
-					 event->attr.config1);
-
-	gran_sup = FIELD_GET(CHMU_INST0_CAP1_UNIT_SIZE_MSK, cap1);
-	/* Default to smallest granual if not specified */
-	if (hmu->hot_gran == 0 && gran_sup)
-		hmu->hot_gran = 8 + ffs(gran_sup);
-
-	if (hmu->hot_gran < 8) {
-		dev_dbg(dev, "Granual less than 256 bytes, not valid in CXL 3.2\n");
+	/* The unit size as log2; default to the smallest supported unit */
+	gran = FIELD_GET(CXL_HMU_ATTR_CONFIG1_HOTNESS_GRANUAL_MASK, event->attr.config1);
+	if (gran > 63)
 		return -EINVAL;
-	}
+	cfg->unit_shift = gran;
+	if (cfg->unit_shift == 0 && caps->unit_sizes)
+		cfg->unit_shift = 8 + __ffs(caps->unit_sizes);
 
-	if (!((1 << (hmu->hot_gran - 8)) & gran_sup)) {
-		dev_dbg(dev, "Granual %d not supported, supported mask %x\n",
-			hmu->hot_gran - 8, gran_sup);
-		return -EOPNOTSUPP;
-	}
+	/* Default of 0 means the smallest supported down-sampling factor */
+	cfg->ds_shift = FIELD_GET(CXL_HMU_ATTR_CONFIG_DS_FACTOR_MASK,
+				  event->attr.config);
+	if (cfg->ds_shift == 0 && caps->ds_factors && !(caps->ds_factors & BIT(0)))
+		cfg->ds_shift = __ffs(caps->ds_factors);
 
-	ds_sup = FIELD_GET(CHMU_INST0_CAP1_DOWNSAMP_MSK, cap1);
-	hmu->ds_factor_pow2 = FIELD_GET(CXL_HMU_ATTR_CONFIG_DS_FACTOR_MASK,
-					event->attr.config);
-	if (!((1 << hmu->ds_factor_pow2) & ds_sup)) {
-		/* Special case default of 0 if not supported as smallest DS possibe */
-		if (hmu->ds_factor_pow2 == 0 && ds_sup) {
-			hmu->ds_factor_pow2 = ffs(ds_sup);
-			dev_dbg(dev, "Downsampling set to default min of %d\n",
-				hmu->ds_factor_pow2);
-		} else {
-			dev_dbg(dev, "Downsampling %d no supported, supported mask %x\n",
-				hmu->ds_factor_pow2, ds_sup);
-			return -EOPNOTSUPP;
-		}
-	}
-
-	hmu->epoch_scale = FIELD_GET(CXL_HMU_ATTR_CONFIG_EPOCH_SCALE_MASK,
+	cfg->epoch_scale = FIELD_GET(CXL_HMU_ATTR_CONFIG_EPOCH_SCALE_MASK,
 				     event->attr.config);
-
-	hmu->epoch_mult = FIELD_GET(CXL_HMU_ATTR_CONFIG_EPOCH_MULT_MASK,
+	cfg->epoch_mult = FIELD_GET(CXL_HMU_ATTR_CONFIG_EPOCH_MULT_MASK,
 				    event->attr.config);
+	/* Default to the shortest epoch the device supports */
+	if (cfg->epoch_mult == 0 && cfg->epoch_scale == 0)
+		cxl_hmu_pick_epoch(inst, caps->epoch_min_us, &cfg->epoch_scale,
+				   &cfg->epoch_mult);
 
-	/* Default to what? */
-	if (hmu->epoch_mult == 0 && hmu->epoch_scale == 0) {
-		hmu->epoch_scale = FIELD_GET(CHMU_INST0_CAP0_EPOCH_MIN_SCALE_MSK, cap0);
-		hmu->epoch_mult = FIELD_GET(CHMU_INST0_CAP0_EPOCH_MIN_MULT_MSK, cap0);
-	}
-	if (hmu->epoch_mult == 0)
-		return -EINVAL;
-
-	/* Units of 100ms */
-	epoch_min = int_pow(10, FIELD_GET(CHMU_INST0_CAP0_EPOCH_MIN_SCALE_MSK, cap0)) *
-		(u64)FIELD_GET(CHMU_INST0_CAP0_EPOCH_MIN_MULT_MSK, cap0);
-	epoch_max = int_pow(10, FIELD_GET(CHMU_INST0_CAP0_EPOCH_MAX_SCALE_MSK, cap0)) *
-		(u64)FIELD_GET(CHMU_INST0_CAP0_EPOCH_MAX_MULT_MSK, cap0);
-	epoch = int_pow(10, hmu->epoch_scale) * (u64)hmu->epoch_mult;
-
-	if (epoch > epoch_max || epoch < epoch_min) {
-		dev_dbg(dev, "out of range %llu %llu %llu\n",
-			epoch, epoch_max, epoch_min);
-		return -EINVAL;
-	}
-
-	hmu->range_base = FIELD_GET(CXL_HMU_ATTR_CONFIG2_DPA_BASE_MASK,
+	cfg->range_base = FIELD_GET(CXL_HMU_ATTR_CONFIG2_DPA_BASE_MASK,
 				    event->attr.config2);
-	hmu->range_num = FIELD_GET(CXL_HMU_ATTR_CONFIG2_DPA_SIZE_MASK,
+	cfg->range_num = FIELD_GET(CXL_HMU_ATTR_CONFIG2_DPA_SIZE_MASK,
 				   event->attr.config2);
+	/* Default of 'everything': the device capacity */
+	if (cfg->range_num == 0)
+		cfg->range_num = caps->capacity_ranges;
 
-	if (hmu->range_num == 0) {
-		/* Set a default of 'everything' */
-		hmu->range_num = (hotlist_offset - bitmap_offset) * 8;
+	/*
+	 * The counter width, and so the threshold bound, follows the unit
+	 * size, which can be programmed into the disabled instance now.
+	 */
+	rc = cxl_hmu_set_unit_size(inst, cfg->unit_shift);
+	if (rc)
+		return rc;
+	rc = cxl_hmu_validate_config(inst, cfg);
+	if (rc) {
+		dev_dbg(dev, "configuration rejected: %d\n", rc);
+		return rc;
 	}
-	/* TODO - pass in better DPA range info from parent driver */
-	if ((u64)hmu->range_base + hmu->range_num >
-	    (hotlist_offset - bitmap_offset) * 8) {
-		dev_dbg(dev, "Requested range that this HMU can't track Can track 0x%llx, asked for 0x%x to 0x%x\n",
-			(hotlist_offset - bitmap_offset) * 8,
-			hmu->range_base, hmu->range_base + hmu->range_num);
-		return -EINVAL;
-	}
-
 	return 0;
 }
 
-static int cxl_hmu_update_aux(struct cxl_hmu_info *hmu, bool stop)
+/* 16 bytes of header - arbitrary choice! */
+#define CHMU_HEADER0_SIZE_MASK GENMASK(15, 0)
+#define CHMU_HEADER0_COUNT_WIDTH GENMASK(23, 16)
+#define CHMU_HEADER1_MAGIC 0xDEADBEEF
+
+static void cxl_hmu_aux_write(struct cxl_hmu_buf *buf, size_t pos, const void *src,
+			      size_t len)
+{
+	size_t first = min(len, buf->length - pos);
+
+	memcpy(buf->base + pos, src, first);
+	if (len > first)
+		memcpy(buf->base, src + first, len - first);
+}
+
+/*
+ * Copy drained hotlist entries into the AUX buffer, within what the
+ * handle says is free of the ring, wrapping at its end, and end the output
+ * handle, beginning a new one unless @stop. Entries that do not fit are
+ * dropped and the record is marked truncated, which perf core answers by
+ * disabling the event, as for any AUX PMU whose consumer fell behind. A
+ * hotlist overflow reported by the device marks the record partial: the
+ * data is sound but has gaps.
+ */
+static int cxl_hmu_perf_flush(struct cxl_hmu_info *hmu, const u64 *entries,
+			      unsigned int nr, u8 count_width, bool overflowed,
+			      bool stop)
 {
 	struct perf_output_handle *handle = &hmu->handle;
 	struct cxl_hmu_buf *buf = perf_get_aux(handle);
 	struct perf_event *event = handle->event;
-	size_t size = 0;
-	size_t tocopy, tocopy2;
-
-	u64 offset = readq(hmu->base + CHMU_INST0_HOTLIST_OFFSET_REG);
-	u16 head = readw(hmu->base + CHMU_INST0_HEAD_REG);
-	u16 tail = readw(hmu->base + CHMU_INST0_TAIL_REG);
-	u8 count_width = FIELD_GET(CHMU_INST0_STATUS_COUNTER_WIDTH_MSK,
-				   readq(hmu->base + CHMU_INST0_STATUS_REG));
-	u16 top = FIELD_GET(CHMU_INST0_CAP0_HOTLIST_SIZE_MSK,
-			    readq(hmu->base + CHMU_INST0_CAP0_REG));
-	/* 16 bytes of header - arbitrary choice! */
-#define CHMU_HEADER0_SIZE_MASK GENMASK(15, 0)
-#define CHMU_HEADER0_COUNT_WIDTH GENMASK(23, 16)
+	size_t size = 0, tocopy, pos;
 	u64 header[2];
 
 	/*
@@ -317,233 +281,168 @@ static int cxl_hmu_update_aux(struct cxl_hmu_info *hmu, bool stop)
 	if (!buf || !handle->size)
 		return -EINVAL;
 
-	if (tail > head) {
-		tocopy = min_t(size_t, (tail - head) * 8,
-			       buf->length - buf->pos - sizeof(header));
+	/*
+	 * One record per 65535 entries, the header's count field: a delivery
+	 * queued while the vector was on another CPU can hold more than one
+	 * hotlist.
+	 */
+	while (nr && handle->size - size >= sizeof(header) + 8) {
+		size_t chunk = min_t(size_t, nr, FIELD_MAX(CHMU_HEADER0_SIZE_MASK));
+
+		tocopy = min_t(size_t, chunk * 8,
+			       (handle->size - size - sizeof(header)) & ~7UL);
 		header[0] = FIELD_PREP(CHMU_HEADER0_SIZE_MASK, tocopy / 8) |
 			    FIELD_PREP(CHMU_HEADER0_COUNT_WIDTH, count_width);
-		header[1] = 0xDEADBEEF;
-		if (tocopy) {
-			memcpy(buf->base + buf->pos, header, sizeof(header));
-			size += sizeof(header);
-			buf->pos += sizeof(header);
-			memcpy_fromio(buf->base + buf->pos,
-				      hmu->base + offset + head * 8, tocopy);
-			size += tocopy;
-			buf->pos += tocopy;
-		}
-
-	} else if (tail < head) { /* wrap around */
-		tocopy = min_t(size_t, (top - head) * 8,
-			       buf->length - buf->pos - sizeof(header));
-		tocopy2 = min_t(size_t, tail * 8,
-				buf->length - buf->pos - tocopy - sizeof(header));
-		header[0] = FIELD_PREP(CHMU_HEADER0_SIZE_MASK, (tocopy + tocopy2) / 8) |
-			    FIELD_PREP(CHMU_HEADER0_COUNT_WIDTH, count_width);
-		header[1] = 0xDEADBEEF;
-		if (tocopy) {
-			memcpy(buf->base + buf->pos, header, sizeof(header));
-			size += sizeof(header);
-			buf->pos += sizeof(header);
-			memcpy_fromio(buf->base + buf->pos,
-				      hmu->base + offset + head * 8, tocopy);
-			size += tocopy;
-			buf->pos += tocopy;
-
-		}
-
-		if (tocopy2) {
-			memcpy_fromio(buf->base + buf->pos,
-				      hmu->base + offset, tocopy2);
-			size += tocopy2;
-			buf->pos += tocopy2;
-		}
-	} /* may be no data */
+		header[1] = CHMU_HEADER1_MAGIC;
+		pos = (handle->head + size) % buf->length;
+		cxl_hmu_aux_write(buf, pos, header, sizeof(header));
+		pos = (pos + sizeof(header)) % buf->length;
+		cxl_hmu_aux_write(buf, pos, entries, tocopy);
+		size += sizeof(header) + tocopy;
+		entries += tocopy / 8;
+		nr -= tocopy / 8;
+	}
+	if (nr)
+		perf_aux_output_flag(handle, PERF_AUX_FLAG_TRUNCATED);
+	if (overflowed)
+		perf_aux_output_flag(handle, PERF_AUX_FLAG_PARTIAL);
 
 	perf_aux_output_end(handle, size);
-	if (buf->pos == buf->length)
-		return -EINVAL; /* FULL */
-
-	/* Do this after the space check, so the buffer on device will not overwrite */
-	writew(tail, hmu->base + CHMU_INST0_HEAD_REG);
-
-	if (!stop) {
-		buf = perf_aux_output_begin(handle, event);
-		if (!buf)
-			return -EINVAL;
-		buf->pos = handle->head % buf->length;
-	}
+	if (!stop && !perf_aux_output_begin(handle, event))
+		return -EINVAL;
 	return 0;
 }
 
-static int __cxl_hmu_start(struct perf_event *event, int flags)
+/* With hmu->lock held, on the event's CPU */
+static void cxl_hmu_perf_flush_pending(struct cxl_hmu_info *hmu, bool stop)
+{
+	if (!hmu->nr_pending && !hmu->pending_overflowed)
+		return;
+	cxl_hmu_perf_flush(hmu, hmu->pending, hmu->nr_pending, hmu->pending_width,
+			   hmu->pending_overflowed, stop);
+	hmu->nr_pending = 0;
+	hmu->pending_overflowed = false;
+}
+
+static void cxl_hmu_perf_csd(void *data)
+{
+	struct cxl_hmu_info *hmu = data;
+
+	guard(raw_spinlock_irqsave)(&hmu->lock);
+	cxl_hmu_perf_flush_pending(hmu, false);
+}
+
+/*
+ * From the hard interrupt. The AUX buffer belongs to the event's CPU, so a
+ * delivery elsewhere is queued for it; a stop on that CPU, with interrupts
+ * off, cannot interleave with a delivery there.
+ */
+static void cxl_hmu_perf_hotlist(struct cxl_hmu_inst *inst, const u64 *entries,
+				 unsigned int nr, u8 counter_width, bool overflowed)
+{
+	struct cxl_hmu_info *hmu = inst->drvdata;
+	unsigned int room;
+
+	guard(raw_spinlock_irqsave)(&hmu->lock);
+	if (smp_processor_id() == hmu->on_cpu) {
+		cxl_hmu_perf_flush_pending(hmu, false);
+		if (cxl_hmu_perf_flush(hmu, entries, nr, counter_width, overflowed, false))
+			dev_dbg(hmu->pmu.dev, "interrupt update failed\n");
+		return;
+	}
+	room = 2 * inst->caps.hotlist_size - hmu->nr_pending;
+	if (nr > room) {
+		nr = room;
+		hmu->pending_overflowed = true;
+	}
+	memcpy(hmu->pending + hmu->nr_pending, entries, nr * 8);
+	hmu->nr_pending += nr;
+	hmu->pending_width = counter_width;
+	hmu->pending_overflowed |= overflowed;
+	/* -EBUSY means a call is already on its way; it takes everything pending */
+	smp_call_function_single_async(hmu->on_cpu, &hmu->csd);
+}
+
+static int __cxl_hmu_perf_start(struct perf_event *event, int flags)
 {
 	struct cxl_hmu_info *hmu = pmu_to_cxl_hmu(event->pmu);
+	struct cxl_hmu_inst *inst = hmu->inst;
 	struct hw_perf_event *hwc = &event->hw;
 	struct device *dev = event->pmu->dev;
-	struct cxl_hmu_buf *buf;
 	int cpu = event->cpu;
-	u64 val, status, bitmap_base;
-	int ret, i;
-	u8 width;
-	u16 list_len = FIELD_GET(CHMU_INST0_CAP0_HOTLIST_SIZE_MSK,
-				 readq(hmu->base + CHMU_INST0_CAP0_REG));
+	int ret;
 
 	hwc->state = 0;
-	status = readq(hmu->base + CHMU_INST0_STATUS_REG);
-	if (FIELD_GET(CHMU_INST0_STATUS_ENABLED, status)) {
+	if (inst->active) {
 		dev_dbg(dev, "trace already started\n");
 		return -EBUSY;
 	}
-	/* TODO: Figure out what to do as very likely this is shared
-	 *  - Hopefully only with other HMU instances
-	 */
-	ret = irq_set_affinity(hmu->irq, cpumask_of(cpu));
-	if (ret)
-		dev_warn(dev, "failed to affinity of HMU interrupt\n");
-
 	hmu->on_cpu = cpu;
+	hmu->nr_pending = 0;
+	hmu->pending_overflowed = false;
 
-	buf = perf_aux_output_begin(&hmu->handle, event);
-	if (!buf) {
+	if (!perf_aux_output_begin(&hmu->handle, event)) {
 		dev_dbg(event->pmu->dev, "aux output begin failed\n");
 		return -EINVAL;
 	}
 
-	buf->pos = hmu->handle.head % buf->length;
-	/* Reset here disrupts samping with -F, should we avoid doing so? */
-	writeq(FIELD_PREP(CHMU_INST0_CFG0_RESET_COUNTERS, 1),
-		hmu->base + CHMU_INST0_CFG0_REG);
-
-	ret = readq_poll_timeout_atomic(hmu->base + CHMU_INST0_STATUS_REG, status,
-		(FIELD_GET(CHMU_INST0_STATUS_OP_INPROG_MSK, status) == 0),
-		10, 100000);
+	ret = cxl_hmu_hw_start(inst, event->pmu_private, cxl_hmu_perf_hotlist, true);
 	if (ret) {
-		dev_dbg(event->pmu->dev, "Reset timed out\n");
-		goto err_end_aux;
-	}
-	/* Setup what is being capured */
-	/* Type of capture, granularity etc */
-
-	val = FIELD_PREP(CHMU_INST0_CFG1_UNIT_SIZE_MSK, hmu->hot_gran) |
-		FIELD_PREP(CHMU_INST0_CFG1_DS_FACTOR_MSK, hmu->ds_factor_pow2) |
-		FIELD_PREP(CHMU_INST0_CFG1_MODE_MSK, hmu->reporting_mode) |
-		FIELD_PREP(CHMU_INST0_CFG1_EPOCH_SCALE_MSK, hmu->epoch_scale) |
-		FIELD_PREP(CHMU_INST0_CFG1_EPOCH_MULT_MSK, hmu->epoch_mult);
-	writeq(val, hmu->base + CHMU_INST0_CFG1_REG);
-
-	val = 0;
-	bitmap_base = readq(hmu->base + CHMU_INST0_RANGE_BITMAP_OFFSET_REG);
-	for (i = hmu->range_base; i < hmu->range_base + hmu->range_num; i++) {
-		val |= BIT(i % 64);
-		if (i % 64 == 63) {
-			writeq(val, hmu->base + bitmap_base + (i / 64) * 8);
-			val = 0;
-		}
+		/*
+		 * Unwind the session: perf_aux_output_begin() nested the handle
+		 * and took references that only the matching end releases.
+		 */
+		perf_aux_output_end(&hmu->handle, 0);
+		return ret;
 	}
 	/*
-	 * Flush a trailing partial word. Only do so when one exists: the
-	 * loop above already wrote every complete word, so an
-	 * unconditional write here lands one qword past the end of the
-	 * Range Configuration Bitmap register. With the default range -
-	 * (Hotlist offset - bitmap offset) * 8 bits - that is exactly the
-	 * first Hotlist entry, which CXL r4.0 Table 8-198 defines as RO.
+	 * TODO: Figure out what to do as very likely this is shared
+	 *  - Hopefully only with other HMU instances
 	 */
-	if (i % 64)
-		writeq(val, hmu->base + bitmap_base + (i / 64) * 8);
-
-	/* Set notificaiton threshold to half of buffer */
-	val = FIELD_PREP(CHMU_INST0_CFG2_FILLTHRESH_THRESHOLD_MSK,
-			 list_len / 2);
-	writeq(val, hmu->base + CHMU_INST0_CFG2_REG);
-
-	/*
-	 * RFC: Only after granual is set can the width be known - so can only check here,
-	 * or program granual size earlier just to see if it will work here.
-	 */
-	status = readq(hmu->base + CHMU_INST0_STATUS_REG);
-	width = FIELD_GET(CHMU_INST0_STATUS_COUNTER_WIDTH_MSK, status);
-	if (!width || width >= 64) {
-		ret = -EINVAL;
-		goto err_end_aux;
-	}
-	/* The threshold must be representable in the counter */
-	if (hmu->hot_thresh >= BIT_ULL(width)) {
-		ret = -EINVAL;
-		goto err_end_aux;
-	}
-	/* Start the unit up */
-	val = FIELD_PREP(CHMU_INST0_CFG0_WHAT_MSK, hmu->m2s_requests_to_track) |
-		FIELD_PREP(CHMU_INST0_CFG0_RAND_DOWNSAMP_EN,
-			   hmu->randomized_ds ? 1 : 0) |
-		FIELD_PREP(CHMU_INST0_CFG0_OVRFLW_INT_EN, 1) |
-		FIELD_PREP(CHMU_INST0_CFG0_FILLTHRESH_INT_EN, 1) |
-		FIELD_PREP(CHMU_INST0_CFG0_ENABLE, 1) |
-		FIELD_PREP(CHMU_INST0_CFG0_HOTNESS_THRESH_MSK, hmu->hot_thresh);
-	writeq(val, hmu->base + CHMU_INST0_CFG0_REG);
-
-	/* Poll status register for enablement to complete */
-	ret = readq_poll_timeout_atomic(hmu->base + CHMU_INST0_STATUS_REG, status,
-		(FIELD_GET(CHMU_INST0_STATUS_OP_INPROG_MSK, status) == 0),
-		10, 100000);
-	if (ret) {
-		dev_info(event->pmu->dev, "Enable timed out\n");
-		goto err_end_aux;
-	}
-
+	if (irq_set_affinity(inst->irq, cpumask_of(cpu)))
+		dev_warn(dev, "failed to affinity of HMU interrupt\n");
 	return 0;
-
-err_end_aux:
-	/*
-	 * Unwind the session: perf_aux_output_begin() nested the handle
-	 * and took references that only the matching end releases.
-	 */
-	perf_aux_output_end(&hmu->handle, 0);
-	return ret;
 }
 
-static void cxl_hmu_start(struct perf_event *event, int flags)
+static void cxl_hmu_perf_start(struct perf_event *event, int flags)
 {
 	struct cxl_hmu_info *hmu = pmu_to_cxl_hmu(event->pmu);
 	int ret;
 
-	guard(raw_spinlock)(&hmu->lock);
+	guard(raw_spinlock_irqsave)(&hmu->lock);
 
-	ret = __cxl_hmu_start(event, flags);
+	ret = __cxl_hmu_perf_start(event, flags);
 	if (ret)
 		event->hw.state |= PERF_HES_STOPPED;
 }
 
-static void cxl_hmu_stop(struct perf_event *event, int flags)
+/*
+ * Stop the hardware if this PMU runs it, and close the AUX session either
+ * way: the instance may already have been stopped on perf's behalf at
+ * unbind, and the session's references are perf's to release.
+ */
+static void cxl_hmu_perf_stop(struct perf_event *event, int flags)
 {
 	struct cxl_hmu_info *hmu = pmu_to_cxl_hmu(event->pmu);
+	struct cxl_hmu_inst *inst = hmu->inst;
 	struct hw_perf_event *hwc = &event->hw;
-	u64 status, val;
-	int ret;
+	bool overflowed = false;
+	u8 width = 0;
+	int n = 0;
 
 	if (hwc->state & PERF_HES_STOPPED)
 		return;
 
-	guard(raw_spinlock)(&hmu->lock);
-	status = readq(hmu->base + CHMU_INST0_STATUS_REG);
-	if (FIELD_GET(CHMU_INST0_STATUS_ENABLED, status)) {
-		/* Stop the HMU instance */
-		val = readq(hmu->base + CHMU_INST0_CFG0_REG);
-		val &= ~CHMU_INST0_CFG0_ENABLE;
-		writeq(val, hmu->base + CHMU_INST0_CFG0_REG);
-
-		ret = readq_poll_timeout_atomic(hmu->base + CHMU_INST0_STATUS_REG, status,
-			(FIELD_GET(CHMU_INST0_STATUS_OP_INPROG_MSK, status) == 0),
-			10, 100000);
-		if (ret) {
-			dev_info(event->pmu->dev, "Disable timed out\n");
-			return;
-		}
-
-		cxl_hmu_update_aux(hmu, true);
-	}
-
+	guard(raw_spinlock_irqsave)(&hmu->lock);
+	if (cxl_hmu_hw_stop(inst))
+		n = cxl_hmu_drain(inst, inst->entries, inst->caps.hotlist_size,
+				  &width, &overflowed);
+	/* Deliver what was pending and what the device still held, then close */
+	cxl_hmu_perf_flush_pending(hmu, false);
+	cxl_hmu_perf_flush(hmu, inst->entries, n, width, overflowed, true);
+	hwc->state |= PERF_HES_STOPPED | PERF_HES_UPTODATE;
 }
+
 static void cxl_hmu_read(struct perf_event *event)
 {
 	/* Nothing to do */
@@ -555,44 +454,16 @@ static int cxl_hmu_add(struct perf_event *event, int flags)
 
 	hwc->state = PERF_HES_STOPPED | PERF_HES_UPTODATE;
 	if (flags & PERF_EF_START) {
-		cxl_hmu_start(event, PERF_EF_RELOAD);
+		cxl_hmu_perf_start(event, PERF_EF_RELOAD);
 		if (hwc->state & PERF_HES_STOPPED)
 			return -EINVAL;
 	}
 	return 0;
 }
 
-/*
- * There is a lot to do in here, but using a thread is not
- * currently possible for a perf PMU driver.
- */
-static irqreturn_t cxl_hmu_irq(int irq, void *data)
-{
-	struct cxl_hmu_info *info = data;
-	u64 status;
-	int ret;
-
-	status = readq(info->base + CHMU_INST0_STATUS_REG);
-	if (!FIELD_GET(CHMU_INST0_STATUS_OVRFLW, status) &&
-	    !FIELD_GET(CHMU_INST0_STATUS_FILLTHRESH, status))
-		return IRQ_NONE;
-
-	ret = cxl_hmu_update_aux(info, false);
-	if (ret)
-		dev_err(info->pmu.dev, "interrupt update failed\n");
-
-	/*
-	 * They are level interrupts so should trigger on next fill
-	 * hence should be no problem with races.
-	 */
-	writeq(status, info->base + CHMU_INST0_STATUS_REG);
-
-	return IRQ_HANDLED;
-}
-
 static void cxl_hmu_del(struct perf_event *event, int flags)
 {
-	cxl_hmu_stop(event, PERF_EF_UPDATE);
+	cxl_hmu_perf_stop(event, PERF_EF_UPDATE);
 }
 
 static void *cxl_hmu_setup_aux(struct perf_event *event, void **pages,
@@ -627,7 +498,6 @@ static void *cxl_hmu_setup_aux(struct perf_event *event, void **pages,
 
 	buf->nr_pages = nr_pages;
 	buf->length = nr_pages * PAGE_SIZE;
-	buf->pos = 0;
 
 	return_ptr(buf);
 }
@@ -655,29 +525,35 @@ static void cxl_hmu_cpuhp_remove(void *_info)
 					    &info->node);
 }
 
-static int cxl_hmu_probe_inst(struct device *idev, void *data)
+int cxl_hmu_perf_probe_inst(struct cxl_hmu_inst *inst)
 {
-	struct cxl_hmu_inst *inst = to_cxl_hmu_inst(idev);
+	struct device *idev = &inst->dev;
 	struct cxl_hmu *hmu = inst->block;
 	struct device *dev = &hmu->dev;
 	struct cxl_hmu_info *info;
 	char *pmu_name;
 	int rc;
 
-	if (!cxl_hmu_dev_is_inst(idev))
-		return 0;
-	/* TODO add polling support - for now require threshold */
-	if (!FIELD_GET(CHMU_INST0_CAP0_FILLTHRESH_CAP,
-		       readq(inst->base + CHMU_INST0_CAP0_REG)))
+	/*
+	 * TODO add polling support - for now require the level-crossing
+	 * interrupt, and a vector to deliver it: without one the core refuses
+	 * every consumer, and a PMU would only have its CPU hotplug callbacks
+	 * fail to set an affinity.
+	 */
+	if (!inst->caps.irq_level || inst->irq < 0)
 		return 0;
 
 	info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
 	if (!info)
 		return -ENOMEM;
 	info->on_cpu = -1;
-	info->base = inst->base;
-	info->irq = inst->irq;
+	info->inst = inst;
 	raw_spin_lock_init(&info->lock);
+	INIT_CSD(&info->csd, cxl_hmu_perf_csd, info);
+	info->pending = devm_kcalloc(dev, 2 * inst->caps.hotlist_size,
+				     sizeof(*info->pending), GFP_KERNEL);
+	if (!info->pending)
+		return -ENOMEM;
 	pmu_name = devm_kasprintf(dev, GFP_KERNEL, "cxl_hmu_mem%d.%d.%u",
 				  hmu->assoc_id, hmu->index, inst->index);
 	if (!pmu_name)
@@ -693,23 +569,12 @@ static int cxl_hmu_probe_inst(struct device *idev, void *data)
 		.event_init = cxl_hmu_event_init,
 		.setup_aux = cxl_hmu_setup_aux,
 		.free_aux = cxl_hmu_free_aux,
-		.start = cxl_hmu_start,
-		.stop = cxl_hmu_stop,
+		.start = cxl_hmu_perf_start,
+		.stop = cxl_hmu_perf_stop,
 		.add = cxl_hmu_add,
 		.del = cxl_hmu_del,
 		.read = cxl_hmu_read,
 	};
-	/*
-	 * Whilst there is a 'strong' recomendation that the interrupt
-	 * should not be shared it is not a requirement.
-	 * Can we support IRQF_SHARED on a PMU?
-	 */
-	rc = devm_request_irq(dev, info->irq, cxl_hmu_irq,
-			      IRQF_NO_THREAD | IRQF_NOBALANCING,
-			      pmu_name, info);
-	if (rc)
-		return rc;
-
 	rc = cpuhp_state_add_instance(cxl_hmu_cpuhp_state_num, &info->node);
 	if (rc)
 		return rc;
@@ -727,29 +592,6 @@ static int cxl_hmu_probe_inst(struct device *idev, void *data)
 	return 0;
 }
 
-static int cxl_hmu_probe(struct device *dev)
-{
-	struct cxl_hmu *hmu = to_cxl_hmu(dev);
-	int num_inst = FIELD_GET(CHMU_COMMON_CAP0_NUMINST_MSK,
-				 readq(hmu->base + CHMU_COMMON_CAP0_REG));
-	int inst_len = FIELD_GET(CHMU_COMMON_CAP1_INSTLEN_MSK,
-				 readq(hmu->base + CHMU_COMMON_CAP1_REG));
-	int i, rc;
-
-	for (i = 0; i < num_inst; i++) {
-		rc = cxl_hmu_inst_add(hmu, i, inst_len);
-		if (rc)
-			return rc;
-	}
-	return device_for_each_child(dev, NULL, cxl_hmu_probe_inst);
-}
-
-static struct cxl_driver cxl_hmu_driver = {
-	.name = "cxl_hmu",
-	.probe = cxl_hmu_probe,
-	.id = CXL_DEVICE_HMU,
-};
-
 static int cxl_hmu_online_cpu(unsigned int cpu, struct hlist_node *node)
 {
 	struct cxl_hmu_info *info =
@@ -760,7 +602,7 @@ static int cxl_hmu_online_cpu(unsigned int cpu, struct hlist_node *node)
 
 	info->on_cpu = cpu;
 
-	WARN_ON(irq_set_affinity(info->irq, cpumask_of(cpu)));
+	WARN_ON(irq_set_affinity(info->inst->irq, cpumask_of(cpu)));
 
 	return 0;
 }
@@ -787,11 +629,11 @@ static int cxl_hmu_offline_cpu(unsigned int cpu, struct hlist_node *node)
 	 * CPU HP lock is held so we should be guaranteed that this CPU hasn't
 	 * yet gone away.
 	 */
-	WARN_ON(irq_set_affinity(info->irq, cpumask_of(target)));
+	WARN_ON(irq_set_affinity(info->inst->irq, cpumask_of(target)));
 	return 0;
 }
 
-static __init int cxl_hmu_init(void)
+int cxl_hmu_perf_init(void)
 {
 	int rc;
 
@@ -801,24 +643,10 @@ static __init int cxl_hmu_init(void)
 	if (rc < 0)
 		return rc;
 	cxl_hmu_cpuhp_state_num = rc;
-
-	rc = cxl_driver_register(&cxl_hmu_driver);
-	if (rc)
-		cpuhp_remove_multi_state(cxl_hmu_cpuhp_state_num);
-
-	return rc;
+	return 0;
 }
 
-static __exit void cxl_hmu_exit(void)
+void cxl_hmu_perf_exit(void)
 {
-	cxl_driver_unregister(&cxl_hmu_driver);
 	cpuhp_remove_multi_state(cxl_hmu_cpuhp_state_num);
 }
-
-MODULE_AUTHOR("Jonathan Cameron <Jonathan.Cameron@huawei.com>");
-MODULE_DESCRIPTION("CXL Hotness Monitor Driver");
-MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS("CXL");
-module_init(cxl_hmu_init);
-module_exit(cxl_hmu_exit);
-MODULE_ALIAS_CXL(CXL_DEVICE_HMU);

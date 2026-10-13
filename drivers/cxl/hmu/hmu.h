@@ -10,6 +10,7 @@
 #include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/mutex.h>
 #include <linux/spinlock.h>
 
 #include "../hmu.h"
@@ -22,6 +23,7 @@
 #define   CHMU_INST0_CAP0_EPOCH_TYPE_MSK		GENMASK(7, 6)
 #define     CHMU_INST0_CAP0_EPOCH_TYPE_GLOBAL		0
 #define     CHMU_INST0_CAP0_EPOCH_TYPE_PERCNT		1
+#define   CHMU_INST0_CAP0_TRACK_MSK			GENMASK(13, 8)
 #define   CHMU_INST0_CAP0_TRACK_NONTEE_R		BIT(8)
 #define   CHMU_INST0_CAP0_TRACK_NONTEE_W		BIT(9)
 #define   CHMU_INST0_CAP0_TRACK_NONTEE_RW		BIT(10)
@@ -95,19 +97,130 @@
 #define CHMU_INST0_HEAD_REG				0x68
 #define CHMU_INST0_TAIL_REG				0x6A
 
+enum cxl_hmu_mode { CXL_HMU_MODE_EPOCH, CXL_HMU_MODE_ALWAYS_ON };
+
+/**
+ * struct cxl_hmu_config - what a start programs into an instance
+ * @mode: epoch (a unit is reported when its count crosses the threshold
+ *	within an epoch, with the count) or always-on (a unit is reported once
+ *	its count crosses the threshold, and the count is not valid)
+ * @unit_shift: log2 of the unit size in bytes, one of the supported sizes
+ * @hotness_threshold: count at which a unit is hot; below 1 << counter width
+ * @epoch_scale: epoch length encoding, scale (1: 100 us .. 5: 1 s)
+ * @epoch_mult: epoch length encoding, multiplier
+ * @access_type: the M2S requests counted, in the CFG0 WHAT encoding
+ * @ds_shift: log2 of the down-sampling factor
+ * @randomized_ds: randomize the down-sampling
+ * @range_base: first 256 MiB unit of device physical address to track
+ * @range_num: number of 256 MiB units to track
+ */
+struct cxl_hmu_config {
+	enum cxl_hmu_mode	mode;
+	u8			unit_shift;
+	u32			hotness_threshold;
+	u8			epoch_scale;
+	u16			epoch_mult;
+	u8			access_type;
+	u8			ds_shift;
+	bool			randomized_ds;
+	u32			range_base, range_num;
+};
+
+/**
+ * struct cxl_hmu_caps - what an instance advertises
+ * @epoch: epoch mode supported
+ * @always_on: always-on mode supported
+ * @randomized_ds: randomized down-sampling supported
+ * @irq_overflow: raises an interrupt on hotlist overflow
+ * @irq_level: raises an interrupt when the hotlist fill level is crossed
+ * @addr_overlap: may track a range that overlaps a sibling instance's
+ * @postponed_overflow: outstanding hot units survive a hotlist overflow
+ * @epoch_type: 0 for a global epoch, 1 for a per-counter one
+ * @unit_sizes: bitmap, bit n means a unit of 256 << n bytes
+ * @ds_factors: bitmap, bit n means a down-sampling factor of 1 << n
+ * @access_types: bitmap of the supported CFG0 WHAT encodings, bit n for n + 1
+ * @epoch_min_us: shortest epoch
+ * @epoch_max_us: longest epoch
+ * @hotlist_size: entries in the hotlist
+ * @range_bits: bits in the range bitmap register
+ * @capacity_ranges: the device capacity in 256 MiB units; the bitmap's
+ *	valid extent and the bound of any configured range
+ * @msi: the Interrupt Message Number
+ */
+struct cxl_hmu_caps {
+	bool			epoch, always_on, randomized_ds;
+	bool			irq_overflow, irq_level;
+	bool			addr_overlap;
+	bool			postponed_overflow;
+	u8			epoch_type;
+	u32			unit_sizes;
+	u16			ds_factors;
+	u8			access_types;
+	u64			epoch_min_us, epoch_max_us;
+	u16			hotlist_size;
+	u32			range_bits;
+	u32			capacity_ranges;
+	u8			msi;
+};
+
+struct cxl_hmu_inst;
+
+/*
+ * Delivery of a drained hotlist. @entries holds @nr raw hotlist entries
+ * (unit number in the upper bits, count in the low @counter_width bits);
+ * @overflowed says the device reported a hotlist overflow since the
+ * previous drain, so entries may have been lost before these.
+ */
+typedef void (*cxl_hmu_hotlist_fn)(struct cxl_hmu_inst *inst, const u64 *entries,
+				   unsigned int nr, u8 counter_width, bool overflowed);
 
 struct cxl_hmu_inst {
 	struct device		dev;
 	struct cxl_hmu		*block;
 	void __iomem		*base;		/* block base + 0x10 + INSTLEN * index */
 	unsigned int		index;
-	int			irq;
+	int			irq;		/* -1 without an interrupt capability */
+	struct cxl_hmu_caps	caps;		/* decoded once at probe */
+	/*
+	 * Hardware RMW, active, owner, the handler and the drain. The block's
+	 * lock nests inside it around an enable or disable, so the overlap
+	 * check and the state it reads from siblings are consistent.
+	 */
 	raw_spinlock_t		lock;
-	void			*drvdata;	/* the perf consumer's per-instance state */
+	struct mutex		drain_lock;	/* the threaded drain and its delivery */
+	struct cxl_hmu_config	config;		/* what the next start programs */
+	struct cxl_hmu_config	live;		/* what the running session was started with */
+	u8			live_width;	/* the counter width of that session */
+	bool			active;		/* hardware enabled */
+	u8			counter_width;	/* valid once a unit size is set */
+	u64			*entries;	/* drain scratch, hotlist_size entries */
+	unsigned long		overflows;	/* hotlist overflows since the last start */
+	/*
+	 * The handler installed by cxl_hmu_hw_start() under the lock together
+	 * with active. An atomic one runs from the hard interrupt and must
+	 * not sleep; otherwise it runs from the interrupt thread.
+	 */
+	cxl_hmu_hotlist_fn	hotlist;
+	bool			hotlist_atomic;
+	void			*drvdata;	/* the perf PMU of this instance, if built */
 };
 #define to_cxl_hmu_inst(d) container_of(d, struct cxl_hmu_inst, dev)
 
 int cxl_hmu_inst_add(struct cxl_hmu *block, unsigned int index, unsigned int inst_len);
 bool cxl_hmu_dev_is_inst(struct device *dev);
+
+int cxl_hmu_perf_init(void);
+void cxl_hmu_perf_exit(void);
+int cxl_hmu_perf_probe_inst(struct cxl_hmu_inst *inst);
+
+u64 cxl_hmu_epoch_us(u8 scale, u16 mult);
+void cxl_hmu_pick_epoch(const struct cxl_hmu_inst *inst, u64 target_us, u8 *scale, u16 *mult);
+int cxl_hmu_validate_config(struct cxl_hmu_inst *inst, const struct cxl_hmu_config *cfg);
+int cxl_hmu_set_unit_size(struct cxl_hmu_inst *inst, u8 unit_shift);
+int cxl_hmu_hw_start(struct cxl_hmu_inst *inst, const struct cxl_hmu_config *cfg,
+		     cxl_hmu_hotlist_fn fn, bool atomic);
+bool cxl_hmu_hw_stop(struct cxl_hmu_inst *inst);
+int cxl_hmu_drain(struct cxl_hmu_inst *inst, u64 *entries, unsigned int max,
+		  u8 *counter_width, bool *overflowed);
 
 #endif

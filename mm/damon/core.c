@@ -10,6 +10,7 @@
 #include <linux/kthread.h>
 #include <linux/memcontrol.h>
 #include <linux/mm.h>
+#include <linux/mm_inline.h>
 #include <linux/psi.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -18,6 +19,7 @@
 
 /* for damon_get_folio() used by node eligible memory metrics */
 #include "ops-common.h"
+#include "../internal.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/damon.h>
@@ -30,6 +32,8 @@ static DEFINE_MUTEX(damon_ops_lock);
 static struct damon_operations damon_registered_ops[NR_DAMON_OPS];
 
 static struct kmem_cache *damon_region_cache __ro_after_init;
+
+static bool damos_quota_is_set(struct damos_quota *quota);
 
 /* Should be called under damon_ops_lock with id smaller than NR_DAMON_OPS */
 static bool __damon_is_registered_ops(enum damon_ops_id id)
@@ -581,6 +585,12 @@ struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
 	scheme->max_nr_snapshots = 0;
 	INIT_LIST_HEAD(&scheme->list);
 
+	INIT_LIST_HEAD(&scheme->folios);
+	scheme->nr_folios = 0;
+	scheme->queued_sz = 0;
+	spin_lock_init(&scheme->folios_lock);
+	scheme->accepting_folios = false;
+
 	scheme->quota = *(damos_quota_init(quota));
 	/* quota.goals should be separately set by caller */
 	INIT_LIST_HEAD(&scheme->quota.goals);
@@ -616,9 +626,126 @@ static void damon_del_scheme(struct damos *s)
 	list_del(&s->list);
 }
 
+/**
+ * damos_putback_folios() - Return LRU-isolated folios to the LRU.
+ * @folios:	Folios isolated with folio_isolate_lru() and accounted in
+ *		NR_ISOLATED_*, linked through folio->lru.
+ *
+ * Undo the isolation of every folio on @folios and drop the isolation's
+ * reference.  The list is empty on return.
+ */
+void damos_putback_folios(struct list_head *folios)
+{
+	struct folio *folio, *next;
+
+	list_for_each_entry_safe(folio, next, folios, lru) {
+		list_del(&folio->lru);
+		node_stat_sub_folio(folio, NR_ISOLATED_ANON +
+				folio_is_file_lru(folio));
+		folio_putback_lru(folio);
+		cond_resched();
+	}
+}
+
 static void damon_free_scheme(struct damos *s)
 {
+	/* A pusher must stop before the scheme goes; what is left goes back */
+	damos_putback_folios(&s->folios);
 	kfree(s);
+}
+
+/* More than this many pushed folios wait for an apply: the pusher is told */
+#define DAMOS_MAX_QUEUED_FOLIOS		65536
+
+/*
+ * Would a push of @nr folios, @sz bytes, be refused?  With a quota, the
+ * queue holds at most what the interval can still apply, so a source stops
+ * isolating once the budget is spoken for; an empty queue takes any push, as
+ * the apply migrates at least one folio.
+ */
+static int damos_folios_refused(struct damos *s, unsigned long nr,
+		unsigned long sz)
+{
+	struct damos_quota *quota = &s->quota;
+
+	lockdep_assert_held(&s->folios_lock);
+	if (!s->accepting_folios)
+		return -EBUSY;
+	if (s->nr_folios + nr > DAMOS_MAX_QUEUED_FOLIOS)
+		return -ENOSPC;
+	if (damos_quota_is_set(quota)) {
+		unsigned long left = quota->esz > quota->charged_sz ?
+			quota->esz - quota->charged_sz : 0;
+
+		if (!left || s->queued_sz >= left ||
+		    (s->queued_sz && s->queued_sz + sz > left))
+			return -ENOSPC;
+	}
+	return 0;
+}
+
+/**
+ * damos_folios_wanted() - Would damos_add_folios() take folios now?
+ * @s:		The scheme.
+ *
+ * For a source that must isolate folios before it can push them: the
+ * answer damos_add_folios() would give an empty push, so the isolation is
+ * not done for nothing.  The answer can change by the time of the push.
+ *
+ * Return: 0 if a push would be taken, else the error it would return.
+ */
+int damos_folios_wanted(struct damos *s)
+{
+	unsigned long flags;
+	int err;
+
+	spin_lock_irqsave(&s->folios_lock, flags);
+	err = damos_folios_refused(s, 0, 0);
+	spin_unlock_irqrestore(&s->folios_lock, flags);
+	return err;
+}
+
+/**
+ * damos_add_folios() - Push folios to a DAMOS scheme.
+ * @s:		The scheme to apply its action to @folios.
+ * @folios:	LRU-isolated folios, linked through folio->lru.
+ *
+ * Queue @folios for @s.  The kdamond of @s applies the action of @s to
+ * them at its next apply interval, under the quota and the operations set
+ * filters of @s (core filters, which select regions, do not apply), and
+ * returns whatever it does not apply to the LRU.  The folios must have been
+ * isolated with folio_isolate_lru() and accounted in NR_ISOLATED_*; the
+ * isolation's reference travels with the list.  The caller keeps @s alive
+ * until it has stopped pushing.
+ *
+ * Can be called from process context or an interrupt thread.
+ *
+ * Return: 0 on success.  -EBUSY if the kdamond of @s is not running, @s is
+ * not active, or its operations set cannot apply folios; -ENOSPC if the
+ * queue already holds what the quota of @s can still apply this interval
+ * (an empty queue takes any push), or DAMOS_MAX_QUEUED_FOLIOS folios.  On
+ * an error @folios is untouched and still owned by the caller.
+ */
+int damos_add_folios(struct damos *s, struct list_head *folios)
+{
+	unsigned long nr = 0, sz = 0, flags;
+	struct folio *folio;
+	int err = 0;
+
+	list_for_each_entry(folio, folios, lru) {
+		nr++;
+		sz += folio_size(folio);
+	}
+
+	spin_lock_irqsave(&s->folios_lock, flags);
+	err = damos_folios_refused(s, nr, sz);
+	if (!err) {
+		list_splice_tail_init(folios, &s->folios);
+		s->nr_folios += nr;
+		s->queued_sz += sz;
+	}
+	spin_unlock_irqrestore(&s->folios_lock, flags);
+	return err;
 }
 
 void damon_destroy_scheme(struct damos *s)
@@ -2438,6 +2565,88 @@ update_stat:
 	damos_update_stat(s, sz, sz_applied, sz_ops_filter_passed);
 }
 
+/* Take the pushed folios of @s, and say whether more will be accepted */
+static void damos_take_folios(struct damos *s, struct list_head *folios,
+		bool accept)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&s->folios_lock, flags);
+	s->accepting_folios = accept;
+	list_splice_init(&s->folios, folios);
+	s->nr_folios = 0;
+	s->queued_sz = 0;
+	spin_unlock_irqrestore(&s->folios_lock, flags);
+}
+
+static bool damos_can_apply_folios(struct damon_ctx *c, struct damos *s)
+{
+	if (!c->ops.apply_folios || !s->wmarks.activated)
+		return false;
+	if (s->max_nr_snapshots && s->max_nr_snapshots <= s->stat.nr_snapshots)
+		return false;
+	return true;
+}
+
+/*
+ * Apply the folios pushed to @s since the last apply, within what is left
+ * of the quota; what the operations set does not take goes back to the
+ * LRU.  Core filters select regions and have nothing to say about a folio,
+ * so the operations set filters always run.
+ */
+static void damos_apply_folios(struct damon_ctx *c, struct damos *s)
+{
+	struct damos_quota *quota = &s->quota;
+	unsigned long sz_budget = ULONG_MAX;
+	unsigned long sz_tried = 0, sz_applied = 0, sz_filter_passed = 0;
+	struct timespec64 begin, end;
+	LIST_HEAD(folios);
+
+	damos_take_folios(s, &folios, true);
+	if (list_empty(&folios))
+		return;
+
+	if (damos_quota_is_set(quota))
+		sz_budget = quota->esz > quota->charged_sz ?
+			quota->esz - quota->charged_sz : 0;
+	s->core_filters_allowed = false;
+
+	ktime_get_coarse_ts64(&begin);
+	if (sz_budget)
+		sz_applied = c->ops.apply_folios(c, s, &folios, sz_budget,
+				&sz_tried, &sz_filter_passed);
+	ktime_get_coarse_ts64(&end);
+	damos_putback_folios(&folios);
+	if (!sz_tried)
+		return;
+	quota->total_charged_ns += timespec64_to_ns(&end) -
+		timespec64_to_ns(&begin);
+	damos_charge_quota(quota, sz_tried, sz_applied);
+	damos_update_stat(s, sz_tried, sz_applied, sz_filter_passed);
+}
+
+/* Nothing more is accepted for @s, and what was pushed goes back */
+static void damos_drain_folios(struct damos *s)
+{
+	LIST_HEAD(folios);
+
+	damos_take_folios(s, &folios, false);
+	damos_putback_folios(&folios);
+}
+
+/*
+ * Pushed folios wait at most one apply interval while the scheme runs; when
+ * kdamond pauses, waits for a watermark, or stops, they go back to the LRU
+ * and nothing more is accepted until it applies again.
+ */
+static void kdamond_drain_folios(struct damon_ctx *c)
+{
+	struct damos *s;
+
+	damon_for_each_scheme(s, c)
+		damos_drain_folios(s);
+}
+
 static void damon_do_apply_schemes(struct damon_ctx *c,
 				   struct damon_target *t,
 				   struct damon_region *r)
@@ -3048,6 +3257,15 @@ static void kdamond_apply_schemes(struct damon_ctx *c)
 	damon_for_each_scheme(s, c) {
 		if (time_before(c->passed_sample_intervals, s->next_apply_sis))
 			continue;
+		if (damos_can_apply_folios(c, s))
+			damos_apply_folios(c, s);
+		else
+			damos_drain_folios(s);
+	}
+
+	damon_for_each_scheme(s, c) {
+		if (time_before(c->passed_sample_intervals, s->next_apply_sis))
+			continue;
 		damos_walk_complete(c, s);
 		damos_set_next_apply_sis(s, c);
 		s->last_applied = NULL;
@@ -3455,6 +3673,7 @@ static int kdamond_wait_activation(struct damon_ctx *ctx)
 		if (!min_wait_time)
 			return 0;
 
+		kdamond_drain_folios(ctx);
 		kdamond_usleep(min_wait_time);
 
 		kdamond_call(ctx, false);
@@ -3481,6 +3700,7 @@ static void kdamond_init_ctx(struct damon_ctx *ctx)
 	damon_for_each_scheme(scheme, ctx) {
 		damos_set_next_apply_sis(scheme, ctx);
 		damos_set_filters_default_reject(scheme);
+		scheme->accepting_folios = damos_can_apply_folios(ctx, scheme);
 	}
 }
 
@@ -3556,6 +3776,7 @@ static int kdamond_fn(void *data)
 			break;
 		while (ctx->pause) {
 			damos_walk_cancel(ctx);
+			kdamond_drain_folios(ctx);
 			kdamond_usleep(ctx->attrs.sample_interval);
 			/* allow caller unset pause via damon_call() */
 			kdamond_call(ctx, false);
@@ -3618,6 +3839,7 @@ static int kdamond_fn(void *data)
 		}
 	}
 done:
+	kdamond_drain_folios(ctx);
 	damon_destroy_targets(ctx);
 
 	kfree(ctx->regions_score_histogram);

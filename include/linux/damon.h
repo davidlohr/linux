@@ -601,6 +601,15 @@ struct damos {
 	void *last_applied;
 	struct damos_stat stat;
 	unsigned long max_nr_snapshots;
+/* private: internal use only */
+	/* folios pushed by damos_add_folios(), applied at the next apply */
+	struct list_head folios;
+	unsigned long nr_folios;
+	unsigned long queued_sz;
+	spinlock_t folios_lock;	/* protects folios, nr_folios, queued_sz, accepting_folios */
+	/* kdamond runs, the scheme is active and the ops can apply folios */
+	bool accepting_folios;
+/* public: */
 	struct list_head list;
 };
 
@@ -631,6 +640,7 @@ enum damon_ops_id {
  * @apply_probes:		Apply probes for each region.
  * @get_scheme_score:		Get the score of a region for a scheme.
  * @apply_scheme:		Apply a DAMON-based operation scheme.
+ * @apply_folios:		Apply a scheme to pushed folios.
  * @target_valid:		Determine if the target is valid.
  * @cleanup_target:		Clean up each target before deallocation.
  *
@@ -664,6 +674,12 @@ enum damon_ops_id {
  * to the region and return bytes of the region that the action is successfully
  * applied.  It should also report how many bytes of the region has passed
  * filters (&struct damos_filter) that handled by itself.
+ * @apply_folios should apply the action of @scheme to the LRU-isolated
+ * folios on @folios while their cumulative size in core address units stays
+ * within @sz_budget, taking at least one folio if any budget is left, store
+ * the considered size in @sz_tried and the size that passed the ops filters
+ * in @sz_filter_passed, and return the applied size.  Folios it does not
+ * take stay on @folios; the core returns them to the LRU.
  * @target_valid should check whether the target is still valid for the
  * monitoring.
  * @cleanup_target is called before the target will be deallocated.
@@ -680,6 +696,10 @@ struct damon_operations {
 	unsigned long (*apply_scheme)(struct damon_ctx *context,
 			struct damon_target *t, struct damon_region *r,
 			struct damos *scheme, unsigned long *sz_filter_passed);
+	unsigned long (*apply_folios)(struct damon_ctx *context,
+			struct damos *scheme, struct list_head *folios,
+			unsigned long sz_budget, unsigned long *sz_tried,
+			unsigned long *sz_filter_passed);
 	bool (*target_valid)(struct damon_target *t);
 	void (*cleanup_target)(struct damon_target *t);
 };
@@ -1035,6 +1055,9 @@ struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
 			struct damos_quota *quota,
 			struct damos_watermarks *wmarks,
 			int target_nid);
+int damos_add_folios(struct damos *s, struct list_head *folios);
+int damos_folios_wanted(struct damos *s);
+void damos_putback_folios(struct list_head *folios);
 void damon_add_scheme(struct damon_ctx *ctx, struct damos *s);
 void damon_destroy_scheme(struct damos *s);
 int damos_commit_quota_goals(struct damos_quota *dst, struct damos_quota *src);

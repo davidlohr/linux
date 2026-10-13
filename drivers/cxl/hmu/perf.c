@@ -23,90 +23,10 @@
 #include <linux/math.h>
 #include <linux/pci.h>
 
-#include "cxlpci.h"
-#include "cxl.h"
+#include "../cxlpci.h"
+#include "../cxl.h"
+#include "../hmu.h"
 #include "hmu.h"
-
-/* Register offsets within instance */
-#define CHMU_INST0_CAP0_REG				0x00
-#define   CHMU_INST0_CAP0_MSI_N_MSK			GENMASK(3, 0)
-#define   CHMU_INST0_CAP0_OVRFLW_CAP			BIT(4)
-#define   CHMU_INST0_CAP0_FILLTHRESH_CAP		BIT(5)
-#define   CHMU_INST0_CAP0_EPOCH_TYPE_MSK		GENMASK(7, 6)
-#define     CHMU_INST0_CAP0_EPOCH_TYPE_GLOBAL		0
-#define     CHMU_INST0_CAP0_EPOCH_TYPE_PERCNT		1
-#define   CHMU_INST0_CAP0_TRACK_NONTEE_R		BIT(8)
-#define   CHMU_INST0_CAP0_TRACK_NONTEE_W		BIT(9)
-#define   CHMU_INST0_CAP0_TRACK_NONTEE_RW		BIT(10)
-#define   CHMU_INST0_CAP0_TRACK_R			BIT(11)
-#define   CHMU_INST0_CAP0_TRACK_W			BIT(12)
-#define   CHMU_INST0_CAP0_TRACK_RW			BIT(13)
-/* Epoch defined as scale * multiplier */
-#define   CHMU_INST0_CAP0_EPOCH_MAX_SCALE_MSK		GENMASK(19, 16)
-#define     CHMU_EPOCH_SCALE_100US			1
-#define     CHMU_EPOCH_SCALE_1MS			2
-#define     CHMU_EPOCH_SCALE_10MS			3
-#define     CHMU_EPOCH_SCALE_100MS			4
-#define     CHMU_EPOCH_SCALE_1S			5
-#define   CHMU_INST0_CAP0_EPOCH_MAX_MULT_MSK		GENMASK(31, 20)
-#define   CHMU_INST0_CAP0_EPOCH_MIN_SCALE_MSK		GENMASK_ULL(35, 32)
-#define   CHMU_INST0_CAP0_EPOCH_MIN_MULT_MSK		GENMASK_ULL(47, 36)
-#define   CHMU_INST0_CAP0_HOTLIST_SIZE_MSK		GENMASK_ULL(63, 48)
-#define CHMU_INST0_CAP1_REG				0x08
-/* Power of 2 * 256 bits */
-#define   CHMU_INST0_CAP1_UNIT_SIZE_MSK			GENMASK(31, 0)
-/* Power of 2 */
-#define   CHMU_INST0_CAP1_DOWNSAMP_MSK			GENMASK_ULL(47, 32)
-#define   CHMU_INST0_CAP1_EPOCH_SUP			BIT_ULL(48)
-#define   CHMU_INST0_CAP1_ALWAYS_ON_SUP			BIT_ULL(49)
-#define   CHMU_INST0_CAP1_RAND_DOWNSAMP_SUP		BIT_ULL(50)
-#define   CHMU_INST0_CAP1_ADDR_OVERLAP_SUP		BIT_ULL(51)
-#define   CHMU_INST0_CAP1_POSTPONED_ON_OVRFLOW_SUP	BIT_ULL(52)
-
-/*
- * In CXL r3.2 all defined as part of single giant CAP register.
- * Where a whole 64 bits is in one field just name after the field.
- */
-#define CHMU_INST0_RANGE_BITMAP_OFFSET_REG		0x10
-#define CHMU_INST0_HOTLIST_OFFSET_REG			0x18
-
-#define CHMU_INST0_CFG0_REG				0x40
-#define   CHMU_INST0_CFG0_WHAT_MSK			GENMASK(7, 0)
-#define      CHMU_INST0_CFG0_WHAT_NONTEE_R		1
-#define      CHMU_INST0_CFG0_WHAT_NONTEE_W		2
-#define      CHMU_INST0_CFG0_WHAT_NONTEE_RW		3
-#define      CHMU_INST0_CFG0_WHAT_R			4
-#define      CHMU_INST0_CFG0_WHAT_W			5
-#define      CHMU_INST0_CFG0_WHAT_RW			6
-#define   CHMU_INST0_CFG0_RAND_DOWNSAMP_EN		BIT(8)
-#define   CHMU_INST0_CFG0_OVRFLW_INT_EN			BIT(9)
-#define   CHMU_INST0_CFG0_FILLTHRESH_INT_EN		BIT(10)
-#define   CHMU_INST0_CFG0_ENABLE			BIT(16)
-#define   CHMU_INST0_CFG0_RESET_COUNTERS		BIT(17)
-#define   CHMU_INST0_CFG0_HOTNESS_THRESH_MSK		GENMASK_ULL(63, 32)
-#define CHMU_INST0_CFG1_REG				0x48
-#define   CHMU_INST0_CFG1_UNIT_SIZE_MSK			GENMASK(31, 0)
-#define   CHMU_INST0_CFG1_DS_FACTOR_MSK			GENMASK(35, 32)
-#define   CHMU_INST0_CFG1_MODE_MSK			GENMASK_ULL(47, 40)
-#define   CHMU_INST0_CFG1_EPOCH_SCALE_MSK		GENMASK_ULL(51, 48)
-#define   CHMU_INST0_CFG1_EPOCH_MULT_MSK		GENMASK_ULL(63, 52)
-#define CHMU_INST0_CFG2_REG				0x50
-#define   CHMU_INST0_CFG2_FILLTHRESH_THRESHOLD_MSK	GENMASK(15, 0)
-
-#define CHMU_INST0_STATUS_REG				0x60
-#define   CHMU_INST0_STATUS_ENABLED			BIT(0)
-#define   CHMU_INST0_STATUS_OP_INPROG_MSK		GENMASK(31, 16)
-#define     CHMU_INST0_STATUS_OP_INPROG_NONE		0
-#define     CHMU_INST0_STATUS_OP_INPROG_ENABLE		1
-#define     CHMU_INST0_STATUS_OP_INPROG_DISABLE		2
-#define     CHMU_INST0_STATUS_OP_INPROG_RESET		3
-#define   CHMU_INST0_STATUS_COUNTER_WIDTH_MSK		GENMASK_ULL(39, 32)
-#define   CHMU_INST0_STATUS_OVRFLW			BIT_ULL(40)
-#define   CHMU_INST0_STATUS_FILLTHRESH			BIT_ULL(41)
-
-/* 2 byte registers */
-#define CHMU_INST0_HEAD_REG				0x68
-#define CHMU_INST0_TAIL_REG				0x6A
 
 /* CFG attribute bit mappings */
 #define CXL_HMU_ATTR_CONFIG_EPOCH_TYPE_MASK GENMASK(1, 0)
@@ -735,100 +655,93 @@ static void cxl_hmu_cpuhp_remove(void *_info)
 					    &info->node);
 }
 
+static int cxl_hmu_probe_inst(struct device *idev, void *data)
+{
+	struct cxl_hmu_inst *inst = to_cxl_hmu_inst(idev);
+	struct cxl_hmu *hmu = inst->block;
+	struct device *dev = &hmu->dev;
+	struct cxl_hmu_info *info;
+	char *pmu_name;
+	int rc;
+
+	if (!cxl_hmu_dev_is_inst(idev))
+		return 0;
+	/* TODO add polling support - for now require threshold */
+	if (!FIELD_GET(CHMU_INST0_CAP0_FILLTHRESH_CAP,
+		       readq(inst->base + CHMU_INST0_CAP0_REG)))
+		return 0;
+
+	info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
+	if (!info)
+		return -ENOMEM;
+	info->on_cpu = -1;
+	info->base = inst->base;
+	info->irq = inst->irq;
+	raw_spin_lock_init(&info->lock);
+	pmu_name = devm_kasprintf(dev, GFP_KERNEL, "cxl_hmu_mem%d.%d.%u",
+				  hmu->assoc_id, hmu->index, inst->index);
+	if (!pmu_name)
+		return -ENOMEM;
+	info->pmu = (struct pmu) {
+		.name = pmu_name,
+		.parent = idev,
+		.module = THIS_MODULE,
+		.capabilities = PERF_PMU_CAP_EXCLUSIVE |
+				PERF_PMU_CAP_NO_EXCLUDE,
+		.task_ctx_nr = perf_sw_context,
+		.attr_groups = cxl_hmu_groups,
+		.event_init = cxl_hmu_event_init,
+		.setup_aux = cxl_hmu_setup_aux,
+		.free_aux = cxl_hmu_free_aux,
+		.start = cxl_hmu_start,
+		.stop = cxl_hmu_stop,
+		.add = cxl_hmu_add,
+		.del = cxl_hmu_del,
+		.read = cxl_hmu_read,
+	};
+	/*
+	 * Whilst there is a 'strong' recomendation that the interrupt
+	 * should not be shared it is not a requirement.
+	 * Can we support IRQF_SHARED on a PMU?
+	 */
+	rc = devm_request_irq(dev, info->irq, cxl_hmu_irq,
+			      IRQF_NO_THREAD | IRQF_NOBALANCING,
+			      pmu_name, info);
+	if (rc)
+		return rc;
+
+	rc = cpuhp_state_add_instance(cxl_hmu_cpuhp_state_num, &info->node);
+	if (rc)
+		return rc;
+	rc = devm_add_action_or_reset(dev, cxl_hmu_cpuhp_remove, info);
+	if (rc)
+		return rc;
+
+	rc = perf_pmu_register(&info->pmu, info->pmu.name, -1);
+	if (rc)
+		return rc;
+	rc = devm_add_action_or_reset(dev, cxl_hmu_perf_unregister, info);
+	if (rc)
+		return rc;
+	inst->drvdata = info;
+	return 0;
+}
+
 static int cxl_hmu_probe(struct device *dev)
 {
-	struct pci_dev *pdev = to_pci_dev(dev->parent);
 	struct cxl_hmu *hmu = to_cxl_hmu(dev);
-	int i, rc;
-
 	int num_inst = FIELD_GET(CHMU_COMMON_CAP0_NUMINST_MSK,
 				 readq(hmu->base + CHMU_COMMON_CAP0_REG));
 	int inst_len = FIELD_GET(CHMU_COMMON_CAP1_INSTLEN_MSK,
 				 readq(hmu->base + CHMU_COMMON_CAP1_REG));
+	int i, rc;
 
 	for (i = 0; i < num_inst; i++) {
-		struct cxl_hmu_info *info;
-		char *pmu_name;
-		int msg_num;
-		u64 val;
-
-		info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
-		if (!info)
-			return -ENOMEM;
-
-		dev_set_drvdata(dev, info);
-		info->on_cpu = -1;
-		info->base = hmu->base + 0x10 + inst_len * i;
-
-		val = readq(info->base + CHMU_INST0_CAP0_REG);
-		msg_num = FIELD_GET(CHMU_INST0_CAP0_MSI_N_MSK, val);
-
-		/* TODO add polling support - for now require threshold */
-		if (!FIELD_GET(CHMU_INST0_CAP0_FILLTHRESH_CAP, val)) {
-			devm_kfree(dev, info);
-			continue;
-		}
-
-		raw_spin_lock_init(&info->lock);
-
-		pmu_name = devm_kasprintf(dev, GFP_KERNEL,
-					  "cxl_hmu_mem%d.%d.%d",
-					  hmu->assoc_id, hmu->index, i);
-		if (!pmu_name)
-			return -ENOMEM;
-
-		info->pmu = (struct pmu) {
-			.name = pmu_name,
-			.parent = dev,
-			.module = THIS_MODULE,
-			.capabilities = PERF_PMU_CAP_EXCLUSIVE |
-					PERF_PMU_CAP_NO_EXCLUDE,
-			.task_ctx_nr = perf_sw_context,
-			.attr_groups = cxl_hmu_groups,
-			.event_init = cxl_hmu_event_init,
-			.setup_aux = cxl_hmu_setup_aux,
-			.free_aux = cxl_hmu_free_aux,
-			.start = cxl_hmu_start,
-			.stop = cxl_hmu_stop,
-			.add = cxl_hmu_add,
-			.del = cxl_hmu_del,
-			.read = cxl_hmu_read,
-		};
-		rc = pci_irq_vector(pdev, msg_num);
-		if (rc < 0)
-			return rc;
-		info->irq = rc;
-
-		/*
-		 * Whilst there is a 'strong' recomendation that the interrupt
-		 * should not be shared it is not a requirement.
-		 * Can we support IRQF_SHARED on a PMU?
-		 */
-		rc = devm_request_irq(dev, info->irq, cxl_hmu_irq,
-				      IRQF_NO_THREAD | IRQF_NOBALANCING,
-				      pmu_name, info);
-		if (rc)
-			return rc;
-
-		rc = cpuhp_state_add_instance(cxl_hmu_cpuhp_state_num,
-					      &info->node);
-		if (rc)
-			return rc;
-
-		rc = devm_add_action_or_reset(dev, cxl_hmu_cpuhp_remove, info);
-		if (rc)
-			return rc;
-
-		rc = perf_pmu_register(&info->pmu, info->pmu.name, -1);
-		if (rc)
-			return rc;
-
-		rc = devm_add_action_or_reset(dev, cxl_hmu_perf_unregister,
-					      info);
+		rc = cxl_hmu_inst_add(hmu, i, inst_len);
 		if (rc)
 			return rc;
 	}
-	return 0;
+	return device_for_each_child(dev, NULL, cxl_hmu_probe_inst);
 }
 
 static struct cxl_driver cxl_hmu_driver = {

@@ -45,6 +45,7 @@
 #define CXL_HMU_ATTR_CONFIG2_DPA_SIZE_MASK GENMASK_ULL(63, 32)
 
 static int cxl_hmu_cpuhp_state_num;
+static const struct cxl_hmu_consumer cxl_hmu_perf_consumer;
 
 struct cxl_hmu_info {
 	struct pmu pmu;
@@ -226,11 +227,12 @@ static int cxl_hmu_event_init(struct perf_event *event)
 
 	/*
 	 * The counter width, and so the threshold bound, follows the unit
-	 * size, which can be programmed into the disabled instance now.
+	 * size, which can be programmed into the disabled instance now; this
+	 * also checks that perf owns the instance.
 	 */
-	rc = cxl_hmu_set_unit_size(inst, cfg->unit_shift);
+	rc = cxl_hmu_consumer_set_unit_size(inst, &cxl_hmu_perf_consumer, cfg->unit_shift);
 	if (rc)
-		return rc;
+		return rc == -EPERM ? -EBUSY : rc;
 	rc = cxl_hmu_validate_config(inst, cfg);
 	if (rc) {
 		dev_dbg(dev, "configuration rejected: %d\n", rc);
@@ -340,7 +342,7 @@ static void cxl_hmu_perf_csd(void *data)
 static void cxl_hmu_perf_hotlist(struct cxl_hmu_inst *inst, const u64 *entries,
 				 unsigned int nr, u8 counter_width, bool overflowed)
 {
-	struct cxl_hmu_info *hmu = inst->drvdata;
+	struct cxl_hmu_info *hmu = cxl_hmu_consumer_data(inst);
 	unsigned int room;
 
 	guard(raw_spinlock_irqsave)(&hmu->lock);
@@ -386,7 +388,7 @@ static int __cxl_hmu_perf_start(struct perf_event *event, int flags)
 		return -EINVAL;
 	}
 
-	ret = cxl_hmu_hw_start(inst, event->pmu_private, cxl_hmu_perf_hotlist, true);
+	ret = cxl_hmu_start(inst, &cxl_hmu_perf_consumer, event->pmu_private);
 	if (ret) {
 		/*
 		 * Unwind the session: perf_aux_output_begin() nested the handle
@@ -434,7 +436,7 @@ static void cxl_hmu_perf_stop(struct perf_event *event, int flags)
 		return;
 
 	guard(raw_spinlock_irqsave)(&hmu->lock);
-	if (cxl_hmu_hw_stop(inst))
+	if (cxl_hmu_hw_stop(inst, &cxl_hmu_perf_consumer))
 		n = cxl_hmu_drain(inst, inst->entries, inst->caps.hotlist_size,
 				  &width, &overflowed);
 	/* Deliver what was pending and what the device still held, then close */
@@ -633,6 +635,23 @@ static int cxl_hmu_offline_cpu(unsigned int cpu, struct hlist_node *node)
 	return 0;
 }
 
+/* The PMU exists only for an instance with the level-crossing interrupt */
+static int cxl_hmu_perf_attach(struct cxl_hmu_inst *inst)
+{
+	if (!inst->drvdata)
+		return -EOPNOTSUPP;
+	cxl_hmu_set_consumer_data(inst, inst->drvdata);
+	return 0;
+}
+
+static const struct cxl_hmu_consumer cxl_hmu_perf_consumer = {
+	.name = "perf",
+	.owner = THIS_MODULE,
+	.atomic = true,
+	.attach = cxl_hmu_perf_attach,
+	.hotlist = cxl_hmu_perf_hotlist,
+};
+
 int cxl_hmu_perf_init(void)
 {
 	int rc;
@@ -643,10 +662,15 @@ int cxl_hmu_perf_init(void)
 	if (rc < 0)
 		return rc;
 	cxl_hmu_cpuhp_state_num = rc;
-	return 0;
+
+	rc = cxl_hmu_register_consumer(&cxl_hmu_perf_consumer);
+	if (rc)
+		cpuhp_remove_multi_state(cxl_hmu_cpuhp_state_num);
+	return rc;
 }
 
 void cxl_hmu_perf_exit(void)
 {
+	cxl_hmu_unregister_consumer(&cxl_hmu_perf_consumer);
 	cpuhp_remove_multi_state(cxl_hmu_cpuhp_state_num);
 }

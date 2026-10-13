@@ -47,11 +47,19 @@ budgets.
 Operation and configuration
 ===========================
 
+Each CHMUI is a device under /sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z
+whose "consumer" attribute names what drives it; the PMU exists for every
+instance with the fill-threshold interrupt and is its default consumer, and
+opening a perf event on an instance owned by another consumer fails with
+-EBUSY. Opening an event needs CAP_PERFMON, since the hotlist carries raw
+device physical addresses. See Documentation/ABI/testing/sysfs-bus-cxl-hmu
+for the per-instance capability and configuration attributes.
+
 An example command line is::
 
   $perf record -a  -e cxl_hmu_mem0.0.0/epoch_type=0,access_type=6,\
   hotness_threshold=1024,epoch_multiplier=4,epoch_scale=4,range_base=0,\
-  range_size=1024,randomized_downsampling=0,hotness_granual=12/ -- sleep 10
+  range_size=4,randomized_downsampling=0,hotness_granual=12/ -- sleep 10
 
   $perf report --dump-raw-trace
 
@@ -74,6 +82,17 @@ to provide sufficient information to interpret the entries::
 The least significant counter_width bits (here 16, hex 10) are the counter
 value, all higher bits are the unit index.  Multiply by the unit size
 to get a Device Physical Address.
+
+A hotlist overflow reported by the device marks the AUX record as partial
+(PERF_AUX_FLAG_PARTIAL): what was read is sound, but units that became hot
+while the list was full may be missing. Entries that do not fit in the AUX
+buffer mark the record truncated (PERF_AUX_FLAG_TRUNCATED) and perf disables
+the event, as for any AUX PMU whose consumer fell behind; a larger -m,,N
+buffer or a shorter epoch keeps up.
+
+A parameter left at 0 takes a default: the smallest unit size and down
+sampling factor the device supports, its shortest epoch, and the whole device
+as the range. access_type has no default and must be one the device supports.
 
 The parameters are as follows:
 
@@ -143,6 +162,7 @@ hotness_granual
 
 Unit size at which tracking is performed.  Must be at least 256 bytes but
 hardware may only support some sizes. Expressed as a power of 2. e.g. 12 = 4kiB.
+0 selects the smallest size the device supports.
 
 hotness_threshold
 -----------------
@@ -177,7 +197,9 @@ bitmap that controls what Device Physical Address spaces is tracked. Each bit
 represents 256MiB of DPA space.
 
 This interface provides a simple base and size in units of 256MiB to configure
-this bitmap. All bits in the specified range will be set.
+this bitmap. The bits in the specified range are set and every other bit that
+covers the device's capacity is cleared; base + size may not exceed that
+capacity. A size of 0 selects the whole device.
 
 downsampling_factor
 -------------------
@@ -185,8 +207,8 @@ downsampling_factor
 Hardware may be incapable of counting accesses at full speed or it may be
 desirable to count over a longer period during which the counters would
 overflow.  This control allows selection of a down sampling factor expressed
-as a power of 2 between 1 and 32768.  Default is minimum supported downsampling
-factor.
+as a power of 2 between 1 and 32768, given as the exponent (0 for 1, 1 for 2,
+and so on).  Default is minimum supported downsampling factor.
 
 randomized_downsampling
 -----------------------

@@ -1,0 +1,128 @@
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/
+Date:		October, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		One directory per instance of a CXL Hot-range Monitoring Unit
+		(CHMU, CXL r4.0 section 8.2.8): block Y of memdev X, instance Z.
+		An instance counts accesses to units of the device's memory and
+		reports the units whose count crossed a threshold in a hotlist.
+		It is driven by one consumer at a time.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/consumer
+Date:		October, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RW) The consumer driving the instance: the name of a registered
+		in-kernel consumer ("perf" for the perf PMU with
+		CONFIG_CXL_HMU_PERF) or "none". The default is "perf" on an
+		instance that has a PMU, else "none". Writing a name while the
+		current consumer has the instance running fails with -EBUSY; a
+		name that is not registered with -ENOENT; any consumer on an
+		instance without an interrupt with -EOPNOTSUPP; anything while
+		the instance is being removed with -ENODEV. The current consumer
+		is detached before the new one is attached, so if the new one
+		refuses (its error is returned) the instance is left on "none".
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/mode
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/unit_size
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/hotness_threshold
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/epoch_ms
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/access_type
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/downsampling_factor
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/randomized_downsampling
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/range_base
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/range_size
+Date:		October, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RW) The configuration a kernel consumer programs when it starts
+		the instance. While the consumer is "perf" these are read-only
+		(-EPERM) and show what the last perf event programmed; a store
+		while the instance is active fails with -EBUSY. Each value is
+		checked against the instance's capabilities at store time: a
+		value the instance does not support is refused with -EOPNOTSUPP,
+		an out-of-range one with -EINVAL or -ERANGE, and a refused store
+		leaves the old value.
+
+		mode: "epoch" (a unit is reported when its count crosses the
+		threshold within an epoch, and the count is reported with it)
+		or "always_on" (a unit is reported once its count crosses the
+		threshold; the reported count is not valid), one of
+		supported_modes.
+
+		unit_size: bytes per counted unit, a power of two from
+		supported_unit_sizes. It is programmed into the (disabled)
+		instance at once, so counter_width reflects it.
+
+		hotness_threshold: the count at which a unit is reported;
+		below 1 << counter_width, else -ERANGE.
+
+		epoch_ms: the epoch length in milliseconds, clamped to
+		epoch_range_ms and rounded to what the device encodes; reads
+		back the effective value, which is 0 for an epoch shorter than
+		a millisecond. 0 is -EINVAL; a length the device cannot encode
+		is -ERANGE.
+
+		access_type: which requests are counted: "nontee_r",
+		"nontee_w", "nontee_rw", "r", "w" or "rw", one of
+		supported_access_types.
+
+		downsampling_factor: count one request in this many, a power of
+		two from supported_downsampling.
+
+		randomized_downsampling: 0 or 1, if the instance supports it.
+
+		range_base, range_size: the device physical address range
+		counted, in units of 256 MiB; base + size must not exceed
+		capacity_ranges, size must not be 0 and the range must hold at
+		least one unit. The default is the whole device.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/supported_modes
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/supported_unit_sizes
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/supported_access_types
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/supported_downsampling
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/epoch_range_ms
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/hotlist_size
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/capacity_ranges
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/epoch_type
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/address_overlap
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/postponed_overflow
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/interrupts
+Date:		October, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) What the instance advertises. supported_modes,
+		supported_access_types and interrupts are space separated names
+		("overflow" and "level" for the two interrupt capabilities);
+		supported_unit_sizes is in bytes and supported_downsampling in
+		factors, both space separated; epoch_range_ms is "min max" in
+		milliseconds; hotlist_size is in entries; capacity_ranges is the
+		device capacity in 256 MiB units, the valid extent of the range
+		bitmap; epoch_type is "global" or "per_counter"; address_overlap
+		is 1 if this instance may count a range that overlaps a sibling
+		instance's (a start whose range overlaps an active sibling's
+		fails with -EBUSY unless both instances have it); epoch_range_ms
+		shows 0 for a bound shorter than a millisecond;
+		postponed_overflow is 1 if hot units survive a hotlist overflow.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/counter_width
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/active
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/overflows
+Date:		October, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) State. counter_width is the width in bits of the access
+		counter for the current unit_size, the bound of
+		hotness_threshold; active is 1 while the instance is enabled;
+		overflows counts the hotlist overflows the device reported since
+		the last start.
+

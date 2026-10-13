@@ -244,11 +244,24 @@ config CXL_ATL
 	depends on ACPI_PRMT && AMD_NB
 
 config CXL_HMU
-	tristate "CXL: Hotness Monitoring Unit Driver"
-	depends on PERF_EVENTS
+	tristate "CXL: Hot-range Monitoring Unit driver"
+	depends on CXL_REGION
 	help
-	  Read data out from the CXL hotness units and provide it to userspace
-	  via the perf auxbuffer framework.
+	  Driver for CXL Hot-range Monitoring Units (CXL r4.0 section 8.2.8),
+	  which report the units of device memory accessed more than a
+	  threshold number of times. Each instance of a unit is driven by one
+	  consumer at a time, chosen per instance through sysfs.
 
 	  If unsure say N.
+
+config CXL_HMU_PERF
+	bool "CXL HMU perf PMU consumer"
+	depends on CXL_HMU && PERF_EVENTS
+	default y
+	help
+	  Expose each CHMU instance as a perf PMU whose AUX buffer carries
+	  the raw hotlist, for perf record and perf report. The PMU is the
+	  default consumer of every instance that has the fill-threshold
+	  interrupt; an instance given to another consumer refuses events.
+
 endif

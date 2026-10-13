@@ -329,19 +329,20 @@ static int cxl_hmu_hw_start_locked(struct cxl_hmu_inst *inst, const struct cxl_h
 }
 
 /*
- * Disable the instance if it is running; true if it was. Entries still in
- * the hotlist stay there for the caller to drain; units the device never
- * inserted are lost, as the spec says. Does not wait for a delivery in
- * progress: an atomic handler is serialized by its caller's lock.
+ * Disable the instance if @c owns it and it is running; true if it was.
+ * Entries still in the hotlist stay there for the caller to drain; units
+ * the device never inserted are lost, as the spec says. Does not wait for
+ * a delivery in progress: an atomic consumer is serialized by its own
+ * lock, a threaded one by cxl_hmu_stop().
  */
-bool cxl_hmu_hw_stop(struct cxl_hmu_inst *inst)
+bool cxl_hmu_hw_stop(struct cxl_hmu_inst *inst, const struct cxl_hmu_consumer *c)
 {
 	unsigned long flags;
 	bool was_active;
 
 	raw_spin_lock_irqsave(&inst->lock, flags);
 	raw_spin_lock(&inst->block->lock);
-	was_active = inst->active;
+	was_active = inst->active && inst->consumer == c;
 	if (was_active) {
 		if (cxl_hmu_disable_locked(inst))
 			dev_info(&inst->dev, "disable timed out\n");
@@ -451,7 +452,7 @@ static irqreturn_t cxl_hmu_irq_thread(int irq, void *data)
 
 	/*
 	 * The drain lock is what a stop waits on, so a consumer is never
-	 * called after a stop has taken it.
+	 * called after cxl_hmu_stop() has taken it.
 	 */
 	mutex_lock(&inst->drain_lock);
 	raw_spin_lock_irq(&inst->lock);
@@ -470,36 +471,608 @@ static irqreturn_t cxl_hmu_irq_thread(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/* Consumers and ownership */
+
+struct cxl_hmu_consumer_entry {
+	const struct cxl_hmu_consumer *c;
+	struct list_head list;
+};
+
+static LIST_HEAD(cxl_hmu_consumers);
+static LIST_HEAD(cxl_hmu_insts);
 /*
- * Program @cfg, enable the instance and install @fn as the handler of its
- * hotlist, atomic or not; one critical section with the overlap check.
+ * The registry, the instance list, consumer switches and config stores.
+ * Taken before a consumer's own locks (a switch calls detach) and before
+ * an instance's drain lock; never from a consumer's callbacks.
  */
-int cxl_hmu_hw_start(struct cxl_hmu_inst *inst, const struct cxl_hmu_config *cfg,
-		     cxl_hmu_hotlist_fn fn, bool atomic)
+static DEFINE_MUTEX(cxl_hmu_consumers_lock);
+
+static const struct cxl_hmu_consumer *cxl_hmu_find_consumer(const char *name)
+{
+	struct cxl_hmu_consumer_entry *e;
+
+	lockdep_assert_held(&cxl_hmu_consumers_lock);
+	list_for_each_entry(e, &cxl_hmu_consumers, list)
+		if (sysfs_streq(name, e->c->name))
+			return e->c;
+	return NULL;
+}
+
+int cxl_hmu_register_consumer(const struct cxl_hmu_consumer *c)
+{
+	struct cxl_hmu_consumer_entry *e;
+
+	if (!c->name || !c->hotlist || !strcmp(c->name, "none"))
+		return -EINVAL;
+	e = kzalloc_obj(*e);
+	if (!e)
+		return -ENOMEM;
+	e->c = c;
+	guard(mutex)(&cxl_hmu_consumers_lock);
+	if (cxl_hmu_find_consumer(c->name)) {
+		kfree(e);
+		return -EEXIST;
+	}
+	list_add_tail(&e->list, &cxl_hmu_consumers);
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_register_consumer, "CXL");
+
+/* A consumer in this module must not pin it, or it could never unload */
+static bool cxl_hmu_consumer_get(const struct cxl_hmu_consumer *c)
+{
+	return c->owner == THIS_MODULE || try_module_get(c->owner);
+}
+
+static void cxl_hmu_consumer_put(const struct cxl_hmu_consumer *c)
+{
+	if (c->owner != THIS_MODULE)
+		module_put(c->owner);
+}
+
+/*
+ * Take the instance away from its owner. Refused while the owner has it
+ * running, unless @force, which is for an instance that is going away:
+ * the owner is then stopped on its behalf. The owner loses the instance
+ * before it is told, and cxl_hmu_start() checks ownership in the same
+ * critical section that enables, so it cannot restart it.
+ */
+static int cxl_hmu_detach_locked(struct cxl_hmu_inst *inst, bool force)
+{
+	const struct cxl_hmu_consumer *old = inst->consumer;
+	unsigned long flags;
+
+	lockdep_assert_held(&cxl_hmu_consumers_lock);
+	if (!old)
+		return 0;
+	raw_spin_lock_irqsave(&inst->lock, flags);
+	if (inst->active && !force) {
+		raw_spin_unlock_irqrestore(&inst->lock, flags);
+		return -EBUSY;
+	}
+	inst->consumer = NULL;
+	raw_spin_unlock_irqrestore(&inst->lock, flags);
+	if (force)
+		cxl_hmu_stop(inst);
+	if (old->detach)
+		old->detach(inst);
+	cxl_hmu_consumer_put(old);
+	return 0;
+}
+
+static int cxl_hmu_attach_locked(struct cxl_hmu_inst *inst, const struct cxl_hmu_consumer *new)
 {
 	unsigned long flags;
 	int rc;
 
-	rc = cxl_hmu_validate_config(inst, cfg);
+	lockdep_assert_held(&cxl_hmu_consumers_lock);
+	if (!cxl_hmu_consumer_get(new))
+		return -ENODEV;
+	/* The owner first, so what attach sets up can be used at once */
+	raw_spin_lock_irqsave(&inst->lock, flags);
+	inst->consumer = new;
+	raw_spin_unlock_irqrestore(&inst->lock, flags);
+	if (new->attach) {
+		rc = new->attach(inst);
+		if (rc) {
+			raw_spin_lock_irqsave(&inst->lock, flags);
+			inst->consumer = NULL;
+			raw_spin_unlock_irqrestore(&inst->lock, flags);
+			cxl_hmu_consumer_put(new);
+			return rc;
+		}
+	}
+	return 0;
+}
+
+int cxl_hmu_set_consumer(struct cxl_hmu_inst *inst, const char *name)
+{
+	const struct cxl_hmu_consumer *new = NULL;
+	int rc;
+
+	guard(mutex)(&cxl_hmu_consumers_lock);
+	if (inst->dead)
+		return -ENODEV;
+	if (!sysfs_streq(name, "none")) {
+		new = cxl_hmu_find_consumer(name);
+		if (!new)
+			return -ENOENT;
+	}
+	if (new == inst->consumer)
+		return 0;
+	/* Nothing can be delivered without an interrupt; a polling mode could lift this */
+	if (new && inst->irq < 0)
+		return -EOPNOTSUPP;
+	rc = cxl_hmu_detach_locked(inst, false);
 	if (rc)
 		return rc;
+	if (!new)
+		return 0;
+	return cxl_hmu_attach_locked(inst, new);
+}
+
+/*
+ * For a consumer that programs its own unit size ahead of a start, from
+ * process context: serialized with switches and stores, and refused unless
+ * @c owns the instance.
+ */
+int cxl_hmu_consumer_set_unit_size(struct cxl_hmu_inst *inst,
+				   const struct cxl_hmu_consumer *c, u8 unit_shift)
+{
+	guard(mutex)(&cxl_hmu_consumers_lock);
+	guard(mutex)(&inst->drain_lock);
+	if (inst->dead)
+		return -ENODEV;
+	if (inst->consumer != c)
+		return -EPERM;
+	return cxl_hmu_set_unit_size(inst, unit_shift);
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_consumer_set_unit_size, "CXL");
+
+int cxl_hmu_start(struct cxl_hmu_inst *inst, const struct cxl_hmu_consumer *c,
+		  const struct cxl_hmu_config *cfg)
+{
+	unsigned long flags;
+	int rc;
+
+	/*
+	 * A consumer that may sleep starts from process context, where the
+	 * start is serialized with config stores, which hold the drain lock;
+	 * ownership is checked under the instance lock below, so a switch
+	 * needs no other lock here (and taking the consumers lock would
+	 * invert a consumer's own lock against a switch). An atomic one
+	 * (perf) starts with interrupts off and relies on its configuration
+	 * being read-only in sysfs while it owns the instance.
+	 */
+	if (!c->atomic)
+		mutex_lock(&inst->drain_lock);
+	rc = cxl_hmu_validate_config(inst, cfg);
+	if (rc)
+		goto out;
 	raw_spin_lock_irqsave(&inst->lock, flags);
 	raw_spin_lock(&inst->block->lock);
-	if (inst->active)
+	if (inst->dead)
+		rc = -ENODEV;
+	else if (inst->consumer != c)
+		rc = -EPERM;
+	else if (inst->active)
 		rc = -EBUSY;
 	else
 		rc = cxl_hmu_check_overlap(inst, cfg);
 	if (!rc)
 		rc = cxl_hmu_hw_start_locked(inst, cfg);
 	if (!rc) {
-		inst->hotlist = fn;
-		inst->hotlist_atomic = atomic;
+		inst->hotlist = c->hotlist;
+		inst->hotlist_atomic = c->atomic;
 		inst->active = true;
 	}
 	raw_spin_unlock(&inst->block->lock);
 	raw_spin_unlock_irqrestore(&inst->lock, flags);
+out:
+	if (!c->atomic)
+		mutex_unlock(&inst->drain_lock);
 	return rc;
 }
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_start, "CXL");
+
+/*
+ * For a consumer whose handler may sleep: disable, wait out a delivery in
+ * progress, deliver what the device still holds. An atomic consumer stops
+ * from the context that excludes its handler and drains there itself.
+ */
+void cxl_hmu_stop(struct cxl_hmu_inst *inst)
+{
+	cxl_hmu_hotlist_fn fn = NULL;
+	unsigned long flags;
+	bool overflowed;
+	u8 width;
+	int n;
+
+	raw_spin_lock_irqsave(&inst->lock, flags);
+	raw_spin_lock(&inst->block->lock);
+	if (inst->active) {
+		if (cxl_hmu_disable_locked(inst))
+			dev_info(&inst->dev, "disable timed out\n");
+		inst->active = false;
+		if (!inst->hotlist_atomic)
+			fn = inst->hotlist;
+	}
+	inst->hotlist = NULL;
+	raw_spin_unlock(&inst->block->lock);
+	raw_spin_unlock_irqrestore(&inst->lock, flags);
+
+	if (inst->irq >= 0)
+		synchronize_irq(inst->irq);
+	mutex_lock(&inst->drain_lock);
+	if (fn) {
+		n = cxl_hmu_drain(inst, inst->entries, inst->caps.hotlist_size,
+				  &width, &overflowed);
+		fn(inst, inst->entries, n, width, overflowed);
+	}
+	mutex_unlock(&inst->drain_lock);
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_stop, "CXL");
+
+void cxl_hmu_unregister_consumer(const struct cxl_hmu_consumer *c)
+{
+	struct cxl_hmu_consumer_entry *e, *tmp;
+	struct cxl_hmu_inst *inst;
+
+	guard(mutex)(&cxl_hmu_consumers_lock);
+	list_for_each_entry(inst, &cxl_hmu_insts, list)
+		if (inst->consumer == c)
+			cxl_hmu_detach_locked(inst, true);
+	list_for_each_entry_safe(e, tmp, &cxl_hmu_consumers, list) {
+		if (e->c == c) {
+			list_del(&e->list);
+			kfree(e);
+		}
+	}
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_unregister_consumer, "CXL");
+
+const struct cxl_hmu_caps *cxl_hmu_caps(const struct cxl_hmu_inst *inst)
+{
+	return &inst->caps;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_caps, "CXL");
+
+const struct cxl_hmu_config *cxl_hmu_config(const struct cxl_hmu_inst *inst)
+{
+	return &inst->config;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_config, "CXL");
+
+void *cxl_hmu_consumer_data(struct cxl_hmu_inst *inst)
+{
+	return inst->consumer_data;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_consumer_data, "CXL");
+
+void cxl_hmu_set_consumer_data(struct cxl_hmu_inst *inst, void *data)
+{
+	inst->consumer_data = data;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_set_consumer_data, "CXL");
+
+/* Sysfs */
+
+static const char * const cxl_hmu_mode_names[] = { "epoch", "always_on" };
+/* Index n is the CFG0 WHAT encoding n + 1 */
+static const char * const cxl_hmu_access_names[] = {
+	"nontee_r", "nontee_w", "nontee_rw", "r", "w", "rw",
+};
+
+static const char *cxl_hmu_access_name(u8 what)
+{
+	if (what < CHMU_INST0_CFG0_WHAT_NONTEE_R || what > CHMU_INST0_CFG0_WHAT_RW)
+		return "none";
+	return cxl_hmu_access_names[what - 1];
+}
+
+static ssize_t consumer_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	struct cxl_hmu_inst *inst = to_cxl_hmu_inst(dev);
+	const struct cxl_hmu_consumer *c;
+
+	guard(mutex)(&cxl_hmu_consumers_lock);
+	c = inst->consumer;
+	return sysfs_emit(buf, "%s\n", c ? c->name : "none");
+}
+
+static ssize_t consumer_store(struct device *dev, struct device_attribute *a,
+			      const char *buf, size_t len)
+{
+	int rc = cxl_hmu_set_consumer(to_cxl_hmu_inst(dev), buf);
+
+	return rc ? rc : len;
+}
+static DEVICE_ATTR_RW(consumer);
+
+/* perf programs its own configuration from the event; it is read-only then */
+static bool cxl_hmu_config_writable(struct cxl_hmu_inst *inst)
+{
+	return !inst->consumer || strcmp(inst->consumer->name, "perf");
+}
+
+/*
+ * A store takes the consumers lock, against switches and a start that may
+ * sleep, and the drain lock, against a delivery or the final drain of a
+ * stop decoding under the configuration it would change.
+ */
+#define CXL_HMU_CFG_ATTR(_name, _fmt, _val, _parse)				\
+static ssize_t _name##_show(struct device *dev, struct device_attribute *a,	\
+			    char *buf)						\
+{										\
+	struct cxl_hmu_inst *inst = to_cxl_hmu_inst(dev);			\
+										\
+	return sysfs_emit(buf, _fmt "\n", _val);				\
+}										\
+static ssize_t _name##_store(struct device *dev, struct device_attribute *a,	\
+			     const char *buf, size_t len)			\
+{										\
+	struct cxl_hmu_inst *inst = to_cxl_hmu_inst(dev);			\
+	struct cxl_hmu_config cfg, old;						\
+	int rc;									\
+										\
+	guard(mutex)(&cxl_hmu_consumers_lock);					\
+	guard(mutex)(&inst->drain_lock);					\
+	if (inst->dead)								\
+		return -ENODEV;							\
+	if (!cxl_hmu_config_writable(inst))					\
+		return -EPERM;							\
+	if (READ_ONCE(inst->active))						\
+		return -EBUSY;							\
+	old = inst->config;							\
+	cfg = old;								\
+	rc = _parse(inst, &cfg, buf);						\
+	if (rc)									\
+		return rc;							\
+	rc = cxl_hmu_validate_config(inst, &cfg);				\
+	if (rc) {								\
+		if (cfg.unit_shift != old.unit_shift &&				\
+		    cxl_hmu_set_unit_size(inst, old.unit_shift))		\
+			dev_warn(dev, "could not restore the unit size\n");	\
+		return rc;							\
+	}									\
+	inst->config = cfg;							\
+	return len;								\
+}										\
+static DEVICE_ATTR_RW(_name)
+
+static int parse_mode(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg, const char *buf)
+{
+	int i = sysfs_match_string(cxl_hmu_mode_names, buf);
+
+	if (i < 0)
+		return i;
+	cfg->mode = i;
+	return 0;
+}
+CXL_HMU_CFG_ATTR(mode, "%s", cxl_hmu_mode_names[inst->config.mode], parse_mode);
+
+static int parse_unit_size(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg, const char *buf)
+{
+	unsigned long v;
+	int rc;
+
+	if (kstrtoul(buf, 0, &v) || !is_power_of_2(v) || v < 256 || v >= BIT_ULL(40))
+		return -EINVAL;
+	if (!(inst->caps.unit_sizes & BIT(ilog2(v) - 8)))
+		return -EOPNOTSUPP;
+	/* Programs the disabled instance and refreshes counter_width */
+	rc = cxl_hmu_set_unit_size(inst, ilog2(v));
+	if (rc)
+		return rc;
+	cfg->unit_shift = ilog2(v);
+	return 0;
+}
+CXL_HMU_CFG_ATTR(unit_size, "%lu", 1UL << inst->config.unit_shift, parse_unit_size);
+
+static int parse_hotness_threshold(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg,
+				   const char *buf)
+{
+	u32 v;
+
+	if (kstrtou32(buf, 0, &v))
+		return -EINVAL;
+	/* The width for the current unit_size */
+	if (inst->counter_width && v >= BIT_ULL(inst->counter_width))
+		return -ERANGE;
+	cfg->hotness_threshold = v;
+	return 0;
+}
+CXL_HMU_CFG_ATTR(hotness_threshold, "%u", inst->config.hotness_threshold, parse_hotness_threshold);
+
+static int parse_epoch_ms(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg, const char *buf)
+{
+	unsigned long v;
+
+	if (kstrtoul(buf, 0, &v) || !v)
+		return -EINVAL;
+	if (v > ULONG_MAX / USEC_PER_MSEC)
+		v = ULONG_MAX / USEC_PER_MSEC;
+	cxl_hmu_pick_epoch(inst, (u64)v * USEC_PER_MSEC, &cfg->epoch_scale, &cfg->epoch_mult);
+	return cfg->epoch_mult ? 0 : -ERANGE;
+}
+CXL_HMU_CFG_ATTR(epoch_ms, "%llu",
+		 cxl_hmu_epoch_us(inst->config.epoch_scale,
+				  inst->config.epoch_mult) / USEC_PER_MSEC,
+		 parse_epoch_ms);
+
+static int parse_access_type(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg, const char *buf)
+{
+	int i = sysfs_match_string(cxl_hmu_access_names, buf);
+
+	if (i < 0)
+		return i;
+	cfg->access_type = i + 1;
+	return 0;
+}
+CXL_HMU_CFG_ATTR(access_type, "%s", cxl_hmu_access_name(inst->config.access_type),
+		 parse_access_type);
+
+static int parse_downsampling_factor(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg,
+				     const char *buf)
+{
+	unsigned long v;
+
+	if (kstrtoul(buf, 0, &v) || !is_power_of_2(v) || v >= BIT(16))
+		return -EINVAL;
+	if (!(inst->caps.ds_factors & BIT(ilog2(v))))
+		return -EOPNOTSUPP;
+	cfg->ds_shift = ilog2(v);
+	return 0;
+}
+CXL_HMU_CFG_ATTR(downsampling_factor, "%u", 1U << inst->config.ds_shift, parse_downsampling_factor);
+
+static int parse_randomized_downsampling(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg,
+					 const char *buf)
+{
+	return kstrtobool(buf, &cfg->randomized_ds);
+}
+CXL_HMU_CFG_ATTR(randomized_downsampling, "%d", inst->config.randomized_ds,
+		 parse_randomized_downsampling);
+
+static int parse_range_base(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg, const char *buf)
+{
+	return kstrtou32(buf, 0, &cfg->range_base);
+}
+CXL_HMU_CFG_ATTR(range_base, "%u", inst->config.range_base, parse_range_base);
+
+static int parse_range_size(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg, const char *buf)
+{
+	return kstrtou32(buf, 0, &cfg->range_num);
+}
+CXL_HMU_CFG_ATTR(range_size, "%u", inst->config.range_num, parse_range_size);
+
+#define CXL_HMU_RO_ATTR(_name, _fmt, _val)					\
+static ssize_t _name##_show(struct device *dev, struct device_attribute *a,	\
+			    char *buf)						\
+{										\
+	struct cxl_hmu_inst *inst = to_cxl_hmu_inst(dev);			\
+										\
+	return sysfs_emit(buf, _fmt "\n", _val);				\
+}										\
+static DEVICE_ATTR_RO(_name)
+
+static ssize_t supported_modes_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+
+	return sysfs_emit(buf, "%s%s%s\n", c->epoch ? "epoch" : "",
+			  c->epoch && c->always_on ? " " : "",
+			  c->always_on ? "always_on" : "");
+}
+static DEVICE_ATTR_RO(supported_modes);
+
+static ssize_t supported_unit_sizes_show(struct device *dev, struct device_attribute *a,
+					 char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+	unsigned long bits = c->unit_sizes;
+	ssize_t len = 0;
+	unsigned int n;
+
+	for_each_set_bit(n, &bits, 32)
+		len += sysfs_emit_at(buf, len, "%s%lu", len ? " " : "", 256UL << n);
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+static DEVICE_ATTR_RO(supported_unit_sizes);
+
+static ssize_t supported_access_types_show(struct device *dev, struct device_attribute *a,
+					   char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+	unsigned long bits = c->access_types;
+	ssize_t len = 0;
+	unsigned int n;
+
+	for_each_set_bit(n, &bits, ARRAY_SIZE(cxl_hmu_access_names))
+		len += sysfs_emit_at(buf, len, "%s%s", len ? " " : "", cxl_hmu_access_names[n]);
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+static DEVICE_ATTR_RO(supported_access_types);
+
+static ssize_t supported_downsampling_show(struct device *dev, struct device_attribute *a,
+					   char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+	unsigned long bits = c->ds_factors;
+	ssize_t len = 0;
+	unsigned int n;
+
+	for_each_set_bit(n, &bits, 16)
+		len += sysfs_emit_at(buf, len, "%s%u", len ? " " : "", 1U << n);
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+static DEVICE_ATTR_RO(supported_downsampling);
+
+static ssize_t interrupts_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+
+	return sysfs_emit(buf, "%s%s%s\n", c->irq_overflow ? "overflow" : "",
+			  c->irq_overflow && c->irq_level ? " " : "",
+			  c->irq_level ? "level" : "");
+}
+static DEVICE_ATTR_RO(interrupts);
+
+static ssize_t epoch_range_ms_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+
+	return sysfs_emit(buf, "%llu %llu\n", c->epoch_min_us / USEC_PER_MSEC,
+			  c->epoch_max_us / USEC_PER_MSEC);
+}
+static DEVICE_ATTR_RO(epoch_range_ms);
+
+CXL_HMU_RO_ATTR(hotlist_size, "%u", inst->caps.hotlist_size);
+CXL_HMU_RO_ATTR(capacity_ranges, "%u", inst->caps.capacity_ranges);
+CXL_HMU_RO_ATTR(epoch_type, "%s", inst->caps.epoch_type == CHMU_INST0_CAP0_EPOCH_TYPE_PERCNT ?
+		"per_counter" : "global");
+CXL_HMU_RO_ATTR(address_overlap, "%d", inst->caps.addr_overlap);
+CXL_HMU_RO_ATTR(postponed_overflow, "%d", inst->caps.postponed_overflow);
+CXL_HMU_RO_ATTR(counter_width, "%u", inst->counter_width);
+CXL_HMU_RO_ATTR(active, "%d", READ_ONCE(inst->active));
+CXL_HMU_RO_ATTR(overflows, "%lu", READ_ONCE(inst->overflows));
+
+static struct attribute *cxl_hmu_inst_attrs[] = {
+	&dev_attr_consumer.attr,
+	&dev_attr_mode.attr,
+	&dev_attr_unit_size.attr,
+	&dev_attr_hotness_threshold.attr,
+	&dev_attr_epoch_ms.attr,
+	&dev_attr_access_type.attr,
+	&dev_attr_downsampling_factor.attr,
+	&dev_attr_randomized_downsampling.attr,
+	&dev_attr_range_base.attr,
+	&dev_attr_range_size.attr,
+	&dev_attr_supported_modes.attr,
+	&dev_attr_supported_unit_sizes.attr,
+	&dev_attr_supported_access_types.attr,
+	&dev_attr_supported_downsampling.attr,
+	&dev_attr_epoch_range_ms.attr,
+	&dev_attr_hotlist_size.attr,
+	&dev_attr_capacity_ranges.attr,
+	&dev_attr_epoch_type.attr,
+	&dev_attr_address_overlap.attr,
+	&dev_attr_postponed_overflow.attr,
+	&dev_attr_interrupts.attr,
+	&dev_attr_counter_width.attr,
+	&dev_attr_active.attr,
+	&dev_attr_overflows.attr,
+	NULL,
+};
+
+static const struct attribute_group cxl_hmu_inst_group = {
+	.attrs = cxl_hmu_inst_attrs,
+};
+
+static const struct attribute_group *cxl_hmu_inst_groups[] = {
+	&cxl_hmu_inst_group,
+	NULL,
+};
 
 /* Instance devices */
 
@@ -511,6 +1084,7 @@ static void cxl_hmu_inst_release(struct device *dev)
 static const struct device_type cxl_hmu_inst_type = {
 	.name = "cxl_hmu_instance",
 	.release = cxl_hmu_inst_release,
+	.groups = cxl_hmu_inst_groups,
 };
 
 bool cxl_hmu_dev_is_inst(struct device *dev)
@@ -557,6 +1131,24 @@ static void cxl_hmu_free_irq(void *data)
 	free_irq(inst->irq, inst);
 }
 
+/*
+ * First to run at unbind, after the PMU has closed its sessions: no
+ * consumer can be chosen or start from here on, and the owner, if any, is
+ * stopped and detached on its behalf.
+ */
+static void cxl_hmu_inst_quiesce(void *data)
+{
+	struct cxl_hmu_inst *inst = data;
+	unsigned long flags;
+
+	guard(mutex)(&cxl_hmu_consumers_lock);
+	raw_spin_lock_irqsave(&inst->lock, flags);
+	inst->dead = true;
+	raw_spin_unlock_irqrestore(&inst->lock, flags);
+	cxl_hmu_detach_locked(inst, true);
+	list_del(&inst->list);
+}
+
 int cxl_hmu_inst_add(struct cxl_hmu *block, unsigned int index, unsigned int inst_len)
 {
 	struct pci_dev *pdev = to_pci_dev(block->dev.parent);
@@ -572,8 +1164,10 @@ int cxl_hmu_inst_add(struct cxl_hmu *block, unsigned int index, unsigned int ins
 	inst->index = index;
 	inst->base = block->base + 0x10 + inst_len * index;
 	inst->irq = -1;
+	inst->dead = true;	/* until it can be quiesced */
 	raw_spin_lock_init(&inst->lock);
 	mutex_init(&inst->drain_lock);
+	INIT_LIST_HEAD(&inst->list);
 	cxl_hmu_decode_caps(inst);
 	cxl_hmu_default_config(inst);
 
@@ -641,6 +1235,14 @@ int cxl_hmu_inst_add(struct cxl_hmu *block, unsigned int index, unsigned int ins
 			return rc;
 	}
 no_irq:
+	/* Registered last, so it runs first at unbind, before the interrupt goes */
+	rc = devm_add_action_or_reset(&block->dev, cxl_hmu_inst_quiesce, inst);
+	if (rc)
+		return rc;
+	scoped_guard(mutex, &cxl_hmu_consumers_lock) {
+		list_add_tail(&inst->list, &cxl_hmu_insts);
+		inst->dead = false;
+	}
 	return 0;
 err:
 	put_device(&inst->dev);
@@ -667,9 +1269,14 @@ static int cxl_hmu_probe(struct device *dev)
 	for (i = 0; i < block->num_inst; i++) {
 		struct cxl_hmu_inst *inst = block->inst[i];
 
+		/* Its devm actions run before the quiesce: it closes its sessions first */
 		rc = cxl_hmu_perf_probe_inst(inst);
 		if (rc)
 			return rc;
+		/* perf by default where it has a PMU, so the perf tool sees no change */
+		rc = cxl_hmu_set_consumer(inst, inst->drvdata ? "perf" : "none");
+		if (rc)
+			dev_warn(&inst->dev, "no default consumer: %d\n", rc);
 	}
 	return 0;
 }

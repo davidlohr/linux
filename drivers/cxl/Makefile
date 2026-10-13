@@ -21,4 +21,5 @@ cxl_acpi-y := acpi.o
 cxl_pmem-y := pmem.o security.o
 cxl_mem-y := mem.o
 cxl_pci-y := pci.o
-cxl_hmu-y := hmu/core.o hmu/perf.o
+cxl_hmu-y := hmu/core.o
+cxl_hmu-$(CONFIG_CXL_HMU_PERF) += hmu/perf.o

@@ -160,6 +160,14 @@ static inline void cxl_hmu_perf_exit(void) { }
 static inline int cxl_hmu_perf_probe_inst(struct cxl_hmu_inst *inst) { return 0; }
 #endif
 
+#if IS_ENABLED(CONFIG_CXL_HMU_DAMON)
+int cxl_hmu_damon_init(void);
+void cxl_hmu_damon_exit(void);
+#else
+static inline int cxl_hmu_damon_init(void) { return 0; }
+static inline void cxl_hmu_damon_exit(void) { }
+#endif
+
 u64 cxl_hmu_epoch_us(u8 scale, u16 mult);
 void cxl_hmu_pick_epoch(const struct cxl_hmu_inst *inst, u64 target_us, u8 *scale, u16 *mult);
 int cxl_hmu_validate_config(struct cxl_hmu_inst *inst, const struct cxl_hmu_config *cfg);

@@ -1368,15 +1368,24 @@ static __init int cxl_hmu_init(void)
 	rc = cxl_hmu_perf_init();
 	if (rc)
 		return rc;
+	rc = cxl_hmu_damon_init();
+	if (rc)
+		goto err_perf;
 	rc = cxl_driver_register(&cxl_hmu_driver);
 	if (rc)
-		cxl_hmu_perf_exit();
+		goto err_damon;
+	return 0;
+err_damon:
+	cxl_hmu_damon_exit();
+err_perf:
+	cxl_hmu_perf_exit();
 	return rc;
 }
 
 static __exit void cxl_hmu_exit(void)
 {
 	cxl_driver_unregister(&cxl_hmu_driver);
+	cxl_hmu_damon_exit();
 	cxl_hmu_perf_exit();
 }
 

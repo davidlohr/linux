@@ -17,7 +17,8 @@ Contact:	linux-cxl@vger.kernel.org
 Description:
 		(RW) The consumer driving the instance: the name of a registered
 		in-kernel consumer ("perf" for the perf PMU with
-		CONFIG_CXL_HMU_PERF) or "none". The default is "perf" on an
+		CONFIG_CXL_HMU_PERF, "damon" to hand hot units to DAMOS with
+		CONFIG_CXL_HMU_DAMON) or "none". The default is "perf" on an
 		instance that has a PMU, else "none". Writing a name while the
 		current consumer has the instance running fails with -EBUSY; a
 		name that is not registered with -ENOENT; any consumer on an
@@ -126,3 +127,93 @@ Description:
 		overflows counts the hotlist overflows the device reported since
 		the last start.
 
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/damon/
+Date:		October, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		Present only while the instance's consumer is "damon"
+		(CONFIG_CXL_HMU_DAMON): created when "damon" is written to
+		consumer, removed when another consumer is selected. The
+		consumer owns a DAMON context with no monitoring targets and
+		one DAMOS migrate_hot scheme; the folios of every hot unit the
+		instance reports are queued on that scheme and migrated every
+		100 ms under its quota. Values are unsigned decimal unless
+		stated.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/damon/start
+Date:		October, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RW) 1 while the consumer's DAMON context runs, else 0.
+		Writing a true boolean when stopped starts the DAMON context
+		with the current target_node and quota_* values, then starts
+		the instance with its current configuration; when started it
+		does nothing. Writing a false boolean stops the instance, then
+		the context, returning every folio not yet migrated to the
+		LRU; when stopped it does nothing. The context is not
+		exclusive: it runs alongside contexts of
+		/sys/kernel/mm/damon/, but not alongside DAMON_RECLAIM,
+		DAMON_LRU_SORT or DAMON_STAT, which cannot be enabled while it
+		runs. Errors: -EINVAL for a value that is not a boolean, a
+		configuration the instance rejects, or a target node that is
+		the instance's own; -ENXIO if no committed region maps the
+		instance's range or no target node can be chosen; -EBUSY if an
+		exclusive DAMON context is running, or the instance's range
+		overlaps an active sibling's and Address Overlap is not
+		supported; -ENODEV while the instance is being removed;
+		-EOPNOTSUPP, -EIO or -ETIMEDOUT if the instance cannot be
+		programmed; -ENOMEM.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/damon/target_node
+Date:		October, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RW) The NUMA node hot folios are migrated to. -1, the default,
+		chooses one at every start: the node with CPUs and memory
+		nearest by NUMA distance to the node of the instance's host
+		bridge (the CXL node itself has no firmware distances), never
+		the instance's own node, the lowest-numbered on a tie; while
+		started the file reads the node chosen. Otherwise a node with
+		memory, else -EINVAL. A store while started fails with -EBUSY.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/damon/quota_bytes
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/damon/quota_ms
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/damon/quota_reset_ms
+Date:		October, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RW) The scheme's quota. quota_bytes: the most bytes of queued
+		folios tried per quota window; 0 (default) is no size limit.
+		quota_ms: the most milliseconds of migration work per window,
+		turned into a size limit from the measured throughput; 0
+		(default) is no time limit. With both set the smaller limit
+		applies; with neither every queued folio is migrated.
+		quota_reset_ms: the window length in milliseconds, default
+		1000, at least 1. Once the window's quota is used up, hot units
+		are not even queued until the next window; queued folios the
+		quota does not cover are returned to the LRU, not kept. A store
+		while started fails with -EBUSY; a value that is not an
+		unsigned number, or below the minimum, with -EINVAL.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/damon/sz_tried
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/damon/sz_applied
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/damon/qt_exceeds
+Date:		October, 2026
+KernelVersion:	v7.3
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) The scheme's statistics for the current run, or the last
+		one once stopped; 0 until the first start after "damon" is
+		selected, and reset by every start. sz_tried: bytes of queued
+		folios considered within the quota; sz_applied: bytes
+		migrated; qt_exceeds: quota windows that ended with the quota
+		used up.

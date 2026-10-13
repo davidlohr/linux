@@ -264,4 +264,12 @@ config CXL_HMU_PERF
 	  default consumer of every instance that has the fill-threshold
 	  interrupt; an instance given to another consumer refuses events.
 
+config CXL_HMU_DAMON
+	bool "CXL HMU DAMON consumer"
+	depends on CXL_HMU && DAMON_PADDR && NUMA && MIGRATION
+	help
+	  Hand the hot units found by a CHMU instance to a DAMOS scheme that
+	  migrates them to the node in the instance's "damon/target_node",
+	  under the quota in its "damon/quota_*" files. Select "damon" as the
+	  instance's consumer in sysfs and write 1 to its "damon/start".
 endif

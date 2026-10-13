@@ -1058,6 +1058,7 @@ struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
 int damos_add_folios(struct damos *s, struct list_head *folios);
 int damos_folios_wanted(struct damos *s);
 void damos_putback_folios(struct list_head *folios);
+int damos_add_paddr_range(struct damos *s, phys_addr_t start, phys_addr_t size);
 void damon_add_scheme(struct damon_ctx *ctx, struct damos *s);
 void damon_destroy_scheme(struct damos *s);
 int damos_commit_quota_goals(struct damos_quota *dst, struct damos_quota *src);

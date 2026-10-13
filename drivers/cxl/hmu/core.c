@@ -29,6 +29,8 @@
 #include "../cxlpci.h"
 #include "hmu.h"
 
+#define CREATE_TRACE_POINTS
+#include "trace.h"
 
 /* Table 8-192: the epoch scale encodings, in microseconds */
 static const u32 cxl_hmu_epoch_scale_us[] = {
@@ -380,6 +382,7 @@ static unsigned int __cxl_hmu_drain(struct cxl_hmu_inst *inst, u64 *entries,
 	 */
 	writeq(status & (CHMU_INST0_STATUS_OVRFLW | CHMU_INST0_STATUS_FILLTHRESH),
 	       inst->base + CHMU_INST0_STATUS_REG);
+	trace_cxl_hmu_hotlist(inst, n, inst->live_width, *overflowed);
 	return n;
 }
 
@@ -730,6 +733,77 @@ void cxl_hmu_unregister_consumer(const struct cxl_hmu_consumer *c)
 	}
 }
 EXPORT_SYMBOL_NS_GPL(cxl_hmu_unregister_consumer, "CXL");
+
+/*
+ * A unit is a contiguous range of device physical address; on an
+ * interleaved region it is spread over several host physical runs. Walk it
+ * by run: one translation for the whole unit on a non-interleaved region,
+ * one per interleave granule otherwise, merging adjacent runs and skipping
+ * DPA that no committed region maps. A granule smaller than a page puts
+ * the whole page in play, once. The count handed to @fn is the entry's in
+ * epoch mode; in always-on mode the entry's counter is not valid and the
+ * configured threshold, which the unit is known to have reached, is handed
+ * over instead. May sleep; not for an atomic consumer.
+ */
+int cxl_hmu_for_each_extent(struct cxl_hmu_inst *inst, u64 entry, u8 counter_width,
+			    cxl_hmu_extent_fn fn, void *data)
+{
+	u64 unit_id = entry >> counter_width;
+	u64 count = entry & (BIT_ULL(counter_width) - 1);
+	u64 dpa = unit_id << inst->live.unit_shift;
+	u64 dpa_end = dpa + BIT_ULL(inst->live.unit_shift);
+	u64 run_hpa = 0, run_len = 0;
+	u32 nr;
+	int rc = 0;
+
+	nr = inst->live.mode == CXL_HMU_MODE_EPOCH ? min_t(u64, count, U32_MAX)
+						   : inst->live.hotness_threshold;
+
+	while (dpa < dpa_end && !rc) {
+		u64 len;
+		u64 hpa = cxl_memdev_dpa_to_hpa_range(inst->block->cxlmd, dpa, &len);
+
+		cond_resched();
+		if (hpa == ULLONG_MAX) {
+			if (run_len) {
+				trace_cxl_hmu_extent(inst, unit_id, run_hpa, run_len, nr);
+				rc = fn(run_hpa, run_len, nr, data);
+				run_len = 0;
+			}
+			dpa += PAGE_SIZE;
+			continue;
+		}
+		if (len < PAGE_SIZE) {
+			/* A sub-page granule: the page holding it is hot */
+			u64 page = ALIGN_DOWN(hpa, PAGE_SIZE);
+
+			dpa += len;
+			if (run_len && page >= run_hpa && page < run_hpa + run_len)
+				continue;
+			hpa = page;
+			len = PAGE_SIZE;
+		} else {
+			len = min(len, dpa_end - dpa);
+			dpa += len;
+		}
+		if (run_len && hpa == run_hpa + run_len) {
+			run_len += len;
+		} else {
+			if (run_len) {
+				trace_cxl_hmu_extent(inst, unit_id, run_hpa, run_len, nr);
+				rc = fn(run_hpa, run_len, nr, data);
+			}
+			run_hpa = hpa;
+			run_len = len;
+		}
+	}
+	if (run_len && !rc) {
+		trace_cxl_hmu_extent(inst, unit_id, run_hpa, run_len, nr);
+		rc = fn(run_hpa, run_len, nr, data);
+	}
+	return rc;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_for_each_extent, "CXL");
 
 const struct cxl_hmu_caps *cxl_hmu_caps(const struct cxl_hmu_inst *inst)
 {

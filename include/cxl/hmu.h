@@ -125,4 +125,13 @@ const struct cxl_hmu_config *cxl_hmu_config(const struct cxl_hmu_inst *inst);
 void *cxl_hmu_consumer_data(struct cxl_hmu_inst *inst);
 void cxl_hmu_set_consumer_data(struct cxl_hmu_inst *inst, void *data);
 
+/*
+ * Walk a hot unit by contiguous host-physical extent. fn() is called
+ * with the HPA, the length of the run, and the entry's count (or the
+ * threshold in always-on mode); it returns 0 to continue. May sleep.
+ */
+typedef int (*cxl_hmu_extent_fn)(u64 hpa, u64 len, u32 nr_accesses, void *data);
+int cxl_hmu_for_each_extent(struct cxl_hmu_inst *inst, u64 entry, u8 counter_width,
+			    cxl_hmu_extent_fn fn, void *data);
+
 #endif

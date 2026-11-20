@@ -10,6 +10,13 @@ Description:
 		It has one user at a time, whichever takes it first: see
 		owner.
 
+		Besides the perf PMU, in-kernel clients of the driver can use
+		an instance (include/cxl/hmu.h). A client holds the instance
+		from its claim to its release, runs it with the configuration
+		staged in the files below for that time, and reads the hot
+		units as host physical address ranges. Each client documents
+		when it takes an instance and how it uses it.
+
 
 What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/owner
 Date:		November, 2026
@@ -19,10 +26,12 @@ Description:
 		(RO) Who holds the instance: "perf" while a perf event is open
 		on the instance's PMU (CONFIG_CXL_HMU_PERF), from
 		perf_event_open() until the event is closed, whether or not
-		it is enabled; else "none". There is nothing to write: an
-		instance is taken by using it, first come, first served, and
-		whoever comes second gets -EBUSY from perf_event_open(). An
-		instance cannot be reserved for a user that is not using it.
+		it is enabled; the name of the in-kernel client that holds it;
+		else "none". There is nothing to write: an instance is taken
+		by using it, first come, first served, and whoever comes
+		second does not get it: perf_event_open() fails with -EBUSY,
+		and so does the claim of a client. An instance cannot be
+		reserved for a user that is not using it.
 
 
 What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/unit_size
@@ -34,12 +43,12 @@ Date:		November, 2026
 KernelVersion:	v7.5
 Contact:	linux-cxl@vger.kernel.org
 Description:
-		(RW) The configuration an in-kernel user starts the instance
-		with. Only a write to these files changes them. A
+		(RW) The configuration an in-kernel client claims the
+		instance with. Only a write to these files changes them. A
 		perf event is configured by its own attributes and neither
 		reads nor changes them. A store takes effect at the next
-		start by an in-kernel user; one that is running keeps what it
-		started with. Each value is checked against the instance's
+		claim by an in-kernel client; one that holds the instance
+		keeps what it claimed with. Each value is checked against the instance's
 		capabilities at store time: a value the instance does not
 		support is refused with -EOPNOTSUPP, an out-of-range one with
 		-EINVAL or -ERANGE, and a refused store leaves the old value.
@@ -55,7 +64,8 @@ Description:
 		default 1. It must be below 1 << (the counter width), which
 		the device only reports once the unit size is programmed, so
 		a value that is too large is refused with -EINVAL by the
-		start, not by the store, and the kernel log names the width.
+		claim, not by the store; with dynamic debug enabled for the
+		driver the kernel log names the width.
 
 		epoch_us: the epoch length in microseconds, clamped to
 		epoch_range_us and rounded down to what the device encodes
@@ -69,7 +79,7 @@ Description:
 		capacity_ranges, size must not be 0 and the range must hold at
 		least one unit. The default is the whole device.
 
-		What has no file is fixed for an in-kernel user: epoch mode
+		What has no file is fixed for an in-kernel client: epoch mode
 		if the instance supports it, else always-on; reads and writes
 		of any kind if supported, else non-TEE reads and writes, else
 		the first access type the instance offers; the smallest
@@ -131,8 +141,8 @@ Description:
 
 		interrupts: "overflow" and/or "level", space separated, or
 		empty. The PMU exists only for an instance with "level" and
-		a usable interrupt vector; an in-kernel user polls and needs
-		neither.
+		a usable interrupt vector; an in-kernel client can poll and
+		need neither.
 
 
 What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/active
@@ -150,4 +160,7 @@ Description:
 		the list was full when a unit became hot, and unless
 		postponed_overflow is 1 that unit is gone. dropped counts the
 		hotlist entries the kernel read and threw away: for a perf
-		event, those its AUX buffer had no room for when it stopped.
+		event, those its AUX buffer had no room for when it stopped;
+		for an in-kernel client, those a read could not hand over to
+		the client, the ones without System RAM behind them
+		included.

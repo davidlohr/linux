@@ -245,6 +245,7 @@ config CXL_ATL
 
 config CXL_HMU
 	tristate "CXL: Hot-range Monitoring Unit driver"
+	depends on CXL_REGION
 	help
 	  Driver for CXL Hot-range Monitoring Units (CXL r4.0 section 8.2.8),
 	  which report the units of device memory accessed more than a

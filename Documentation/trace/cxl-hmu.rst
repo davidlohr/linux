@@ -264,10 +264,24 @@ To avoid problems with downsampling when accesses are periodic this option
 allows for an implementation defined randomization of the sampling interval,
 whilst remaining close to the specified downsampling_factor.
 
+In-kernel clients
+=================
+
+An instance that no perf event holds can be used by an in-kernel client of
+the driver instead, through the interface in include/cxl/hmu.h. A client
+registers with the driver and is told of every instance. It claims an
+instance with the configuration staged in the attributes of the instance
+device, not with the parameters above (see
+Documentation/ABI/testing/sysfs-bus-cxl-hmu), which programs and starts it.
+It then reads the hot units as host physical address ranges, by polling or
+when the instance's interrupt notifies it, and releases the instance, which
+stops it. While a client holds an instance, the instance's owner attribute
+shows the client's name and perf_event_open() on its PMU fails with -EBUSY.
+
 Trace events
 ============
 
-The cxl_hmu trace system has one event, which starts with the name of the
+The cxl_hmu trace system has three events. Each starts with the name of the
 instance device.
 
 cxl_hmu_hotlist
@@ -275,3 +289,23 @@ cxl_hmu_hotlist
   read that found it empty: nr is the number of entries taken,
   counter_width the counter width of the session, and overflowed is 1 if the
   device had reported a hotlist overflow since the previous read.
+
+cxl_hmu_hpa_range
+  One contiguous host physical range of a hot unit, as handed to an
+  in-kernel client; the PMU reports device physical units and does not emit
+  it. unit_id is the unit, hpa and len (in bytes) the range, and
+  nr_accesses the count of the hotlist entry in epoch mode or the configured
+  threshold in always-on mode. Ranges are page granular, so one can be
+  larger than the unit, and a unit on an interleaved region has several.
+  Only a range that is at least partly System RAM is reported.
+
+cxl_hmu_read
+  One read of the instance by the in-kernel client that holds it, which is
+  one batch: client is the client's name, drained the number of entries
+  taken off the hotlist, handed the units of those handed to the client
+  whole, dropped the entries taken and not handed over (a unit with no
+  System RAM behind it has nothing to hand over and is one of them), lost is
+  1 if the device lost hot units to an overflow, and err is what ended the
+  read: 0, or a negative errno (what the client refused a range with, -EBUSY
+  a unit that could not be translated without waiting for a lock, -ENODEV a
+  memory device that cxl_mem is no longer bound to).

@@ -6,23 +6,34 @@
  * configuration, hotlist and interrupt (CXL r4.0 Section 8.2.8). Each is
  * registered as a child device of the block. This file is a library over
  * one instance: claim it, start it, drain its hotlist a bounded number of
- * entries at a time, stop it and release it. It delivers nothing and
- * requests no interrupt. The device hotlist is the only queue, and whoever
- * holds the instance decides when to read it: the perf PMU from an
- * interrupt it requests itself, an in-kernel user by polling.
+ * entries at a time, stop it, release it, and translate an entry to host
+ * physical ranges. The device hotlist is the only queue, and whoever holds
+ * the instance decides when to read it: the perf PMU from an interrupt it
+ * requests itself, an in-kernel client by polling or from a notify.
+ *
+ * In-kernel clients use the interface of include/cxl/hmu.h and nothing
+ * else. The core knows none of them: a client registers, is told of every
+ * instance and claims the ones it wants. perf is part of this module and
+ * uses the library directly (see hmu.h).
  *
  * Ownership is claim-on-use, first come, first served. The perf PMU holds
- * an instance from event_init to event->destroy, an in-kernel user from
- * its start to its stop. There is no reservation.
+ * an instance from event_init to event->destroy, a client from its claim
+ * to its release, which also start and stop the instance. There is no
+ * reservation.
  *
  * Configuration has one writer per holder. perf's is decoded from the
- * event's attributes and handed to the claim. An in-kernel holder's is the
- * one staged in sysfs, which only the sysfs stores write. A claim copies
- * its configuration to inst->live and a start programs that copy, so no
- * session changes what the next in-kernel holder starts with.
+ * event's attributes and handed to the claim. A client's is the one
+ * staged in sysfs, which only the sysfs stores write. A claim copies its
+ * configuration to inst->live and a start programs that copy, so no
+ * session changes what the next client starts with.
  *
  * Locking, outermost first:
  *
+ *   cxl_hmu_clients_lock (mutex)  the registered clients, the probed
+ *                        blocks and the binds of every instance. A
+ *                        client's add() and remove() run under it, so it
+ *                        is taken before whatever they take; nothing else
+ *                        of the client interface takes it.
  *   block->lock (mutex)  the owner, the staged configuration and the
  *                        claimed range of every instance of the block, so
  *                        the overlap check of a claim sees a stable set of
@@ -33,18 +44,25 @@
  *                        PREEMPT_RT too. Nothing is taken under it.
  *
  * inst->owner and inst->live are written under both, so either is enough
- * to read them. A front-end's own lock is taken before both (perf's raw
- * lock before inst->lock only: perf claims and releases without it).
+ * to read them. A holder's own lock is taken before both (perf's raw lock
+ * before inst->lock only: perf claims and releases without it). The HPA
+ * walk takes neither: it tries the memdev lock and cxl_rwsem in the region
+ * core and reads what is fixed while its caller holds the claim.
  */
 #include <linux/bitfield.h>
 #include <linux/device.h>
+#include <linux/interrupt.h>
 #include <linux/iopoll.h>
+#include <linux/ioport.h>
 #include <linux/kstrtox.h>
 #include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/range.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
+#include <linux/string.h>
 #include <linux/sysfs.h>
 
 #include "../cxl.h"
@@ -338,8 +356,9 @@ static int cxl_hmu_program(struct cxl_hmu_inst *inst, const struct cxl_hmu_confi
 	return 0;
 }
 
-int __cxl_hmu_claim(struct cxl_hmu_inst *inst, const char *who,
-		    const struct cxl_hmu_config *cfg)
+/* A unit above @max_unit_size, if not 0, is -EINVAL */
+static int cxl_hmu_take(struct cxl_hmu_inst *inst, const char *who,
+			const struct cxl_hmu_config *cfg, u64 max_unit_size)
 {
 	int rc;
 
@@ -351,6 +370,11 @@ int __cxl_hmu_claim(struct cxl_hmu_inst *inst, const char *who,
 	rc = cxl_hmu_validate_config(inst, cfg);
 	if (rc)
 		return rc;
+	if (max_unit_size && BIT_ULL(cfg->unit_shift) > max_unit_size) {
+		dev_dbg(&inst->dev, "unit size %llu is above %llu\n",
+			BIT_ULL(cfg->unit_shift), max_unit_size);
+		return -EINVAL;
+	}
 	rc = cxl_hmu_check_overlap(inst, cfg);
 	if (rc)
 		return rc;
@@ -358,6 +382,12 @@ int __cxl_hmu_claim(struct cxl_hmu_inst *inst, const char *who,
 	inst->live = *cfg;
 	inst->owner = who;
 	return 0;
+}
+
+int __cxl_hmu_claim(struct cxl_hmu_inst *inst, const char *who,
+		    const struct cxl_hmu_config *cfg)
+{
+	return cxl_hmu_take(inst, who, cfg, 0);
 }
 
 int cxl_hmu_check_threshold(struct cxl_hmu_inst *inst)
@@ -386,13 +416,40 @@ int cxl_hmu_check_threshold(struct cxl_hmu_inst *inst)
 	return 0;
 }
 
+/**
+ * cxl_hmu_release() - Stop an instance and give it up
+ * @inst: the instance, held by the caller
+ *
+ * Disables the instance if it runs and, if it was claimed with a notify,
+ * frees the interrupt: the notify function is not running when this
+ * returns, and is not called again. The instance is then free for the
+ * next claim. What its hotlist held is lost.
+ *
+ * Tear down in this order: first stop the client's own reader, that is
+ * disable or cancel, and wait for, the work a notify queues or a poll
+ * runs, so that no cxl_hmu_read_ranges() is in flight and none starts;
+ * then release. A release or a read after the release would act on the
+ * next holder's session.
+ *
+ * Context: process context, may sleep. For the holder only: an instance
+ * that nobody holds is warned about and left alone.
+ */
 void cxl_hmu_release(struct cxl_hmu_inst *inst)
 {
 	guard(mutex)(&inst->block->lock);
+	if (WARN_ON_ONCE(!inst->owner))
+		return;
 	cxl_hmu_stop(inst);
+	/* The handler does nothing for a stopped instance; this waits for one running */
+	if (inst->notify) {
+		free_irq(inst->irq, inst);
+		inst->notify = NULL;
+		inst->notify_arg = NULL;
+	}
 	guard(raw_spinlock_irqsave)(&inst->lock);
 	inst->owner = NULL;
 }
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_release, "CXL_HMU");
 
 int __cxl_hmu_start(struct cxl_hmu_inst *inst, unsigned int flags)
 {
@@ -471,11 +528,502 @@ unsigned int cxl_hmu_drain(struct cxl_hmu_inst *inst, u64 *entries,
 	return n;
 }
 
+void cxl_hmu_account_dropped(struct cxl_hmu_inst *inst, unsigned int nr)
+{
+	guard(raw_spinlock_irqsave)(&inst->lock);
+	inst->dropped += nr;
+}
+
 bool cxl_hmu_pending(struct cxl_hmu_inst *inst)
 {
 	return readq(inst->base + CHMU_INST0_STATUS_REG) &
 		(CHMU_INST0_STATUS_OVRFLW | CHMU_INST0_STATUS_FILLTHRESH);
 }
+
+/* One page of HPA ranges: a 2 MiB unit over 8 KiB interleave granules */
+#define CXL_HMU_WALK_RANGES	(PAGE_SIZE / sizeof(struct range))
+
+/* One read: where its ranges go, and the walk's buffer */
+struct cxl_hmu_reader {
+	cxl_hmu_range_fn	fn;
+	void			*arg;
+	unsigned int		nr_ranges;	/* handed over for the current entry */
+	struct range		*hpa;		/* CXL_HMU_WALK_RANGES */
+};
+
+/*
+ * Hand one HPA range to the reader, unless none of it is System RAM: a
+ * region that is device-dax, or that nothing has claimed, has no page the
+ * reader could act on, and walking its page frames to find that out is the
+ * expensive way. That is all this check is for. It says nothing of whether
+ * the memory is online, and by the time the reader's function runs the
+ * answer may be stale, so that function must still validate every page
+ * frame it touches, which is also what skips the offline blocks and the
+ * holes of a range that is only partly System RAM.
+ */
+static int cxl_hmu_hpa_range(struct cxl_hmu_inst *inst, u64 unit_id,
+			     const struct range *hpa, u32 count,
+			     struct cxl_hmu_reader *r)
+{
+	if (region_intersects(hpa->start, range_len(hpa), IORESOURCE_SYSTEM_RAM,
+			      IORES_DESC_NONE) == REGION_DISJOINT)
+		return 0;
+
+	trace_cxl_hmu_hpa_range(inst, unit_id, hpa->start, range_len(hpa), count);
+	r->nr_ranges++;
+	return r->fn(r->arg, hpa->start, range_len(hpa), count);
+}
+
+/*
+ * A unit is a contiguous range of device physical address; on an
+ * interleaved region it is spread over several HPA ranges. Walk it by
+ * range. The region core translates the unit a batch of HPA ranges at a
+ * time, taking its locks once per batch: page granular, adjacent ranges
+ * merged, DPA that no committed region maps left out. A granule or a unit
+ * smaller than a page puts the whole page in play, once, so an HPA range
+ * can be larger than the unit. Only those that are at least partly System
+ * RAM are handed over. The count handed over is the entry's in epoch mode;
+ * in always-on mode the entry's counter is not valid and the configured
+ * threshold, which the unit is known to have reached, is handed over
+ * instead.
+ *
+ * The reader may keep what it is handed until after the walk, pages it
+ * took off the LRU for one, so no CXL lock is waited for between two
+ * ranges: whoever holds the memory device's lock may be removing the very
+ * memory and waiting for those pages. See
+ * cxl_memdev_dpa_to_hpa_ranges_nowait().
+ *
+ * Returns the first non-zero return of the reader's function, which ends
+ * the walk, -ENODEV if cxl_mem is not bound to the memory device, in which
+ * case no unit will translate until it is, or -EBUSY if a lock was not
+ * free, which says nothing about the unit. May sleep.
+ */
+static int cxl_hmu_for_each_hpa_range(struct cxl_hmu_inst *inst, u64 entry,
+				      struct cxl_hmu_reader *r)
+{
+	u8 counter_width = inst->live_width;
+	u64 unit_id = entry >> counter_width;
+	u64 count = entry & (BIT_ULL(counter_width) - 1);
+	u64 dpa = unit_id << inst->live.unit_shift;
+	u64 dpa_end = dpa + BIT_ULL(inst->live.unit_shift);
+	struct range *hpa = r->hpa;
+	struct range run;
+	bool have_run = false;
+	u32 nr;
+	int rc;
+
+	nr = inst->live.mode == CXL_HMU_MODE_EPOCH ? min_t(u64, count, U32_MAX)
+						   : inst->live.hotness_threshold;
+
+	while (dpa < dpa_end) {
+		u64 done;
+		int i, n;
+
+		n = cxl_memdev_dpa_to_hpa_ranges_nowait(inst->block->hmu->cxlmd,
+							dpa, dpa_end - dpa, hpa,
+							CXL_HMU_WALK_RANGES,
+							&done);
+		/* A region whose addressing cannot be translated is a hole here */
+		if (n < 0 && n != -EOPNOTSUPP)
+			return n;
+		dpa += done;
+
+		/* The last HPA range of a batch may continue in the next */
+		for (i = 0; i < n; i++) {
+			if (have_run && hpa[i].start >= run.start &&
+			    hpa[i].start <= run.end + 1) {
+				run.end = max(run.end, hpa[i].end);
+				continue;
+			}
+			if (have_run) {
+				rc = cxl_hmu_hpa_range(inst, unit_id, &run, nr, r);
+				if (rc)
+					return rc;
+			}
+			run = hpa[i];
+			have_run = true;
+		}
+		cond_resched();
+	}
+	if (have_run)
+		return cxl_hmu_hpa_range(inst, unit_id, &run, nr, r);
+	return 0;
+}
+
+/* Hottest first; the count is the low live_width bits of an entry */
+static int cxl_hmu_count_cmp(const void *a, const void *b, const void *priv)
+{
+	u64 mask = *(const u64 *)priv;
+	u64 ca = *(const u64 *)a & mask, cb = *(const u64 *)b & mask;
+
+	return ca < cb ? 1 : ca > cb ? -1 : 0;
+}
+
+/**
+ * cxl_hmu_read_ranges() - Read hot units off an instance as HPA ranges
+ * @inst: the instance, held by the caller
+ * @max: the most hotlist entries to take, at most %CXL_HMU_READ_MAX
+ * @fn: called with @arg for each HPA range, with the HPA, the length in
+ *	bytes and the count; returns 0 to go on, or a negative errno that
+ *	ends the read
+ * @arg: passed to @fn
+ * @flags: set to %CXL_HMU_READ_MORE if entries are left in the hotlist and
+ *	%CXL_HMU_READ_LOST if the device lost hot units to a hotlist overflow
+ *	since the last read; always written
+ *
+ * Takes up to @max entries off the head of the hotlist. They are consumed:
+ * a unit that stays hot is reported again. In epoch mode they are handed
+ * over by count, the highest first, so whatever @fn takes before it stops
+ * is the hottest of the batch; in always-on mode in the device's order,
+ * and the count is the configured threshold, since the entry has none.
+ *
+ * The unit of each entry is handed over one HPA range at a time, page
+ * granular and merged, and only where it is at least partly System RAM:
+ * @fn must still validate every page frame. @fn may keep what it is
+ * handed, isolated folios for one, past the call, which is why the read
+ * waits for no CXL lock.
+ *
+ * What is not handed over whole, from the entry that ended the read to
+ * the end of the batch, and every entry whose unit had no range to hand
+ * over, is counted in the instance's "dropped" attribute.
+ *
+ * The read acknowledges the interrupt status bits it found, including
+ * when it then ends in an error. A client claimed with a notify may not
+ * be notified again until the hotlist crosses the fill level or
+ * overflows anew, so after a read that ends in an error, or with
+ * %CXL_HMU_READ_MORE set, it must schedule the next read itself.
+ *
+ * Context: process context, may sleep. For the holder, which serializes
+ * its own calls.
+ *
+ * Return: the number of entries whose unit was handed over whole, or what
+ * ended the read: the error @fn returned, -EBUSY if a CXL lock was not
+ * free, -ENODEV if cxl_mem is not bound to the memory device, -ENOMEM,
+ * -EINVAL for a @max of 0, or -EPERM (with a warning) if nobody holds the
+ * instance.
+ */
+int cxl_hmu_read_ranges(struct cxl_hmu_inst *inst, unsigned int max,
+			cxl_hmu_range_fn fn, void *arg, unsigned int *flags)
+{
+	u64 mask = BIT_ULL(inst->live_width) - 1;
+	struct cxl_hmu_reader r = { .fn = fn, .arg = arg };
+	u64 entries[CXL_HMU_READ_MAX];
+	unsigned int dflags, n, i, skipped = 0;
+	int rc = 0;
+
+	*flags = 0;
+	if (WARN_ON_ONCE(!READ_ONCE(inst->owner)))
+		return -EPERM;
+	if (!max)
+		return -EINVAL;
+	max = min(max, CXL_HMU_READ_MAX);
+
+	/* Before the drain, so that a failure loses no entry */
+	struct range *hpa __free(kfree) =
+		kmalloc_array(CXL_HMU_WALK_RANGES, sizeof(*hpa), GFP_KERNEL);
+	if (!hpa)
+		return -ENOMEM;
+	r.hpa = hpa;
+
+	n = cxl_hmu_drain(inst, entries, max, &dflags);
+	if (dflags & CXL_HMU_DRAIN_MORE)
+		*flags |= CXL_HMU_READ_MORE;
+	if (dflags & CXL_HMU_DRAIN_LOST)
+		*flags |= CXL_HMU_READ_LOST;
+	if (inst->live.mode == CXL_HMU_MODE_EPOCH)
+		sort_r(entries, n, sizeof(*entries), cxl_hmu_count_cmp, NULL,
+		       &mask);
+	for (i = 0; i < n; i++) {
+		r.nr_ranges = 0;
+		rc = cxl_hmu_for_each_hpa_range(inst, entries[i], &r);
+		if (rc)
+			break;
+		if (!r.nr_ranges)
+			skipped++;
+	}
+	if (n - i + skipped)
+		cxl_hmu_account_dropped(inst, n - i + skipped);
+	trace_cxl_hmu_read(inst, n, i - skipped, n - i + skipped,
+			   dflags & CXL_HMU_DRAIN_LOST, rc);
+	if (rc)
+		return rc;
+	return i - skipped;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_read_ranges, "CXL_HMU");
+
+/* Clients */
+
+static DEFINE_MUTEX(cxl_hmu_clients_lock);
+static LIST_HEAD(cxl_hmu_clients);	/* registered */
+static LIST_HEAD(cxl_hmu_blocks);	/* probed, until unbind */
+
+/* A client bound to an instance: its add() accepted it */
+struct cxl_hmu_bind {
+	struct list_head	node;		/* inst->binds */
+	struct cxl_hmu_client	*client;
+	void			*data;		/* what add() stored */
+};
+
+static void cxl_hmu_bind(struct cxl_hmu_client *client, struct cxl_hmu_inst *inst)
+{
+	struct cxl_hmu_bind *b;
+	void *data = NULL;
+	int rc;
+
+	lockdep_assert_held(&cxl_hmu_clients_lock);
+	b = kzalloc_obj(*b);
+	if (!b) {
+		rc = -ENOMEM;
+		goto out;
+	}
+	rc = client->add(inst, &data);
+	if (rc) {
+		kfree(b);
+		goto out;
+	}
+	b->client = client;
+	b->data = data;
+	list_add_tail(&b->node, &inst->binds);
+	return;
+out:
+	dev_dbg(&inst->dev, "not bound to client %s: %d\n", client->name, rc);
+}
+
+/*
+ * remove() ends the client's use of the instance, a claim included. A
+ * claim it left is released here, so that no client name outlives its
+ * client as an owner.
+ */
+static void cxl_hmu_unbind(struct cxl_hmu_inst *inst, struct cxl_hmu_bind *b)
+{
+	bool held;
+
+	lockdep_assert_held(&cxl_hmu_clients_lock);
+	b->client->remove(inst, b->data);
+	scoped_guard(mutex, &inst->block->lock)
+		held = inst->owner == b->client->name;
+	if (WARN_ON_ONCE(held))
+		cxl_hmu_release(inst);
+	list_del(&b->node);
+	kfree(b);
+}
+
+/**
+ * cxl_hmu_register_client() - Register an in-kernel client of CHMU instances
+ * @client: the client, with its name and both callbacks set
+ *
+ * Calls @client->add() for every instance there is, and from then on for
+ * every instance that is probed, until cxl_hmu_unregister_client(). An
+ * instance whose add() fails is not bound to the client, and the client
+ * is not told of it again; the failure is not returned.
+ *
+ * Context: process context, may sleep.
+ *
+ * Return: 0, -EINVAL if a name or a callback is missing or the name is
+ * reserved, -EEXIST if a registered client has the name.
+ */
+int cxl_hmu_register_client(struct cxl_hmu_client *client)
+{
+	struct cxl_hmu_client *c;
+	struct cxl_hmu_block *block;
+	unsigned int i;
+
+	if (!client->name || !client->name[0] || !client->add || !client->remove)
+		return -EINVAL;
+	/* What "owner" shows for perf and for a free instance */
+	if (!strcmp(client->name, "perf") || !strcmp(client->name, "none"))
+		return -EINVAL;
+
+	guard(mutex)(&cxl_hmu_clients_lock);
+	list_for_each_entry(c, &cxl_hmu_clients, node)
+		if (!strcmp(c->name, client->name))
+			return -EEXIST;
+	list_add_tail(&client->node, &cxl_hmu_clients);
+	list_for_each_entry(block, &cxl_hmu_blocks, node)
+		for (i = 0; i < block->num_inst; i++)
+			if (block->inst[i])
+				cxl_hmu_bind(client, block->inst[i]);
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_register_client, "CXL_HMU");
+
+/**
+ * cxl_hmu_unregister_client() - Unregister an in-kernel client
+ * @client: a registered client
+ *
+ * Calls @client->remove() for every instance bound to it. On return the
+ * core holds nothing of the client's and calls none of its callbacks.
+ *
+ * Context: process context, may sleep. Must not be called with a lock
+ * held that @client->remove() takes.
+ */
+void cxl_hmu_unregister_client(struct cxl_hmu_client *client)
+{
+	struct cxl_hmu_block *block;
+	struct cxl_hmu_bind *b, *tmp;
+	unsigned int i;
+
+	guard(mutex)(&cxl_hmu_clients_lock);
+	list_del(&client->node);
+	list_for_each_entry(block, &cxl_hmu_blocks, node) {
+		for (i = 0; i < block->num_inst; i++) {
+			struct cxl_hmu_inst *inst = block->inst[i];
+
+			if (!inst)
+				continue;
+			list_for_each_entry_safe(b, tmp, &inst->binds, node)
+				if (b->client == client)
+					cxl_hmu_unbind(inst, b);
+		}
+	}
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_unregister_client, "CXL_HMU");
+
+/**
+ * cxl_hmu_dev() - The device of an instance
+ * @inst: an instance the caller is bound to
+ *
+ * Its name is the instance's, for example "hmu_mem0.0.0", and its sysfs
+ * directory holds the configuration a claim takes.
+ *
+ * Context: any, between the client's add() and remove() for @inst.
+ *
+ * Return: the device, valid until the client's remove() for @inst.
+ */
+struct device *cxl_hmu_dev(struct cxl_hmu_inst *inst)
+{
+	return &inst->dev;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_dev, "CXL_HMU");
+
+/* A notify: the instance is a client's, running, and has something to read */
+static irqreturn_t cxl_hmu_notify_irq(int irq, void *data)
+{
+	struct cxl_hmu_inst *inst = data;
+
+	scoped_guard(raw_spinlock, &inst->lock)
+		if (!inst->enabled || !cxl_hmu_pending(inst))
+			return IRQ_NONE;
+	/*
+	 * Not acknowledged: the status bits hold off another interrupt until
+	 * the client's next read has moved the head and acknowledged them.
+	 */
+	inst->notify(inst->notify_arg);
+	return IRQ_HANDLED;
+}
+
+static int cxl_hmu_claim_start(struct cxl_hmu_inst *inst,
+			       const struct cxl_hmu_client *client,
+			       cxl_hmu_notify_fn fn, void *arg)
+{
+	int rc;
+
+	rc = cxl_hmu_take(inst, client->name, NULL, client->max_unit_size);
+	if (rc)
+		return rc;
+	/* A threshold that does not fit the counter is refused quietly here */
+	rc = cxl_hmu_check_threshold(inst);
+	if (rc)
+		goto release;
+	if (fn) {
+		/* Before the request: the vector may be shared and taken at once */
+		inst->notify = fn;
+		inst->notify_arg = arg;
+		rc = request_irq(inst->irq, cxl_hmu_notify_irq,
+				 IRQF_SHARED | IRQF_NO_THREAD,
+				 dev_name(&inst->dev), inst);
+		if (rc) {
+			dev_dbg(&inst->dev, "interrupt %d not available: %d\n",
+				inst->irq, rc);
+			inst->notify = NULL;
+			inst->notify_arg = NULL;
+			goto release;
+		}
+	}
+	rc = __cxl_hmu_start(inst, fn ? CXL_HMU_START_IRQ : 0);
+	if (!rc)
+		return 0;
+release:
+	cxl_hmu_release(inst);
+	return rc;
+}
+
+/**
+ * cxl_hmu_claim() - Take an instance and start it, polled
+ * @inst: an instance the client is bound to
+ * @client: the client; its name is the instance's owner until the release
+ *
+ * Claims @inst with the configuration staged in its sysfs files, programs
+ * it, empties its hotlist and enables it with its interrupts off: the
+ * client reads it with cxl_hmu_read_ranges() when it chooses. The claim is
+ * first come, first served, between clients and perf alike.
+ *
+ * Context: process context, may sleep, between the client's add() and
+ * remove() for @inst. Busy-waits for the device for up to 0.3 s.
+ *
+ * Return: 0 with the instance held and running. On error nothing is held:
+ * -EBUSY if the instance is held, or its range overlaps that of a held
+ * sibling and both do not support Address Overlap; -EOPNOTSUPP or -EINVAL
+ * if the staged configuration does not fit the instance, a threshold that
+ * does not fit the counter included; -EINVAL, before the device is
+ * touched, if the staged unit size is above @client->max_unit_size; -EIO
+ * or -ETIMEDOUT if the device does not follow.
+ */
+int cxl_hmu_claim(struct cxl_hmu_inst *inst, const struct cxl_hmu_client *client)
+{
+	return cxl_hmu_claim_start(inst, client, NULL, NULL);
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_claim, "CXL_HMU");
+
+/**
+ * cxl_hmu_claim_notify() - Take an instance and start it, with a notify
+ * @inst: an instance the client is bound to
+ * @client: the client; its name is the instance's owner until the release
+ * @fn: called with @arg in hard interrupt context when the hotlist fills
+ *	to half or overflows; it may only queue work
+ * @arg: passed to @fn
+ *
+ * As cxl_hmu_claim(), but the instance's interrupt is requested, shared,
+ * before it is enabled with its overflow and fill level interrupts on.
+ * The interrupt is not acknowledged until the next read moves the head.
+ * A read acknowledges it whatever it then returns, and the device raises
+ * it again only when the hotlist crosses the fill level or overflows
+ * anew: after a read that ends in an error, or with %CXL_HMU_READ_MORE
+ * set, the client must schedule the next read itself rather than wait
+ * for a notify. cxl_hmu_release() frees the interrupt.
+ *
+ * Context: as cxl_hmu_claim().
+ *
+ * Return: as cxl_hmu_claim(), and -EOPNOTSUPP if the instance has no
+ * interrupt vector or no interrupt, or the error of request_irq() (-EBUSY
+ * if the vector cannot be shared). On error nothing is held and no
+ * interrupt is requested.
+ */
+int cxl_hmu_claim_notify(struct cxl_hmu_inst *inst,
+			 const struct cxl_hmu_client *client,
+			 cxl_hmu_notify_fn fn, void *arg)
+{
+	if (!fn)
+		return -EINVAL;
+	if (inst->irq < 0 || !(inst->caps.irq_overflow || inst->caps.irq_level))
+		return -EOPNOTSUPP;
+	return cxl_hmu_claim_start(inst, client, fn, arg);
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_claim_notify, "CXL_HMU");
+
+/**
+ * cxl_hmu_unit_size() - The unit size an instance was claimed with
+ * @inst: the instance, held by the caller
+ *
+ * Context: any. For the holder: the value is fixed until the release.
+ *
+ * Return: the size in bytes of the unit one hotlist entry stands for.
+ */
+u64 cxl_hmu_unit_size(struct cxl_hmu_inst *inst)
+{
+	return BIT_ULL(inst->live.unit_shift);
+}
+EXPORT_SYMBOL_NS_GPL(cxl_hmu_unit_size, "CXL_HMU");
 
 /* Sysfs */
 
@@ -742,16 +1290,19 @@ static void cxl_hmu_default_config(struct cxl_hmu_inst *inst)
 }
 
 /*
- * Unbind. The actions that unregister the instance's PMU and free the
- * interrupt it requested were added after this one, so they have run:
- * every perf event is closed, which released a claim perf held, and none
- * can be opened.
+ * Unbind. The clients were unbound first (cxl_hmu_unbind_clients()), and
+ * each released what it held. The actions that unregister the instance's
+ * PMU and free the interrupt it requested were added after this one, so
+ * they have run too: every perf event is closed, which released a claim
+ * perf held, and none can be opened. So no claim is left and none can
+ * succeed.
  */
 static void cxl_hmu_inst_remove(void *data)
 {
 	struct cxl_hmu_inst *inst = data;
 	struct cxl_hmu_block *block = inst->block;
 
+	WARN_ON_ONCE(!list_empty(&inst->binds));
 	scoped_guard(mutex, &block->lock) {
 		WARN_ON_ONCE(inst->owner);
 		block->inst[inst->index] = NULL;
@@ -777,6 +1328,7 @@ static int cxl_hmu_inst_add(struct cxl_hmu_block *block, unsigned int index,
 	inst->base = block->hmu->base + 0x10 + inst_len * index;
 	inst->irq = -1;
 	raw_spin_lock_init(&inst->lock);
+	INIT_LIST_HEAD(&inst->binds);
 	cxl_hmu_decode_caps(inst);
 	cxl_hmu_default_config(inst);
 
@@ -811,9 +1363,9 @@ static int cxl_hmu_inst_add(struct cxl_hmu_block *block, unsigned int index,
 	 * The Interrupt Message Number is defined for an instance with the
 	 * overflow interrupt; it is used for a level-crossing-only instance
 	 * too, as the spec gives such an instance no other vector. Only
-	 * looked up here: whoever wants the interrupt requests it, shared,
-	 * since two instances may report the same number. Without a vector
-	 * the instance can still be polled.
+	 * looked up here: perf, or the claim of a client that wants a notify,
+	 * requests it, shared, since two instances may report the same
+	 * number. Without a vector the instance can still be polled.
 	 */
 	if (inst->caps.irq_overflow || inst->caps.irq_level) {
 		irq = pdev->msi_enabled || pdev->msix_enabled ?
@@ -831,6 +1383,28 @@ err:
 }
 
 /* The driver */
+
+/*
+ * Unbind, first: once the block is off the list no client is told of it,
+ * and once every bound client's remove() has returned none uses it.
+ */
+static void cxl_hmu_unbind_clients(void *data)
+{
+	struct cxl_hmu_block *block = data;
+	struct cxl_hmu_bind *b, *tmp;
+	unsigned int i;
+
+	guard(mutex)(&cxl_hmu_clients_lock);
+	list_del(&block->node);
+	for (i = 0; i < block->num_inst; i++) {
+		struct cxl_hmu_inst *inst = block->inst[i];
+
+		if (!inst)
+			continue;
+		list_for_each_entry_safe(b, tmp, &inst->binds, node)
+			cxl_hmu_unbind(inst, b);
+	}
+}
 
 static int cxl_hmu_probe(struct device *dev)
 {
@@ -865,7 +1439,17 @@ static int cxl_hmu_probe(struct device *dev)
 		if (rc)
 			return rc;
 	}
-	return 0;
+
+	/* Last, so that at unbind the clients go first */
+	scoped_guard(mutex, &cxl_hmu_clients_lock) {
+		struct cxl_hmu_client *client;
+
+		list_add_tail(&block->node, &cxl_hmu_blocks);
+		list_for_each_entry(client, &cxl_hmu_clients, node)
+			for (i = 0; i < block->num_inst; i++)
+				cxl_hmu_bind(client, block->inst[i]);
+	}
+	return devm_add_action_or_reset(dev, cxl_hmu_unbind_clients, block);
 }
 
 static struct cxl_driver cxl_hmu_driver = {

@@ -10,9 +10,12 @@
 #include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
+
+#include <cxl/hmu.h>
 
 #include "../hmu.h"
 
@@ -182,6 +185,7 @@ struct cxl_hmu_block {
 	struct mutex		lock;
 	unsigned int		num_inst;
 	struct cxl_hmu_inst	*inst[CXL_HMU_MAX_INST];
+	struct list_head	node;		/* the probed blocks; the clients lock */
 };
 
 struct cxl_hmu_inst {
@@ -190,9 +194,9 @@ struct cxl_hmu_inst {
 	void __iomem		*base;		/* block base + 0x10 + INSTLEN * index */
 	unsigned int		index;
 	/*
-	 * The vector of the instance's Interrupt Message Number, or -1. The
-	 * core requests nothing on it: a holder that wants the interrupt
-	 * requests it, shared, and starts with CXL_HMU_START_IRQ.
+	 * The vector of the instance's Interrupt Message Number, or -1. It is
+	 * requested, shared, by whoever wants the interrupt: perf for its
+	 * PMU, the core for a client that claimed with a notify.
 	 */
 	int			irq;
 	struct cxl_hmu_caps	caps;		/* decoded once at probe */
@@ -216,21 +220,26 @@ struct cxl_hmu_inst {
 	bool			enabled;	/* hardware enabled */
 	unsigned long		overflows;	/* hotlist overflows since the last start */
 	unsigned long		dropped;	/* entries the holder discarded since then */
+	/* What a client claimed with a notify; the holder */
+	cxl_hmu_notify_fn	notify;
+	void			*notify_arg;
+	struct list_head	binds;		/* the clients bound; the clients lock */
 };
 #define to_cxl_hmu_inst(d) container_of(d, struct cxl_hmu_inst, dev)
 
 void cxl_hmu_pick_epoch(const struct cxl_hmu_inst *inst, u64 target_us, u8 *scale, u16 *mult);
 
 /*
- * The instance library. An instance has one holder at a time, first come,
- * first served.
+ * The instance library, under the client interface of include/cxl/hmu.h.
+ * An instance has one holder at a time, first come, first served. perf
+ * uses this directly, since it holds an instance it has not started.
  *
  * __cxl_hmu_claim() takes the instance for @who with @cfg, or with the
  * configuration staged in sysfs if @cfg is NULL: -EBUSY if it is held or
  * if the range overlaps that of a held sibling and both do not support
  * Address Overlap, -EOPNOTSUPP or -EINVAL if the instance cannot do @cfg.
- * It writes no register. cxl_hmu_release() stops the instance if it runs
- * and gives it up. Both may sleep.
+ * It writes no register. cxl_hmu_release() stops the instance if it runs,
+ * frees a client's notify interrupt and gives it up. Both may sleep.
  *
  * cxl_hmu_check_threshold() is for a holder that wants to know before its
  * first start, where an errno may have nowhere to go, whether the claimed
@@ -255,7 +264,6 @@ void cxl_hmu_pick_epoch(const struct cxl_hmu_inst *inst, u64 target_us, u8 *scal
 
 int __cxl_hmu_claim(struct cxl_hmu_inst *inst, const char *who,
 		    const struct cxl_hmu_config *cfg);
-void cxl_hmu_release(struct cxl_hmu_inst *inst);
 int cxl_hmu_check_threshold(struct cxl_hmu_inst *inst);
 int __cxl_hmu_start(struct cxl_hmu_inst *inst, unsigned int flags);
 void cxl_hmu_stop(struct cxl_hmu_inst *inst);
@@ -270,6 +278,9 @@ void cxl_hmu_stop(struct cxl_hmu_inst *inst);
  * told from what the device lost. Returns the number taken; @flags says
  * what else there is to know.
  *
+ * cxl_hmu_account_dropped() adds to "dropped" the entries a holder drained
+ * into a buffer and then could not use.
+ *
  * cxl_hmu_pending() is true if the instance has an interrupt status bit
  * set, for the handler of a shared vector.
  */
@@ -283,8 +294,14 @@ void cxl_hmu_stop(struct cxl_hmu_inst *inst);
 
 unsigned int cxl_hmu_drain(struct cxl_hmu_inst *inst, u64 *entries,
 			   unsigned int max, unsigned int *flags);
+void cxl_hmu_account_dropped(struct cxl_hmu_inst *inst, unsigned int nr);
 bool cxl_hmu_pending(struct cxl_hmu_inst *inst);
 
+/*
+ * perf is part of this module and not a client: it needs the raw entries,
+ * its own interrupt handler and a claim it can hold stopped. These
+ * three calls are the only ones the core makes to a user of an instance.
+ */
 #if IS_ENABLED(CONFIG_CXL_HMU_PERF)
 int cxl_hmu_perf_init(void);
 void cxl_hmu_perf_exit(void);

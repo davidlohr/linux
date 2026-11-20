@@ -10,6 +10,8 @@
 #include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 
 #include "../hmu.h"
@@ -22,6 +24,7 @@
 #define   CHMU_INST0_CAP0_EPOCH_TYPE_MSK		GENMASK(7, 6)
 #define     CHMU_INST0_CAP0_EPOCH_TYPE_GLOBAL		0
 #define     CHMU_INST0_CAP0_EPOCH_TYPE_PERCNT		1
+#define   CHMU_INST0_CAP0_TRACK_MSK			GENMASK(13, 8)
 #define   CHMU_INST0_CAP0_TRACK_NONTEE_R		BIT(8)
 #define   CHMU_INST0_CAP0_TRACK_NONTEE_W		BIT(9)
 #define   CHMU_INST0_CAP0_TRACK_NONTEE_RW		BIT(10)
@@ -100,9 +103,83 @@
 
 struct cxl_hmu_inst;
 
-/* The driver's state for one register block: its instances */
+enum cxl_hmu_mode { CXL_HMU_MODE_EPOCH, CXL_HMU_MODE_ALWAYS_ON };
+
+/**
+ * struct cxl_hmu_config - what a start programs into an instance
+ * @mode: epoch (a unit is reported when its count crosses the threshold
+ *	within an epoch, with the count) or always-on (a unit is reported once
+ *	its count crosses the threshold, and the count is not valid)
+ * @unit_shift: log2 of the unit size in bytes, one of the supported sizes
+ * @hotness_threshold: count at which a unit is hot; below 1 << counter width
+ * @epoch_scale: epoch length encoding, scale (1: 100 us .. 5: 1 s)
+ * @epoch_mult: epoch length encoding, multiplier
+ * @access_type: the M2S requests counted, in the CFG0 WHAT encoding
+ * @ds_shift: log2 of the down-sampling factor
+ * @randomized_ds: randomize the down-sampling
+ * @range_base: first 256 MiB unit of device physical address to track
+ * @range_num: number of 256 MiB units to track
+ */
+struct cxl_hmu_config {
+	enum cxl_hmu_mode	mode;
+	u8			unit_shift;
+	u32			hotness_threshold;
+	u8			epoch_scale;
+	u16			epoch_mult;
+	u8			access_type;
+	u8			ds_shift;
+	bool			randomized_ds;
+	u32			range_base, range_num;
+};
+
+/**
+ * struct cxl_hmu_caps - what an instance advertises
+ * @epoch: epoch mode supported
+ * @always_on: always-on mode supported
+ * @randomized_ds: randomized down-sampling supported
+ * @irq_overflow: raises an interrupt on hotlist overflow
+ * @irq_level: raises an interrupt when the hotlist fill level is crossed
+ * @addr_overlap: may track a range that overlaps a sibling instance's
+ * @postponed_overflow: outstanding hot units survive a hotlist overflow
+ * @epoch_type: 0 for a global epoch, 1 for a per-counter one
+ * @unit_sizes: bitmap, bit n means a unit of 256 << n bytes
+ * @ds_factors: bitmap, bit n means a down-sampling factor of 1 << n
+ * @access_types: bitmap of the supported CFG0 WHAT encodings, bit n for n + 1
+ * @epoch_min_us: shortest epoch
+ * @epoch_max_us: longest epoch
+ * @hotlist_size: entries in the hotlist
+ * @range_bits: bits in the range bitmap register
+ * @capacity_ranges: the device capacity in 256 MiB units; the bitmap's
+ *	valid length and the bound of any configured range
+ * @msi: the Interrupt Message Number
+ */
+struct cxl_hmu_caps {
+	bool			epoch, always_on, randomized_ds;
+	bool			irq_overflow, irq_level;
+	bool			addr_overlap;
+	bool			postponed_overflow;
+	u8			epoch_type;
+	u32			unit_sizes;
+	u16			ds_factors;
+	u8			access_types;
+	u64			epoch_min_us, epoch_max_us;
+	u16			hotlist_size;
+	u32			range_bits;
+	u32			capacity_ranges;
+	u8			msi;
+};
+
+/*
+ * The driver's state for one register block. The instances are in a table
+ * so a claim can check its range against the siblings that are held.
+ */
 struct cxl_hmu_block {
 	struct cxl_hmu		*hmu;
+	/*
+	 * The owner and the claimed range of every instance of the block.
+	 * Taken before an instance's lock.
+	 */
+	struct mutex		lock;
 	unsigned int		num_inst;
 	struct cxl_hmu_inst	*inst[CXL_HMU_MAX_INST];
 };
@@ -112,11 +189,108 @@ struct cxl_hmu_inst {
 	struct cxl_hmu_block	*block;
 	void __iomem		*base;		/* block base + 0x10 + INSTLEN * index */
 	unsigned int		index;
+	/*
+	 * The vector of the instance's Interrupt Message Number, or -1. The
+	 * core requests nothing on it: a holder that wants the interrupt
+	 * requests it, shared, and starts with CXL_HMU_START_IRQ.
+	 */
+	int			irq;
+	struct cxl_hmu_caps	caps;		/* decoded once at probe */
+	/*
+	 * The instance's registers, enabled and the session snapshot. Raw:
+	 * perf starts, stops and drains with interrupts off.
+	 */
+	raw_spinlock_t		lock;
+	/*
+	 * Who holds the instance; NULL when free. Written under the block
+	 * lock and the instance lock.
+	 */
+	const char		*owner;
+	/*
+	 * What the holder claimed with and a start programs. Written by the
+	 * claim under both locks, fixed until the release.
+	 */
+	struct cxl_hmu_config	live;
+	u8			live_width;	/* the counter width of the last start */
+	bool			enabled;	/* hardware enabled */
+	unsigned long		overflows;	/* hotlist overflows since the last start */
+	unsigned long		dropped;	/* entries the holder discarded since then */
 };
 #define to_cxl_hmu_inst(d) container_of(d, struct cxl_hmu_inst, dev)
 
+void cxl_hmu_pick_epoch(const struct cxl_hmu_inst *inst, u64 target_us, u8 *scale, u16 *mult);
+
+/*
+ * The instance library. An instance has one holder at a time, first come,
+ * first served.
+ *
+ * cxl_hmu_claim() takes the instance for @who with @cfg: -EBUSY if it is
+ * held or if the range overlaps that of a held sibling and both do not
+ * support Address Overlap, -EOPNOTSUPP or -EINVAL if the instance cannot do
+ * @cfg. It writes no register. cxl_hmu_release() stops the instance if it
+ * runs and gives it up. Both may sleep.
+ *
+ * cxl_hmu_check_threshold() is for a holder that wants to know before its
+ * first start, where an errno may have nowhere to go, whether the claimed
+ * threshold fits the counter: it programs the claimed unit size into the
+ * disabled instance, which is what makes the device show the width, and
+ * nothing else. -EINVAL if the threshold does not fit, -EIO if the device
+ * shows no width, -EBUSY if the instance is enabled. A start checks again.
+ *
+ * The rest is for the holder only, which serializes its own calls, and may
+ * be called with interrupts off.
+ *
+ * cxl_hmu_start() programs the claimed configuration, empties the hotlist
+ * and enables: -EBUSY if already enabled, -EINVAL if the threshold does not
+ * fit the counter width the device has for the unit size, -EIO or
+ * -ETIMEDOUT if the device does not follow. With CXL_HMU_START_IRQ every
+ * interrupt the instance has is enabled, for a holder that requested
+ * inst->irq; without it none is, for a holder that polls.
+ * cxl_hmu_stop() disables. What the hotlist still holds can be drained
+ * until the next start, which discards it.
+ */
+#define CXL_HMU_START_IRQ	BIT(0)
+
+int cxl_hmu_claim(struct cxl_hmu_inst *inst, const char *who,
+		  const struct cxl_hmu_config *cfg);
+void cxl_hmu_release(struct cxl_hmu_inst *inst);
+int cxl_hmu_check_threshold(struct cxl_hmu_inst *inst);
+int cxl_hmu_start(struct cxl_hmu_inst *inst, unsigned int flags);
+void cxl_hmu_stop(struct cxl_hmu_inst *inst);
+
+/*
+ * cxl_hmu_drain() copies at most @max entries from the head of the hotlist
+ * to @entries, advances the head by as many and acknowledges the status
+ * bits it read. An entry is the unit number in the upper bits and the count
+ * in the low inst->live_width bits. With @entries NULL the entries are
+ * discarded instead, for a holder that has nowhere to put them, and counted
+ * in the instance's "dropped", so that what the kernel threw away can be
+ * told from what the device lost. Returns the number taken; @flags says
+ * what else there is to know.
+ *
+ * cxl_hmu_pending() is true if the instance has an interrupt status bit
+ * set, for the handler of a shared vector.
+ */
+/*
+ * The hotlist overflowed and hot units were lost for it. Not set for an
+ * instance that postpones the units it could not insert: its overflow
+ * delays them and loses none. Either kind is counted in "overflows".
+ */
+#define CXL_HMU_DRAIN_LOST	BIT(0)
+#define CXL_HMU_DRAIN_MORE	BIT(1)	/* entries are left in the hotlist */
+
+unsigned int cxl_hmu_drain(struct cxl_hmu_inst *inst, u64 *entries,
+			   unsigned int max, unsigned int *flags);
+bool cxl_hmu_pending(struct cxl_hmu_inst *inst);
+
+#if IS_ENABLED(CONFIG_CXL_HMU_PERF)
 int cxl_hmu_perf_init(void);
 void cxl_hmu_perf_exit(void);
 int cxl_hmu_perf_probe_inst(struct cxl_hmu_inst *inst);
+#else
+static inline int cxl_hmu_perf_init(void) { return 0; }
+static inline void cxl_hmu_perf_exit(void) { }
+static inline int cxl_hmu_perf_probe_inst(struct cxl_hmu_inst *inst) { return 0; }
+#endif
 
 #endif

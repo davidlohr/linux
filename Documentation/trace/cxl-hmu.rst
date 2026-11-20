@@ -47,11 +47,43 @@ budgets.
 Operation and configuration
 ===========================
 
-An example command line is::
+Each CHMUI is a device under /sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z.
+The PMU exists for every instance with the fill-threshold interrupt and a
+vector to deliver it. An instance whose Interrupt Message Number has no
+vector is still registered, with the warning "no vector for interrupt
+message number N (-errno): no interrupt, no PMU", and so is one whose vector
+the driver could not request ("interrupt N not available (-errno): no PMU").
+
+An instance has one user at a time. An open perf event holds the instance
+from perf_event_open() until the event is closed, whether or not it is
+enabled, so a second event on the same PMU, or an event on an instance that
+another user holds, fails to open with -EBUSY. So does an event whose range
+overlaps that of a held sibling instance when the instances do not support
+Address Overlap. Opening an event needs CAP_PERFMON, since the hotlist
+carries raw device physical addresses.
+
+The device reports the width of its counter only once the unit size is
+programmed, so opening an event programs the event's unit size into the
+instance, which it holds by then and which is not enabled. A
+hotness_threshold that does not fit the counter fails the open with -EINVAL,
+and a device that reports no usable width fails it with -EIO.
+
+An event that is open can still fail to start, when the device does not
+follow: it does not come out of a counter reset or an enable in time, or
+shows no counter width. The kernel logs "start failed (-errno)" once, and
+the event then stays open and records nothing until it is closed. The
+device is not tried again for it; open a new event.
+
+An example command line is below. The event counts for the whole device,
+not for a task or a cgroup: it is opened system-wide, as with -a. A
+per-task event (a command without -a) fails with -EOPNOTSUPP and a cgroup's
+event (-G) with -EINVAL. The PMU is served by one CPU, the one in its
+"cpumask" attribute, which is what perf opens the event on; the kernel puts
+the event there whatever CPU it was asked for::
 
   $perf record -a  -e cxl_hmu_mem0.0.0/epoch_type=0,access_type=6,\
   hotness_threshold=1024,epoch_multiplier=4,epoch_scale=4,range_base=0,\
-  range_size=1024,randomized_downsampling=0,hotness_granual=12/ -- sleep 10
+  range_size=4,randomized_downsampling=0,hotness_granual=12/ -- sleep 10
 
   $perf report --dump-raw-trace
 
@@ -74,6 +106,35 @@ to provide sufficient information to interpret the entries::
 The least significant counter_width bits (here 16, hex 10) are the counter
 value, all higher bits are the unit index.  Multiply by the unit size
 to get a Device Physical Address.
+
+The AUX data is a sequence of records, each a 16 byte header followed by
+8 byte entries: bits 15:0 of the first header word are the number of
+entries in the record, bits 23:16 the counter width, and the second word is
+the magic 0xdeadbeef. Each hotlist the driver drains, on an interrupt or
+when the event stops, is written as one record in its own AUX output. A
+decoder reads record by record, as perf report does above, rather than
+assuming one header per AUX output.
+
+The two ways of losing data have a flag each. A hotlist overflow reported
+by a device that loses hot units for it marks the AUX record as partial
+(PERF_AUX_FLAG_PARTIAL): what was read is sound, but units that became hot
+while the list was full are missing. A device that supports Postponed on
+Overflow inserts those units later, loses none, and its records are not
+marked.
+
+The free space of the AUX buffer is looked up at every delivery, and only
+what fits is taken from the device. If entries are left behind for want of
+room the record is marked truncated (PERF_AUX_FLAG_TRUNCATED) and perf
+disables the event, as for any AUX PMU whose reader fell behind. Stopping
+the event writes what the reader has made room for by then; the rest is
+discarded. A larger -m,,N buffer or a longer epoch keeps up.
+
+A parameter left at 0 takes a default: the smallest unit size and down
+sampling factor the device supports, its shortest epoch when epoch_scale
+and epoch_multiplier are both 0 (one of them alone at 0 is -EINVAL), and
+the whole device as the range. access_type has no default and must be one
+the device supports. The bits of config that none of the parameters covers
+must be 0, else the event fails to open with -EINVAL.
 
 The parameters are as follows:
 
@@ -143,6 +204,7 @@ hotness_granual
 
 Unit size at which tracking is performed.  Must be at least 256 bytes but
 hardware may only support some sizes. Expressed as a power of 2. e.g. 12 = 4kiB.
+0 selects the smallest size the device supports.
 
 hotness_threshold
 -----------------
@@ -177,7 +239,9 @@ bitmap that controls what Device Physical Address spaces is tracked. Each bit
 represents 256MiB of DPA space.
 
 This interface provides a simple base and size in units of 256MiB to configure
-this bitmap. All bits in the specified range will be set.
+this bitmap. The bits in the specified range are set and every other bit that
+covers the device's capacity is cleared; base + size may not exceed that
+capacity. A size of 0 selects the whole device.
 
 downsampling_factor
 -------------------
@@ -185,8 +249,8 @@ downsampling_factor
 Hardware may be incapable of counting accesses at full speed or it may be
 desirable to count over a longer period during which the counters would
 overflow.  This control allows selection of a down sampling factor expressed
-as a power of 2 between 1 and 32768.  Default is minimum supported downsampling
-factor.
+as a power of 2 between 1 and 32768, given as the exponent (0 for 1, 1 for 2,
+and so on).  Default is minimum supported downsampling factor.
 
 randomized_downsampling
 -----------------------
@@ -194,3 +258,15 @@ randomized_downsampling
 To avoid problems with downsampling when accesses are periodic this option
 allows for an implementation defined randomization of the sampling interval,
 whilst remaining close to the specified downsampling_factor.
+
+Trace events
+============
+
+The cxl_hmu trace system has one event, which starts with the name of the
+instance device.
+
+cxl_hmu_hotlist
+  One read of the hotlist, by the PMU or by an in-kernel user, including a
+  read that found it empty: nr is the number of entries taken,
+  counter_width the counter width of the session, and overflowed is 1 if the
+  device had reported a hotlist overflow since the previous read.

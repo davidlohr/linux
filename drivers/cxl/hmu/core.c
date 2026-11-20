@@ -15,15 +15,18 @@
  * an instance from event_init to event->destroy, an in-kernel user from
  * its start to its stop. There is no reservation.
  *
- * Configuration comes with the claim: perf's is decoded from the event's
- * attributes. A claim copies its configuration to inst->live and a start
- * programs that copy.
+ * Configuration has one writer per holder. perf's is decoded from the
+ * event's attributes and handed to the claim. An in-kernel holder's is the
+ * one staged in sysfs, which only the sysfs stores write. A claim copies
+ * its configuration to inst->live and a start programs that copy, so no
+ * session changes what the next in-kernel holder starts with.
  *
  * Locking, outermost first:
  *
- *   block->lock (mutex)  the owner and the claimed range of every instance
- *                        of the block, so the overlap check of a claim
- *                        sees a stable set of siblings.
+ *   block->lock (mutex)  the owner, the staged configuration and the
+ *                        claimed range of every instance of the block, so
+ *                        the overlap check of a claim sees a stable set of
+ *                        siblings.
  *   inst->lock (raw)     the registers of the instance, enabled and the
  *                        counter width of the session. Raw because perf
  *                        starts, stops and drains with interrupts off, on
@@ -36,10 +39,13 @@
 #include <linux/bitfield.h>
 #include <linux/device.h>
 #include <linux/iopoll.h>
+#include <linux/kstrtox.h>
+#include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
 
 #include "../cxl.h"
 #include "../cxlmem.h"
@@ -340,6 +346,8 @@ int cxl_hmu_claim(struct cxl_hmu_inst *inst, const char *who,
 	guard(mutex)(&inst->block->lock);
 	if (inst->owner)
 		return -EBUSY;
+	if (!cfg)
+		cfg = &inst->config;
 	rc = cxl_hmu_validate_config(inst, cfg);
 	if (rc)
 		return rc;
@@ -469,6 +477,232 @@ bool cxl_hmu_pending(struct cxl_hmu_inst *inst)
 		(CHMU_INST0_STATUS_OVRFLW | CHMU_INST0_STATUS_FILLTHRESH);
 }
 
+/* Sysfs */
+
+/* Index n is the CFG0 WHAT encoding n + 1 */
+static const char * const cxl_hmu_access_names[] = {
+	"nontee_r", "nontee_w", "nontee_rw", "r", "w", "rw",
+};
+
+static ssize_t owner_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	struct cxl_hmu_inst *inst = to_cxl_hmu_inst(dev);
+
+	guard(mutex)(&inst->block->lock);
+	return sysfs_emit(buf, "%s\n", inst->owner ?: "none");
+}
+static DEVICE_ATTR_RO(owner);
+
+/*
+ * The staged configuration: what an in-kernel holder claims with. Only
+ * these stores write it. A store is checked against the capabilities and
+ * takes effect at the next claim; a holder keeps what it claimed with.
+ *
+ * Five files, the ones an in-kernel holder has a reason to be told: how
+ * large a unit is and how many accesses make it hot, how often the device
+ * reports, and which part of the device to watch. The mode, the access
+ * type and the down-sampling stay at cxl_hmu_default_config(). None of the
+ * five shares a name with a perf format attribute unless it also shares
+ * its meaning and its unit.
+ */
+#define CXL_HMU_CFG_ATTR(_name, _fmt, _val, _parse)				\
+static ssize_t _name##_show(struct device *dev, struct device_attribute *a,	\
+			    char *buf)						\
+{										\
+	struct cxl_hmu_inst *inst = to_cxl_hmu_inst(dev);			\
+										\
+	guard(mutex)(&inst->block->lock);					\
+	return sysfs_emit(buf, _fmt "\n", _val);				\
+}										\
+static ssize_t _name##_store(struct device *dev, struct device_attribute *a,	\
+			     const char *buf, size_t len)			\
+{										\
+	struct cxl_hmu_inst *inst = to_cxl_hmu_inst(dev);			\
+	struct cxl_hmu_config cfg;						\
+	int rc;									\
+										\
+	guard(mutex)(&inst->block->lock);					\
+	cfg = inst->config;							\
+	rc = _parse(inst, &cfg, buf);						\
+	if (rc)									\
+		return rc;							\
+	rc = cxl_hmu_validate_config(inst, &cfg);				\
+	if (rc)									\
+		return rc;							\
+	inst->config = cfg;							\
+	return len;								\
+}										\
+static DEVICE_ATTR_RW(_name)
+
+static int parse_unit_size(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg, const char *buf)
+{
+	unsigned long v;
+
+	if (kstrtoul(buf, 0, &v) || !is_power_of_2(v) || v < 256 || v >= BIT_ULL(40))
+		return -EINVAL;
+	cfg->unit_shift = ilog2(v);
+	return 0;
+}
+CXL_HMU_CFG_ATTR(unit_size, "%lu", 1UL << inst->config.unit_shift, parse_unit_size);
+
+/* Its bound, the counter width, is known at a start, which is where it is checked */
+static int parse_hotness_threshold(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg,
+				   const char *buf)
+{
+	return kstrtou32(buf, 0, &cfg->hotness_threshold) ? -EINVAL : 0;
+}
+CXL_HMU_CFG_ATTR(hotness_threshold, "%u", inst->config.hotness_threshold, parse_hotness_threshold);
+
+/* Microseconds: the finest scale of Table 8-192 is 100 us */
+static int parse_epoch_us(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg, const char *buf)
+{
+	u64 v;
+
+	if (kstrtou64(buf, 0, &v) || !v)
+		return -EINVAL;
+	cxl_hmu_pick_epoch(inst, v, &cfg->epoch_scale, &cfg->epoch_mult);
+	return cfg->epoch_mult ? 0 : -ERANGE;
+}
+CXL_HMU_CFG_ATTR(epoch_us, "%llu",
+		 cxl_hmu_epoch_us(inst->config.epoch_scale, inst->config.epoch_mult),
+		 parse_epoch_us);
+
+static int parse_range_base(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg, const char *buf)
+{
+	return kstrtou32(buf, 0, &cfg->range_base);
+}
+CXL_HMU_CFG_ATTR(range_base, "%u", inst->config.range_base, parse_range_base);
+
+static int parse_range_size(struct cxl_hmu_inst *inst, struct cxl_hmu_config *cfg, const char *buf)
+{
+	return kstrtou32(buf, 0, &cfg->range_num);
+}
+CXL_HMU_CFG_ATTR(range_size, "%u", inst->config.range_num, parse_range_size);
+
+#define CXL_HMU_RO_ATTR(_name, _fmt, _val)					\
+static ssize_t _name##_show(struct device *dev, struct device_attribute *a,	\
+			    char *buf)						\
+{										\
+	struct cxl_hmu_inst *inst = to_cxl_hmu_inst(dev);			\
+										\
+	return sysfs_emit(buf, _fmt "\n", _val);				\
+}										\
+static DEVICE_ATTR_RO(_name)
+
+static ssize_t supported_modes_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+
+	return sysfs_emit(buf, "%s%s%s\n", c->epoch ? "epoch" : "",
+			  c->epoch && c->always_on ? " " : "",
+			  c->always_on ? "always_on" : "");
+}
+static DEVICE_ATTR_RO(supported_modes);
+
+static ssize_t supported_unit_sizes_show(struct device *dev, struct device_attribute *a,
+					 char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+	unsigned long bits = c->unit_sizes;
+	ssize_t len = 0;
+	unsigned int n;
+
+	for_each_set_bit(n, &bits, 32)
+		len += sysfs_emit_at(buf, len, "%s%lu", len ? " " : "", 256UL << n);
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+static DEVICE_ATTR_RO(supported_unit_sizes);
+
+static ssize_t supported_access_types_show(struct device *dev, struct device_attribute *a,
+					   char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+	unsigned long bits = c->access_types;
+	ssize_t len = 0;
+	unsigned int n;
+
+	for_each_set_bit(n, &bits, ARRAY_SIZE(cxl_hmu_access_names))
+		len += sysfs_emit_at(buf, len, "%s%s", len ? " " : "", cxl_hmu_access_names[n]);
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+static DEVICE_ATTR_RO(supported_access_types);
+
+static ssize_t supported_downsampling_show(struct device *dev, struct device_attribute *a,
+					   char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+	unsigned long bits = c->ds_factors;
+	ssize_t len = 0;
+	unsigned int n;
+
+	for_each_set_bit(n, &bits, 16)
+		len += sysfs_emit_at(buf, len, "%s%u", len ? " " : "", 1U << n);
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+static DEVICE_ATTR_RO(supported_downsampling);
+
+static ssize_t interrupts_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+
+	return sysfs_emit(buf, "%s%s%s\n", c->irq_overflow ? "overflow" : "",
+			  c->irq_overflow && c->irq_level ? " " : "",
+			  c->irq_level ? "level" : "");
+}
+static DEVICE_ATTR_RO(interrupts);
+
+static ssize_t epoch_range_us_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	const struct cxl_hmu_caps *c = &to_cxl_hmu_inst(dev)->caps;
+
+	return sysfs_emit(buf, "%llu %llu\n", c->epoch_min_us, c->epoch_max_us);
+}
+static DEVICE_ATTR_RO(epoch_range_us);
+
+CXL_HMU_RO_ATTR(hotlist_size, "%u", inst->caps.hotlist_size);
+CXL_HMU_RO_ATTR(capacity_ranges, "%u", inst->caps.capacity_ranges);
+/* Not "epoch_type": that is perf's name for epoch against always-on */
+CXL_HMU_RO_ATTR(epoch_scope, "%s", inst->caps.epoch_type == CHMU_INST0_CAP0_EPOCH_TYPE_PERCNT ?
+		"per_counter" : "global");
+CXL_HMU_RO_ATTR(address_overlap, "%d", inst->caps.addr_overlap);
+CXL_HMU_RO_ATTR(postponed_overflow, "%d", inst->caps.postponed_overflow);
+CXL_HMU_RO_ATTR(active, "%d", READ_ONCE(inst->enabled));
+CXL_HMU_RO_ATTR(overflows, "%lu", READ_ONCE(inst->overflows));
+CXL_HMU_RO_ATTR(dropped, "%lu", READ_ONCE(inst->dropped));
+
+static struct attribute *cxl_hmu_inst_attrs[] = {
+	&dev_attr_owner.attr,
+	&dev_attr_unit_size.attr,
+	&dev_attr_hotness_threshold.attr,
+	&dev_attr_epoch_us.attr,
+	&dev_attr_range_base.attr,
+	&dev_attr_range_size.attr,
+	&dev_attr_supported_modes.attr,
+	&dev_attr_supported_unit_sizes.attr,
+	&dev_attr_supported_access_types.attr,
+	&dev_attr_supported_downsampling.attr,
+	&dev_attr_epoch_range_us.attr,
+	&dev_attr_epoch_scope.attr,
+	&dev_attr_hotlist_size.attr,
+	&dev_attr_capacity_ranges.attr,
+	&dev_attr_address_overlap.attr,
+	&dev_attr_postponed_overflow.attr,
+	&dev_attr_interrupts.attr,
+	&dev_attr_active.attr,
+	&dev_attr_overflows.attr,
+	&dev_attr_dropped.attr,
+	NULL,
+};
+
+static const struct attribute_group cxl_hmu_inst_group = {
+	.attrs = cxl_hmu_inst_attrs,
+};
+
+static const struct attribute_group *cxl_hmu_inst_groups[] = {
+	&cxl_hmu_inst_group,
+	NULL,
+};
+
 /* Instance devices */
 
 static void cxl_hmu_inst_release(struct device *dev)
@@ -479,7 +713,33 @@ static void cxl_hmu_inst_release(struct device *dev)
 static const struct device_type cxl_hmu_inst_type = {
 	.name = "cxl_hmu_instance",
 	.release = cxl_hmu_inst_release,
+	.groups = cxl_hmu_inst_groups,
 };
+
+/* What an in-kernel holder starts with unless sysfs stages otherwise */
+static void cxl_hmu_default_config(struct cxl_hmu_inst *inst)
+{
+	const struct cxl_hmu_caps *c = &inst->caps;
+	struct cxl_hmu_config *cfg = &inst->config;
+
+	cfg->mode = c->epoch ? CXL_HMU_MODE_EPOCH : CXL_HMU_MODE_ALWAYS_ON;
+	/* 4 KiB, else the smallest unit */
+	if (c->unit_sizes)
+		cfg->unit_shift = c->unit_sizes & BIT(4) ? 12 : 8 + __ffs(c->unit_sizes);
+	cfg->hotness_threshold = 1;
+	cxl_hmu_pick_epoch(inst, 1000 * USEC_PER_MSEC, &cfg->epoch_scale, &cfg->epoch_mult);
+	/* Reads and writes, TEE or not; else non-TEE reads and writes; else what it offers */
+	if (c->access_types & BIT(CHMU_INST0_CFG0_WHAT_RW - 1))
+		cfg->access_type = CHMU_INST0_CFG0_WHAT_RW;
+	else if (c->access_types & BIT(CHMU_INST0_CFG0_WHAT_NONTEE_RW - 1))
+		cfg->access_type = CHMU_INST0_CFG0_WHAT_NONTEE_RW;
+	else if (c->access_types)
+		cfg->access_type = __ffs(c->access_types) + 1;
+	cfg->ds_shift = c->ds_factors && !(c->ds_factors & BIT(0)) ? __ffs(c->ds_factors) : 0;
+	cfg->randomized_ds = false;
+	cfg->range_base = 0;
+	cfg->range_num = c->capacity_ranges;
+}
 
 /*
  * Unbind. The actions that unregister the instance's PMU and free the
@@ -518,6 +778,7 @@ static int cxl_hmu_inst_add(struct cxl_hmu_block *block, unsigned int index,
 	inst->irq = -1;
 	raw_spin_lock_init(&inst->lock);
 	cxl_hmu_decode_caps(inst);
+	cxl_hmu_default_config(inst);
 
 	/* Whatever left it enabled, the configuration is ours to write now */
 	if (FIELD_GET(CHMU_INST0_STATUS_ENABLED, readq(inst->base + CHMU_INST0_STATUS_REG)) &&
@@ -531,7 +792,7 @@ static int cxl_hmu_inst_add(struct cxl_hmu_block *block, unsigned int index,
 	rc = dev_set_name(&inst->dev, "%s.%u", dev_name(dev), index);
 	if (rc)
 		goto err;
-	/* Under the lock: a claim checks the siblings in the table */
+	/* In the table before its attributes can be written: a claim checks siblings */
 	scoped_guard(mutex, &block->lock) {
 		block->inst[index] = inst;
 		block->num_inst = max(block->num_inst, index + 1);

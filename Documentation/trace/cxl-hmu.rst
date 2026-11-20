@@ -54,13 +54,16 @@ vector is still registered, with the warning "no vector for interrupt
 message number N (-errno): no interrupt, no PMU", and so is one whose vector
 the driver could not request ("interrupt N not available (-errno): no PMU").
 
-An instance has one user at a time. An open perf event holds the instance
-from perf_event_open() until the event is closed, whether or not it is
-enabled, so a second event on the same PMU, or an event on an instance that
-another user holds, fails to open with -EBUSY. So does an event whose range
-overlaps that of a held sibling instance when the instances do not support
-Address Overlap. Opening an event needs CAP_PERFMON, since the hotlist
-carries raw device physical addresses.
+An instance has one user at a time, shown by its "owner" attribute. An open
+perf event holds the instance from perf_event_open() until the event is
+closed, whether or not it is enabled, so a second event on the same PMU, or
+an event on an instance that another user holds, fails to open with -EBUSY.
+So does an event whose range overlaps that of a held sibling instance when
+the instances do not support Address Overlap. Opening an event needs
+CAP_PERFMON, since the hotlist carries raw device physical addresses. See
+Documentation/ABI/testing/sysfs-bus-cxl-hmu for the per-instance
+attributes; the configuration files there are for in-kernel users and have
+no effect on an event, which is configured by the parameters below alone.
 
 The device reports the width of its counter only once the unit size is
 programmed, so opening an event programs the event's unit size into the
@@ -118,16 +121,18 @@ assuming one header per AUX output.
 The two ways of losing data have a flag each. A hotlist overflow reported
 by a device that loses hot units for it marks the AUX record as partial
 (PERF_AUX_FLAG_PARTIAL): what was read is sound, but units that became hot
-while the list was full are missing. A device that supports Postponed on
-Overflow inserts those units later, loses none, and its records are not
-marked.
+while the list was full are missing. A device whose postponed_overflow
+attribute is 1 inserts those units later, loses none, and its records are
+not marked. The instance's "overflows" attribute counts either kind.
 
 The free space of the AUX buffer is looked up at every delivery, and only
 what fits is taken from the device. If entries are left behind for want of
 room the record is marked truncated (PERF_AUX_FLAG_TRUNCATED) and perf
 disables the event, as for any AUX PMU whose reader fell behind. Stopping
 the event writes what the reader has made room for by then; the rest is
-discarded. A larger -m,,N buffer or a longer epoch keeps up.
+discarded and counted in the instance's "dropped" attribute, so a loss in
+the kernel can be told from one in the device. A larger -m,,N buffer or a
+longer epoch keeps up.
 
 A parameter left at 0 takes a default: the smallest unit size and down
 sampling factor the device supports, its shortest epoch when epoch_scale

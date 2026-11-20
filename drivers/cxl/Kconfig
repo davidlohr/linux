@@ -248,9 +248,9 @@ config CXL_HMU
 	help
 	  Driver for CXL Hot-range Monitoring Units (CXL r4.0 section 8.2.8),
 	  which report the units of device memory accessed more than a
-	  threshold number of times. Each instance of a unit is a device,
-	  held by one user at a time: the perf PMU below, while an event is
-	  open on it.
+	  threshold number of times. Each instance of a unit is a device with
+	  its capabilities in sysfs, held by one user at a time: the perf
+	  PMU below, while an event is open on it.
 
 	  If unsure say N.
 

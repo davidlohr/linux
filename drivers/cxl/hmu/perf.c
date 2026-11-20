@@ -5,8 +5,8 @@
  * Based on hisi_ptt.c (Author Yicong Yang <yangyicong@hisilicon.com>)
  * Copyright (c) 2022-2024 HiSilicon Technologies Co., Ltd.
  *
- * TODO:
- * - Add capabilities attributes to help userspace know what can be set.
+ * What an instance can be asked for is in the attributes of its device,
+ * see Documentation/ABI/testing/sysfs-bus-cxl-hmu.
  */
 #include <linux/dev_printk.h>
 #include <linux/perf_event.h>

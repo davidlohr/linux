@@ -1,0 +1,153 @@
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/
+Date:		October, 2026
+KernelVersion:	v7.5
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		One directory per instance of a CXL Hot-range Monitoring Unit
+		(CHMU, CXL r4.0 section 8.2.8): block Y of memdev X, instance Z.
+		An instance counts accesses to units of the device's memory and
+		reports the units whose count crossed a threshold in a hotlist.
+		It has one user at a time, whichever takes it first: see
+		owner.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/owner
+Date:		November, 2026
+KernelVersion:	v7.5
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) Who holds the instance: "perf" while a perf event is open
+		on the instance's PMU (CONFIG_CXL_HMU_PERF), from
+		perf_event_open() until the event is closed, whether or not
+		it is enabled; else "none". There is nothing to write: an
+		instance is taken by using it, first come, first served, and
+		whoever comes second gets -EBUSY from perf_event_open(). An
+		instance cannot be reserved for a user that is not using it.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/unit_size
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/hotness_threshold
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/epoch_us
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/range_base
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/range_size
+Date:		November, 2026
+KernelVersion:	v7.5
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RW) The configuration an in-kernel user starts the instance
+		with. Only a write to these files changes them. A
+		perf event is configured by its own attributes and neither
+		reads nor changes them. A store takes effect at the next
+		start by an in-kernel user; one that is running keeps what it
+		started with. Each value is checked against the instance's
+		capabilities at store time: a value the instance does not
+		support is refused with -EOPNOTSUPP, an out-of-range one with
+		-EINVAL or -ERANGE, and a refused store leaves the old value.
+		Where a file has the name of a parameter of the instance's
+		perf PMU (hotness_threshold, range_base, range_size) it has
+		the same meaning and unit.
+
+		unit_size: bytes per counted unit, a power of two from
+		supported_unit_sizes. The default is 4096 if supported, else
+		the smallest. (The PMU's hotness_granual is its log2.)
+
+		hotness_threshold: the count at which a unit is reported,
+		default 1. It must be below 1 << (the counter width), which
+		the device only reports once the unit size is programmed, so
+		a value that is too large is refused with -EINVAL by the
+		start, not by the store, and the kernel log names the width.
+
+		epoch_us: the epoch length in microseconds, clamped to
+		epoch_range_us and rounded down to what the device encodes
+		(a multiplier of 1 to 4095 on a scale of 100 us, 1 ms, 10 ms,
+		100 ms or 1 s); reads back the effective value. The default
+		is one second. 0 is -EINVAL; a length the device cannot
+		encode is -ERANGE.
+
+		range_base, range_size: the device physical address range
+		counted, in units of 256 MiB; base + size must not exceed
+		capacity_ranges, size must not be 0 and the range must hold at
+		least one unit. The default is the whole device.
+
+		What has no file is fixed for an in-kernel user: epoch mode
+		if the instance supports it, else always-on; reads and writes
+		of any kind if supported, else non-TEE reads and writes, else
+		the first access type the instance offers; the smallest
+		down-sampling factor, not randomized.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/supported_modes
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/supported_unit_sizes
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/supported_access_types
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/supported_downsampling
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/epoch_range_us
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/epoch_scope
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/hotlist_size
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/capacity_ranges
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/address_overlap
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/postponed_overflow
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/interrupts
+Date:		November, 2026
+KernelVersion:	v7.5
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) What the instance advertises: what a perf event or the
+		files above may ask of it, and how to read what it reports.
+
+		supported_modes: "epoch" (a unit is reported when its count
+		crosses the threshold within an epoch, and the count is
+		reported with it) and/or "always_on" (a unit is reported once
+		its count crosses the threshold; the reported count is not
+		valid), space separated. They are the PMU's epoch_type 0 and
+		1.
+
+		supported_unit_sizes: in bytes, space separated.
+
+		supported_access_types: the requests that can be counted,
+		space separated: "nontee_r", "nontee_w", "nontee_rw", "r",
+		"w", "rw", which are the PMU's access_type 1 to 6.
+
+		supported_downsampling: the factors, space separated; the
+		PMU's downsampling_factor is the log2 of one of them.
+
+		epoch_range_us: "min max", the shortest and the longest epoch
+		in microseconds.
+
+		epoch_scope: "global" if every counter shares one epoch,
+		"per_counter" if each has its own.
+
+		hotlist_size: in entries.
+
+		capacity_ranges: the device capacity in 256 MiB units, the
+		bound of range_base + range_size.
+
+		address_overlap: 1 if this instance may count a range that
+		overlaps a sibling instance's. Taking an instance whose range
+		overlaps that of a sibling that is held, running or not,
+		fails with -EBUSY unless both instances have it.
+
+		postponed_overflow: 1 if hot units survive a hotlist overflow,
+		so that an overflow delays them and loses none.
+
+		interrupts: "overflow" and/or "level", space separated, or
+		empty. The PMU exists only for an instance with "level" and
+		a usable interrupt vector; an in-kernel user polls and needs
+		neither.
+
+
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/active
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/overflows
+What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/dropped
+Date:		November, 2026
+KernelVersion:	v7.5
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) State. active is 1 while the instance is enabled; an
+		instance can be held (see owner) without being enabled, as by
+		a perf event that is open but disabled. overflows and dropped
+		are the two ways a hot unit is lost, since the last start.
+		overflows counts the hotlist overflows the device reported:
+		the list was full when a unit became hot, and unless
+		postponed_overflow is 1 that unit is gone. dropped counts the
+		hotlist entries the kernel read and threw away: for a perf
+		event, those its AUX buffer had no room for when it stopped.

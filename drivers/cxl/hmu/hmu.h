@@ -176,8 +176,8 @@ struct cxl_hmu_caps {
 struct cxl_hmu_block {
 	struct cxl_hmu		*hmu;
 	/*
-	 * The owner and the claimed range of every instance of the block.
-	 * Taken before an instance's lock.
+	 * The owner, the staged configuration and the claimed range of every
+	 * instance of the block. Taken before an instance's lock.
 	 */
 	struct mutex		lock;
 	unsigned int		num_inst;
@@ -202,10 +202,11 @@ struct cxl_hmu_inst {
 	 */
 	raw_spinlock_t		lock;
 	/*
-	 * Who holds the instance; NULL when free. Written under the block
-	 * lock and the instance lock.
+	 * Who holds the instance, as the "owner" attribute shows it; NULL
+	 * when free. Written under the block lock and the instance lock.
 	 */
 	const char		*owner;
+	struct cxl_hmu_config	config;		/* staged in sysfs; the block lock */
 	/*
 	 * What the holder claimed with and a start programs. Written by the
 	 * claim under both locks, fixed until the release.
@@ -224,11 +225,12 @@ void cxl_hmu_pick_epoch(const struct cxl_hmu_inst *inst, u64 target_us, u8 *scal
  * The instance library. An instance has one holder at a time, first come,
  * first served.
  *
- * __cxl_hmu_claim() takes the instance for @who with @cfg: -EBUSY if it is
- * held or if the range overlaps that of a held sibling and both do not
- * support Address Overlap, -EOPNOTSUPP or -EINVAL if the instance cannot do
- * @cfg. It writes no register. cxl_hmu_release() stops the instance if it
- * runs and gives it up. Both may sleep.
+ * __cxl_hmu_claim() takes the instance for @who with @cfg, or with the
+ * configuration staged in sysfs if @cfg is NULL: -EBUSY if it is held or
+ * if the range overlaps that of a held sibling and both do not support
+ * Address Overlap, -EOPNOTSUPP or -EINVAL if the instance cannot do @cfg.
+ * It writes no register. cxl_hmu_release() stops the instance if it runs
+ * and gives it up. Both may sleep.
  *
  * cxl_hmu_check_threshold() is for a holder that wants to know before its
  * first start, where an errno may have nowhere to go, whether the claimed

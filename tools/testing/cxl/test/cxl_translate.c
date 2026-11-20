@@ -10,6 +10,9 @@
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/acpi.h>
+#include <linux/random.h>
+#include <linux/range.h>
+#include <linux/sizes.h>
 #include <cxlmem.h>
 #include <cxl.h>
 
@@ -361,6 +364,125 @@ static int test_cxl_validate_translation_params(void)
 	return 0;
 }
 
+struct test_decode {
+	struct cxl_dpa_decode d;
+	int pos;
+	u8 eiw;
+	u16 eig;
+};
+
+static u64 test_decode_to_hpa(const struct cxl_dpa_decode *d, u64 dpa)
+{
+	const struct test_decode *t = container_of(d, struct test_decode, d);
+
+	return cxl_calculate_hpa_offset(dpa - d->base, t->pos, t->eiw, t->eig);
+}
+
+/*
+ * Check one batch of HPA ranges against a translation of every 256 byte
+ * piece of the DPA range it covers: each piece's page must be in a
+ * range, the ranges must hold no other page, and they must ascend
+ * without touching.
+ */
+static int check_ranges(const struct test_decode *t, u64 dpa, u64 len,
+			const struct range *out, unsigned int nr)
+{
+	u64 pos = dpa, end = dpa + len, last_page = ULLONG_MAX;
+	u64 want = 0, have = 0;
+	unsigned int i = 0;
+
+	for (i = 0; i < nr; i++) {
+		if (!IS_ALIGNED(out[i].start, PAGE_SIZE) ||
+		    !IS_ALIGNED(out[i].end + 1, PAGE_SIZE) ||
+		    out[i].end < out[i].start)
+			return -EINVAL;
+		if (i && out[i].start <= out[i - 1].end + 1)
+			return -EINVAL;
+		have += range_len(&out[i]) >> PAGE_SHIFT;
+	}
+
+	i = 0;
+	while (pos < end) {
+		u64 hpa = test_decode_to_hpa(&t->d, pos);
+		u64 page = hpa >> PAGE_SHIFT;
+
+		if (hpa == ULLONG_MAX)
+			return -EINVAL;
+		if (page != last_page) {
+			while (i < nr && out[i].end < hpa)
+				i++;
+			if (i == nr || out[i].start > hpa)
+				return -ENOENT;
+			last_page = page;
+			want++;
+		}
+		pos = min(end, ALIGN(pos + 1, 256));
+	}
+
+	return want == have ? 0 : -E2BIG;
+}
+
+/*
+ * cxl_dpa_decode_ranges() against a piece by piece translation, with a
+ * range array small enough that most ranges take several calls.
+ */
+static int test_decode_ranges(void)
+{
+	u8 valid_eiws[] = { 0, 1, 2, 3, 4, 8, 9, 10 };
+	u16 valid_eigs[] = { 0, 1, 2, 3, 4, 5, 6 };
+	int iterations = 1000;
+	struct range out[8];
+	int failures = 0;
+	int i, ways;
+
+	for (i = 0; i < iterations; i++) {
+		struct test_decode t = {
+			.d.to_hpa = test_decode_to_hpa,
+			.d.base = (u64)get_random_u32_below(16) * SZ_256M,
+			.eiw = valid_eiws[get_random_u32() % ARRAY_SIZE(valid_eiws)],
+			.eig = valid_eigs[get_random_u32() % ARRAY_SIZE(valid_eigs)],
+		};
+		u64 dpa = t.d.base + get_random_u32_below(SZ_1G);
+		u64 len = 1 + get_random_u32_below(SZ_2M);
+		u64 done, pos = dpa;
+		unsigned int nr;
+		int rc = 0;
+
+		eiw_to_ways(t.eiw, &ways);
+		t.pos = get_random_u32() % ways;
+		/* A single way is the linear decode: no granule stepping */
+		if (ways > 1)
+			t.d.gran = 256ULL << t.eig;
+
+		while (pos < dpa + len && !rc) {
+			nr = cxl_dpa_decode_ranges(&t.d, pos, dpa + len - pos,
+						   out, 0, ARRAY_SIZE(out),
+						   &done);
+			if (!nr || !done)
+				rc = -ENODATA;
+			else
+				rc = check_ranges(&t, pos, done, out, nr);
+			pos += done;
+		}
+		if (!rc)
+			continue;
+
+		pr_err("test ranges iter %d FAIL rc=%d dpa=%llu len=%llu base=%llu pos=%d eiw=%u eig=%u\n",
+		       i, rc, dpa, len, t.d.base, t.pos, t.eiw, t.eig);
+
+		if (failures++ > 10) {
+			pr_err("test ranges too many failures, stop\n");
+			break;
+		}
+	}
+	pr_info("..... test ranges: PASS %d FAIL %d\n", i - failures, failures);
+
+	if (failures)
+		return -EINVAL;
+
+	return 0;
+}
+
 /*
  * cxl_translate_init
  *
@@ -382,6 +504,10 @@ static int __init cxl_translate_init(void)
 			return rc;
 
 		rc = test_random_params();
+		if (rc)
+			return rc;
+
+		rc = test_decode_ranges();
 		if (rc)
 			return rc;
 

@@ -886,6 +886,20 @@ static inline void cxl_disable_dcd(struct cxl_memdev_state *mds)
 
 int cxl_set_timestamp(struct cxl_memdev_state *mds);
 int cxl_poison_state_init(struct cxl_memdev_state *mds);
+#ifdef CONFIG_CXL_REGION
+int cxl_memdev_dpa_to_hpa_ranges_nowait(struct cxl_memdev *cxlmd, u64 dpa,
+					u64 len, struct range *out,
+					unsigned int nr_max, u64 *done);
+#else
+static inline int
+cxl_memdev_dpa_to_hpa_ranges_nowait(struct cxl_memdev *cxlmd, u64 dpa,
+				    u64 len, struct range *out,
+				    unsigned int nr_max, u64 *done)
+{
+	*done = 0;
+	return -ENODEV;
+}
+#endif
 int cxl_mem_get_poison(struct cxl_memdev *cxlmd, u64 offset, u64 len,
 		       struct cxl_region *cxlr);
 int cxl_trigger_poison_list(struct cxl_memdev *cxlmd);

@@ -3478,6 +3478,264 @@ skip_aligned:
 	return hpa;
 }
 
+/* Translations per call, which bounds how long the locks are held */
+#define CXL_DPA_DECODE_MAX_STEPS	8192
+
+/**
+ * cxl_dpa_decode_ranges() - gather the HPA ranges of a DPA range
+ * @d: how to translate: one decoder's share of one region
+ * @dpa: start of the range
+ * @len: length of the range in bytes
+ * @out: HPA ranges gathered so far, to be added to
+ * @nr: number of HPA ranges in @out
+ * @nr_max: capacity of @out
+ * @done: bytes of the range that were consumed
+ *
+ * Every decode keeps the address bits below the interleave granularity
+ * intact, so a translation is contiguous to the end of the granule the DPA
+ * falls in: translate once per granule, or once for the whole range when
+ * the decode is linear. An HPA range is rounded out to whole pages and one
+ * that begins inside or right behind the last is merged into it, so a
+ * granule smaller than a page yields its page once however many granules
+ * of the range land there. A granule that does not translate is consumed
+ * without a range.
+ *
+ * Stops when @out is full or after CXL_DPA_DECODE_MAX_STEPS translations.
+ *
+ * Return: the new number of HPA ranges in @out.
+ */
+unsigned int cxl_dpa_decode_ranges(const struct cxl_dpa_decode *d, u64 dpa,
+				   u64 len, struct range *out, unsigned int nr,
+				   unsigned int nr_max, u64 *done)
+{
+	u64 pos = dpa, end = dpa + len;
+	unsigned int steps = 0;
+
+	while (pos < end && steps++ < CXL_DPA_DECODE_MAX_STEPS) {
+		u64 chunk = end - pos;
+		u64 hpa, start, last;
+
+		/* The granule phase follows the decoder-relative DPA offset */
+		if (d->gran)
+			chunk = min(chunk, d->gran -
+					   ((pos - d->base) & (d->gran - 1)));
+
+		hpa = d->to_hpa(d, pos);
+		if (hpa != ULLONG_MAX) {
+			start = ALIGN_DOWN(hpa, PAGE_SIZE);
+			last = ALIGN(hpa + chunk, PAGE_SIZE) - 1;
+			if (nr && start >= out[nr - 1].start &&
+			    start <= out[nr - 1].end + 1) {
+				out[nr - 1].end = max(out[nr - 1].end, last);
+			} else {
+				if (nr == nr_max)
+					break;
+				out[nr].start = start;
+				out[nr].end = last;
+				nr++;
+			}
+		}
+		pos += chunk;
+	}
+
+	*done = pos - dpa;
+	return nr;
+}
+EXPORT_SYMBOL_FOR_MODULES(cxl_dpa_decode_ranges, "cxl_translate");
+
+struct cxl_region_dpa_decode {
+	struct cxl_dpa_decode d;
+	struct cxl_region *cxlr;
+	const struct cxl_memdev *cxlmd;
+};
+
+static u64 cxl_region_dpa_decode(const struct cxl_dpa_decode *d, u64 dpa)
+{
+	const struct cxl_region_dpa_decode *rd =
+		container_of(d, struct cxl_region_dpa_decode, d);
+
+	return cxl_dpa_to_hpa(rd->cxlr, rd->cxlmd, dpa);
+}
+
+struct cxl_dpa_to_cxled_context {
+	struct cxl_endpoint_decoder *cxled;
+	u64 dpa;
+	u64 next;
+};
+
+/* Find the decoder that holds a DPA, or else where the next one starts */
+static int __cxl_dpa_to_cxled(struct device *dev, void *arg)
+{
+	struct cxl_dpa_to_cxled_context *ctx = arg;
+	struct cxl_endpoint_decoder *cxled;
+
+	if (!is_endpoint_decoder(dev))
+		return 0;
+
+	cxled = to_cxl_endpoint_decoder(dev);
+	if (cxled_empty(cxled))
+		return 0;
+
+	if (cxl_resource_contains_addr(cxled->dpa_res, ctx->dpa)) {
+		ctx->cxled = cxled;
+		return 1;
+	}
+
+	if (cxled->dpa_res->start > ctx->dpa)
+		ctx->next = min(ctx->next, cxled->dpa_res->start);
+
+	return 0;
+}
+
+/* With the memdev lock held, and the region and DPA locks for reading */
+static int __cxl_memdev_dpa_to_hpa_ranges(struct cxl_memdev *cxlmd, u64 dpa,
+					  u64 len, struct range *out,
+					  unsigned int nr_max, u64 *done)
+{
+	u64 pos = dpa, end = dpa + len;
+	unsigned int nr = 0;
+	struct cxl_port *port;
+
+	device_lock_assert(&cxlmd->dev);
+	lockdep_assert_held_read(&cxl_rwsem.region);
+	lockdep_assert_held_read(&cxl_rwsem.dpa);
+
+	*done = 0;
+
+	if (!cxlmd->dev.driver)
+		return -ENODEV;
+	port = cxlmd->endpoint;
+
+	while (pos < end) {
+		struct cxl_dpa_to_cxled_context ctx = {
+			.dpa = pos,
+			.next = end,
+		};
+		struct cxl_region_dpa_decode rd = {
+			.d.to_hpa = cxl_region_dpa_decode,
+			.cxlmd = cxlmd,
+		};
+		struct cxl_region_params *p;
+		u64 span, chunk;
+
+		if (cxl_num_decoders_committed(port))
+			device_for_each_child(&port->dev, &ctx,
+					      __cxl_dpa_to_cxled);
+		if (!ctx.cxled) {
+			pos = ctx.next;
+			continue;
+		}
+
+		span = min(end, ctx.cxled->dpa_res->end + 1) - pos;
+		rd.cxlr = ctx.cxled->cxld.region;
+		if (!rd.cxlr || rd.cxlr->params.state != CXL_CONFIG_COMMIT) {
+			pos += span;
+			continue;
+		}
+
+		if (test_bit(CXL_REGION_F_NORMALIZED_ADDRESSING,
+			     &rd.cxlr->flags)) {
+			if (pos != dpa)
+				break;
+			*done = span;
+			return -EOPNOTSUPP;
+		}
+
+		/*
+		 * Only the plain linear decode, a single way with an aligned
+		 * modulo decode and no root decoder address translation, is
+		 * contiguous beyond the granule.
+		 */
+		p = &rd.cxlr->params;
+		rd.d.base = ctx.cxled->dpa_res->start;
+		if (p->interleave_ways != 1 || rd.cxlr->cxlrd->ops.hpa_to_spa ||
+		    region_is_unaligned_mod3(rd.cxlr))
+			rd.d.gran = p->interleave_granularity;
+
+		nr = cxl_dpa_decode_ranges(&rd.d, pos, span, out, nr, nr_max,
+					   &chunk);
+		pos += chunk;
+		if (chunk < span)
+			break;
+	}
+
+	*done = pos - dpa;
+	return nr;
+}
+
+/**
+ * cxl_memdev_dpa_to_hpa_ranges_nowait() - translate a DPA range on a memdev
+ *					    to host physical ranges
+ * @cxlmd: memdev that owns the range
+ * @dpa: start of the range
+ * @len: length of the range in bytes
+ * @out: array the HPA ranges are written to
+ * @nr_max: capacity of @out
+ * @done: bytes of the range, counted from @dpa, that this call dealt with
+ *
+ * For endpoint drivers that hold only the memdev. Holds the memdev lock,
+ * which keeps cxl_mem bound and with it the endpoint port in place, and
+ * the region and DPA locks, once for the whole call, and looks up the
+ * decoder and its region once per decoder the range crosses, not once per
+ * translation.
+ *
+ * None of the three locks is waited for. The caller may hold something
+ * their holder is waiting for, such as pages it has taken off the LRU:
+ * memory offlining waits for those, the removal of a region's memory waits
+ * for the offlining, and an unbind of cxl_mem does that removal with the
+ * memdev lock held.
+ *
+ * On an interleaved region a DPA range is spread over many host physical
+ * runs. Each is rounded out to whole pages and merged with the one before
+ * it where they touch, see cxl_dpa_decode_ranges(); the HPA ranges are
+ * inclusive of their end. DPA that no committed region maps is a hole:
+ * it contributes no HPA range and is counted in @done, so a DPA range
+ * that begins in one comes back as no HPA ranges and the size of the
+ * hole.
+ *
+ * A call may stop short of @len, when @out is full or the bound on the
+ * work done under the locks is reached; the caller resumes at @dpa plus
+ * @done. A call that does not fail consumes at least one byte when @len
+ * and @nr_max are not zero.
+ *
+ * An HPA range is what the decode says while the locks are held. By the
+ * time the caller looks at it the region may be gone and the memory may
+ * never have been online, so it is a hint for a walk that validates each
+ * page frame, not a reference on anything.
+ *
+ * Return: the number of HPA ranges written, 0 with a non-zero @done for a
+ * hole, -ENODEV if cxl_mem is not bound to @cxlmd, -EOPNOTSUPP if the
+ * region that maps @dpa uses an addressing that cannot be translated,
+ * with the bytes left in its decoder in @done so that it can be skipped,
+ * or -EBUSY, with @done zero, if a lock is not free. That says nothing
+ * about the range; the caller lets go of what it holds before it tries
+ * again.
+ */
+int cxl_memdev_dpa_to_hpa_ranges_nowait(struct cxl_memdev *cxlmd, u64 dpa,
+					u64 len, struct range *out,
+					unsigned int nr_max, u64 *done)
+{
+	int rc = -EBUSY;
+
+	*done = 0;
+
+	if (!device_trylock(&cxlmd->dev))
+		return rc;
+	if (!down_read_trylock(&cxl_rwsem.region))
+		goto unlock_dev;
+	if (!down_read_trylock(&cxl_rwsem.dpa))
+		goto unlock_region;
+	rc = __cxl_memdev_dpa_to_hpa_ranges(cxlmd, dpa, len, out, nr_max,
+					    done);
+	up_read(&cxl_rwsem.dpa);
+unlock_region:
+	up_read(&cxl_rwsem.region);
+unlock_dev:
+	device_unlock(&cxlmd->dev);
+	return rc;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_memdev_dpa_to_hpa_ranges_nowait, "CXL");
+
 struct dpa_result {
 	struct cxl_memdev *cxlmd;
 	u64 dpa;

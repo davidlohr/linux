@@ -735,6 +735,22 @@ int cxl_validate_translation_params(u8 eiw, u16 eig, int pos);
 u64 cxl_calculate_hpa_offset(u64 dpa_offset, int pos, u8 eiw, u16 eig);
 u64 cxl_calculate_dpa_offset(u64 hpa_offset, u8 eiw, u16 eig);
 int cxl_calculate_position(u64 hpa_offset, u8 eiw, u16 eig);
+
+/**
+ * struct cxl_dpa_decode - how one decoder's DPA translates to HPA
+ * @base: DPA that the interleave granules are counted from
+ * @gran: interleave granularity, or 0 if the decode is linear
+ * @to_hpa: translate one DPA, ULLONG_MAX if it does not translate
+ */
+struct cxl_dpa_decode {
+	u64 base;
+	u64 gran;
+	u64 (*to_hpa)(const struct cxl_dpa_decode *d, u64 dpa);
+};
+
+unsigned int cxl_dpa_decode_ranges(const struct cxl_dpa_decode *d, u64 dpa,
+				   u64 len, struct range *out, unsigned int nr,
+				   unsigned int nr_max, u64 *done);
 struct cxl_cxims_data {
 	int nr_maps;
 	u64 xormaps[] __counted_by(nr_maps);

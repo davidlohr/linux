@@ -6,10 +6,11 @@
  * configuration, hotlist and interrupt (CXL r4.0 Section 8.2.8). Each is
  * registered as a child device of the block. This file is a library over
  * one instance: claim it, start it, drain its hotlist a bounded number of
- * entries at a time, stop it and release it. It delivers nothing and
- * requests no interrupt. The device hotlist is the only queue, and whoever
- * holds the instance decides when to read it: the perf PMU from an
- * interrupt it requests itself, an in-kernel user by polling.
+ * entries at a time, stop it, release it, and translate an entry to host
+ * physical ranges. It delivers nothing and requests no interrupt. The
+ * device hotlist is the only queue, and whoever holds the instance decides
+ * when to read it: the perf PMU from an interrupt it requests itself, an
+ * in-kernel user by polling.
  *
  * Ownership is claim-on-use, first come, first served. The perf PMU holds
  * an instance from event_init to event->destroy, an in-kernel user from
@@ -34,16 +35,20 @@
  *
  * inst->owner and inst->live are written under both, so either is enough
  * to read them. A front-end's own lock is taken before both (perf's raw
- * lock before inst->lock only: perf claims and releases without it).
+ * lock before inst->lock only: perf claims and releases without it). The
+ * HPA walk takes neither: it tries the memdev lock and cxl_rwsem in the
+ * region core and reads what is fixed while its caller holds the claim.
  */
 #include <linux/bitfield.h>
 #include <linux/device.h>
 #include <linux/iopoll.h>
+#include <linux/ioport.h>
 #include <linux/kstrtox.h>
 #include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/range.h>
 #include <linux/slab.h>
 #include <linux/sysfs.h>
 
@@ -475,6 +480,110 @@ bool cxl_hmu_pending(struct cxl_hmu_inst *inst)
 {
 	return readq(inst->base + CHMU_INST0_STATUS_REG) &
 		(CHMU_INST0_STATUS_OVRFLW | CHMU_INST0_STATUS_FILLTHRESH);
+}
+
+/* One page of HPA ranges: a 2 MiB unit over 8 KiB interleave granules */
+#define CXL_HMU_WALK_RANGES	(PAGE_SIZE / sizeof(struct range))
+
+/*
+ * Hand one HPA range to the caller, unless none of it is System RAM: a region
+ * that is device-dax, or that nothing has claimed, has no page the caller
+ * could act on, and walking its page frames to find that out is the
+ * expensive way. That is all this check is for. It says nothing of whether
+ * the memory is online, and by the time @fn runs the answer may be stale,
+ * so @fn must still validate every page frame it touches, which is also
+ * what skips the offline blocks and the holes of a range that is only
+ * partly System RAM.
+ */
+static int cxl_hmu_hpa_range(struct cxl_hmu_inst *inst, u64 unit_id,
+			     const struct range *hpa, u32 nr,
+			     cxl_hmu_hpa_range_fn fn, void *data)
+{
+	if (region_intersects(hpa->start, range_len(hpa), IORESOURCE_SYSTEM_RAM,
+			      IORES_DESC_NONE) == REGION_DISJOINT)
+		return 0;
+
+	trace_cxl_hmu_hpa_range(inst, unit_id, hpa->start, range_len(hpa), nr);
+	return fn(hpa->start, range_len(hpa), nr, data);
+}
+
+/*
+ * A unit is a contiguous range of device physical address; on an
+ * interleaved region it is spread over several host physical runs. Walk it
+ * by run. The region core translates the unit a batch of HPA ranges at a time,
+ * taking its locks once per batch: page granular, adjacent runs merged, DPA
+ * that no committed region maps left out. A granule or a unit smaller than
+ * a page puts the whole page in play, once, so an HPA range can be larger
+ * than the unit. Only those that are at least partly System RAM are handed
+ * over. The count handed to @fn is the entry's in epoch mode; in always-on
+ * mode the entry's counter is not valid and the configured threshold, which
+ * the unit is known to have reached, is handed over instead.
+ *
+ * @fn may keep what it is handed until after the walk, pages it took off
+ * the LRU for one, so no CXL lock is waited for between two calls of it:
+ * whoever holds the memory device's lock may be removing the very memory
+ * and waiting for those pages. See cxl_memdev_dpa_to_hpa_ranges_nowait().
+ *
+ * Returns the first non-zero return of @fn, which ends the walk, -ENODEV
+ * if cxl_mem is not bound to the memory device, in which case no unit will
+ * translate until it is, -EBUSY if a lock was not free, which says nothing
+ * about the unit, or -ENOMEM. May sleep.
+ */
+int cxl_hmu_for_each_hpa_range(struct cxl_hmu_inst *inst, u64 entry,
+			       cxl_hmu_hpa_range_fn fn, void *data)
+{
+	u8 counter_width = inst->live_width;
+	u64 unit_id = entry >> counter_width;
+	u64 count = entry & (BIT_ULL(counter_width) - 1);
+	u64 dpa = unit_id << inst->live.unit_shift;
+	u64 dpa_end = dpa + BIT_ULL(inst->live.unit_shift);
+	struct range run;
+	bool have_run = false;
+	u32 nr;
+	int rc;
+
+	struct range *hpa __free(kfree) =
+		kmalloc_array(CXL_HMU_WALK_RANGES, sizeof(*hpa), GFP_KERNEL);
+	if (!hpa)
+		return -ENOMEM;
+
+	nr = inst->live.mode == CXL_HMU_MODE_EPOCH ? min_t(u64, count, U32_MAX)
+						   : inst->live.hotness_threshold;
+
+	while (dpa < dpa_end) {
+		u64 done;
+		int i, n;
+
+		n = cxl_memdev_dpa_to_hpa_ranges_nowait(inst->block->hmu->cxlmd,
+							dpa, dpa_end - dpa, hpa,
+							CXL_HMU_WALK_RANGES,
+							&done);
+		/* A region whose addressing cannot be translated is a hole here */
+		if (n < 0 && n != -EOPNOTSUPP)
+			return n;
+		dpa += done;
+
+		/* The last HPA range of a batch may continue in the next */
+		for (i = 0; i < n; i++) {
+			if (have_run && hpa[i].start >= run.start &&
+			    hpa[i].start <= run.end + 1) {
+				run.end = max(run.end, hpa[i].end);
+				continue;
+			}
+			if (have_run) {
+				rc = cxl_hmu_hpa_range(inst, unit_id, &run, nr,
+						       fn, data);
+				if (rc)
+					return rc;
+			}
+			run = hpa[i];
+			have_run = true;
+		}
+		cond_resched();
+	}
+	if (have_run)
+		return cxl_hmu_hpa_range(inst, unit_id, &run, nr, fn, data);
+	return 0;
 }
 
 /* Sysfs */

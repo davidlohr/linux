@@ -267,7 +267,7 @@ whilst remaining close to the specified downsampling_factor.
 Trace events
 ============
 
-The cxl_hmu trace system has one event, which starts with the name of the
+The cxl_hmu trace system has two events. Each starts with the name of the
 instance device.
 
 cxl_hmu_hotlist
@@ -275,3 +275,12 @@ cxl_hmu_hotlist
   read that found it empty: nr is the number of entries taken,
   counter_width the counter width of the session, and overflowed is 1 if the
   device had reported a hotlist overflow since the previous read.
+
+cxl_hmu_hpa_range
+  One contiguous host physical range of a hot unit, as handed to an
+  in-kernel user; the PMU reports device physical units and does not emit
+  it. unit_id is the unit, hpa and len (in bytes) the range, and
+  nr_accesses the count of the hotlist entry in epoch mode or the configured
+  threshold in always-on mode. Ranges are page granular, so one can be
+  larger than the unit, and a unit on an interleaved region has several.
+  Only a range that is at least partly System RAM is reported.

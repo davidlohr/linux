@@ -32,6 +32,30 @@ TRACE_EVENT(cxl_hmu_hotlist,
 		  __entry->overflowed)
 );
 
+/* One contiguous host-physical range of a hot unit */
+TRACE_EVENT(cxl_hmu_hpa_range,
+	TP_PROTO(const struct cxl_hmu_inst *inst, u64 unit_id, u64 hpa,
+		 u64 len, u32 nr_accesses),
+	TP_ARGS(inst, unit_id, hpa, len, nr_accesses),
+	TP_STRUCT__entry(
+		__string(dev, dev_name(&inst->dev))
+		__field(u64, unit_id)
+		__field(u64, hpa)
+		__field(u64, len)
+		__field(u32, nr_accesses)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->unit_id = unit_id;
+		__entry->hpa = hpa;
+		__entry->len = len;
+		__entry->nr_accesses = nr_accesses;
+	),
+	TP_printk("%s unit_id=%llu hpa=%#llx len=%llu nr_accesses=%u",
+		  __get_str(dev), __entry->unit_id, __entry->hpa, __entry->len,
+		  __entry->nr_accesses)
+);
+
 #endif /* _CXL_HMU_TRACE_H */
 
 /* This part must be outside protection */

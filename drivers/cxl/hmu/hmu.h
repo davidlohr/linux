@@ -285,6 +285,18 @@ unsigned int cxl_hmu_drain(struct cxl_hmu_inst *inst, u64 *entries,
 			   unsigned int max, unsigned int *flags);
 bool cxl_hmu_pending(struct cxl_hmu_inst *inst);
 
+/*
+ * Walk the hot unit of a drained entry by contiguous host-physical range.
+ * fn() is called with the HPA, the length of the run, and the entry's count
+ * (or the threshold in always-on mode); it returns 0 to continue. For the
+ * holder, for an entry of its current session. May sleep, but waits for no
+ * CXL lock, so fn() may hold on to pages: -EBUSY if one was not free.
+ */
+typedef int (*cxl_hmu_hpa_range_fn)(u64 hpa, u64 len, u32 nr_accesses,
+				    void *data);
+int cxl_hmu_for_each_hpa_range(struct cxl_hmu_inst *inst, u64 entry,
+			       cxl_hmu_hpa_range_fn fn, void *data);
+
 #if IS_ENABLED(CONFIG_CXL_HMU_PERF)
 int cxl_hmu_perf_init(void);
 void cxl_hmu_perf_exit(void);

@@ -26,9 +26,10 @@ static void remove_dev(void *dev)
 	device_unregister(dev);
 }
 
-int devm_cxl_hmu_add(struct device *parent, struct cxl_hmu_regs *regs,
-		     int assoc_id, int index)
+int devm_cxl_hmu_add(struct cxl_memdev *cxlmd, struct cxl_hmu_regs *regs,
+		     int index)
 {
+	struct device *parent = cxlmd->cxlds->dev;
 	struct cxl_hmu *hmu;
 	struct device *dev;
 	int rc;
@@ -37,7 +38,8 @@ int devm_cxl_hmu_add(struct device *parent, struct cxl_hmu_regs *regs,
 	if (!hmu)
 		return -ENOMEM;
 
-	hmu->assoc_id = assoc_id;
+	hmu->cxlmd = cxlmd;
+	hmu->assoc_id = cxlmd->id;
 	hmu->index = index;
 	hmu->base = regs->hmu;
 	dev = &hmu->dev;
@@ -46,7 +48,7 @@ int devm_cxl_hmu_add(struct device *parent, struct cxl_hmu_regs *regs,
 	dev->parent = parent;
 	dev->bus = &cxl_bus_type;
 	dev->type = &cxl_hmu_type;
-	rc = dev_set_name(dev, "hmu_mem%d.%d", assoc_id, index);
+	rc = dev_set_name(dev, "hmu_mem%d.%d", cxlmd->id, index);
 	if (rc)
 		goto err;
 

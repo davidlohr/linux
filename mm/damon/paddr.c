@@ -11,6 +11,7 @@
 #include <linux/rmap.h>
 #include <linux/swap.h>
 #include <linux/memory-tiers.h>
+#include <linux/migrate.h>
 #include <linux/mm_inline.h>
 
 #include "../internal.h"
@@ -383,6 +384,124 @@ put_folio:
 	return damon_pa_core_addr(applied * PAGE_SIZE, addr_unit);
 }
 
+static bool damon_pa_folio_action(enum damos_action action)
+{
+	return action == DAMOS_MIGRATE_HOT || action == DAMOS_MIGRATE_COLD;
+}
+
+/* Folios damos_add_paddr_range() isolates before it queues them */
+#define DAMOS_PA_PUSH_BATCH	512
+
+/*
+ * The add_range() operation: queue the folios of a physical range for @s.
+ *
+ * Isolate every LRU folio in the range that the operations set filters of
+ * @s let through and queue it with damos_add_folios(), in batches of
+ * DAMOS_PA_PUSH_BATCH, so a range of any size can be queued and a refusal
+ * puts back one batch.  A batch is pushed as soon as it holds what the quota
+ * of @s leaves, so no more is isolated than the apply takes.  The filters
+ * run before the isolation, as they do for a region, so a folio they reject
+ * never leaves the LRU.  Folios that cannot be isolated are skipped.  If the
+ * scheme does not take a batch, its folios are returned to the LRU here and
+ * the rest of the range is not isolated, so the caller never holds folios.
+ *
+ * Returns 0, -EOPNOTSUPP if the action of @s cannot be applied to a list of
+ * folios (only migrate_hot and migrate_cold can), or what damos_add_folios()
+ * returned.
+ */
+static int damos_add_paddr_range(struct damon_ctx *ctx, struct damos *s,
+				 phys_addr_t start, phys_addr_t size)
+{
+	phys_addr_t addr = ALIGN_DOWN(start, PAGE_SIZE), end = start + size;
+	unsigned long nr = 0, sz = 0, room;
+	LIST_HEAD(folios);
+	int err;
+
+	if (!damon_pa_folio_action(s->action))
+		return -EOPNOTSUPP;
+	/* Isolating is the expensive part; do not do it to be refused */
+	err = damos_folios_wanted(ctx, s);
+	if (err)
+		return err;
+	room = damos_folios_room(ctx, s);
+
+	/* No region, so no core filter has spoken for these folios */
+	s->core_filters_allowed = false;
+	while (addr < end) {
+		struct folio *folio = damon_get_folio(PHYS_PFN(addr));
+
+		cond_resched();
+		if (!folio) {
+			addr += PAGE_SIZE;
+			continue;
+		}
+		if (!damos_pa_filter_out(s, folio) && folio_isolate_lru(folio)) {
+			node_stat_add_folio(folio, NR_ISOLATED_ANON +
+					folio_is_file_lru(folio));
+			list_add_tail(&folio->lru, &folios);
+			nr++;
+			sz += folio_size(folio);
+		}
+		/* The folio may start before @addr; step past the whole of it */
+		addr = PFN_PHYS(folio_pfn(folio) + folio_nr_pages(folio));
+		folio_put(folio);
+		if (nr == DAMOS_PA_PUSH_BATCH || sz >= room) {
+			err = damos_add_folios(ctx, s, &folios);
+			if (err || addr >= end)
+				break;
+			nr = 0;
+			sz = 0;
+			err = damos_folios_wanted(ctx, s);
+			if (err)
+				break;
+			room = damos_folios_room(ctx, s);
+		}
+	}
+	if (!err && !list_empty(&folios))
+		err = damos_add_folios(ctx, s, &folios);
+	/* Empty unless the last push was refused */
+	putback_movable_pages(&folios);
+	return err;
+}
+
+/*
+ * Migrate the pushed folios that fit the budget, counting in bytes so that
+ * an address unit larger than a folio cannot zero the accounting, and
+ * taking at least one folio when any budget is left so that a quota smaller
+ * than a folio still makes progress, as a region does.  What is not taken
+ * stays on @folios for the core to put back.  The operations set filters
+ * are not run here: damos_add_paddr_range() ran them before it isolated,
+ * and running a filter that clears what it tests, as the young one does,
+ * a second time would reject what it let through.
+ */
+static unsigned long damon_pa_apply_folios(struct damon_ctx *ctx,
+		struct damos *s, struct list_head *folios,
+		unsigned long sz_budget, unsigned long *sz_tried,
+		unsigned long *sz_filter_passed)
+{
+	unsigned long aunit = ctx->addr_unit;
+	unsigned long budget = sz_budget > ULONG_MAX / aunit ? ULONG_MAX :
+		sz_budget * aunit;
+	unsigned long bytes = 0, applied = 0;
+	struct folio *folio, *next;
+	LIST_HEAD(migrate_list);
+
+	if (!damon_pa_folio_action(s->action))
+		return 0;
+
+	list_for_each_entry_safe(folio, next, folios, lru) {
+		if (bytes >= budget)
+			break;
+		bytes += folio_size(folio);
+		list_move_tail(&folio->lru, &migrate_list);
+	}
+	if (!list_empty(&migrate_list))
+		applied = damon_migrate_pages(&migrate_list, s->target_nid);
+	*sz_tried = DIV_ROUND_UP(bytes, aunit);
+	*sz_filter_passed += *sz_tried;
+	return damon_pa_core_addr(applied * PAGE_SIZE, aunit);
+}
+
 static unsigned long damon_pa_stat(struct damon_region *r,
 		unsigned long addr_unit, struct damos *s,
 		unsigned long *sz_filter_passed)
@@ -470,6 +589,8 @@ static int __init damon_pa_initcall(void)
 		.apply_probes = damon_pa_apply_probes,
 		.target_valid = NULL,
 		.apply_scheme = damon_pa_apply_scheme,
+		.add_range = damos_add_paddr_range,
+		.apply_folios = damon_pa_apply_folios,
 		.get_scheme_score = damon_pa_scheme_score,
 	};
 

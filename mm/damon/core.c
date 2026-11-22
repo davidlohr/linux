@@ -11,9 +11,13 @@
 #include <linux/memcontrol.h>
 #include <linux/migrate.h>
 #include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/nodemask.h>
 #include <linux/pid.h>
 #include <linux/psi.h>
+#include <linux/refcount.h>
 #include <linux/sched.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
@@ -777,6 +781,9 @@ struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
 	scheme->last_applied = NULL;
 	INIT_LIST_HEAD(&scheme->list);
 
+	scheme->source_name[0] = '\0';
+	scheme->source = NULL;
+	scheme->source_err = 0;
 	INIT_LIST_HEAD(&scheme->folios);
 	scheme->nr_folios = 0;
 	scheme->queued_sz = 0;
@@ -822,10 +829,15 @@ static void damon_free_scheme(struct damos *s)
 	kfree(s);
 }
 
+static void damos_detach_source(struct damos *s);
+
 void damon_destroy_scheme(struct damos *s)
 {
 	struct damos_quota_goal *g, *g_next;
 	struct damos_filter *f, *next;
+
+	if (s->source)
+		damos_detach_source(s);
 
 	damos_for_each_quota_goal_safe(g, g_next, &s->quota)
 		damos_destroy_quota_goal(g);
@@ -1594,6 +1606,14 @@ static int damos_commit(struct damos *dst, struct damos *src)
 		return err;
 
 	dst->max_nr_snapshots = src->max_nr_snapshots;
+
+	/* Last: nothing after stopping the old source can fail */
+	if (strcmp(dst->source_name, src->source_name)) {
+		if (dst->source)
+			damos_detach_source(dst);
+		strscpy(dst->source_name, src->source_name);
+		dst->source_err = 0;
+	}
 	return 0;
 }
 
@@ -1931,6 +1951,64 @@ static int damon_commit_probes(struct damon_ctx *dst, struct damon_ctx *src)
 	return 0;
 }
 
+/**
+ * damos_source_check_goals() - Can a scheme have the goals of a quota?
+ * @s:		The scheme.
+ * @quota:	The quota whose goals are to be committed to that of @s.
+ *
+ * A goal that is computed from the regions the scheme is eligible for says
+ * nothing of a scheme that is applied to what its source hands over.
+ *
+ * Return: -EINVAL if @s names a hot range source and @quota has such a goal,
+ * 0 otherwise.
+ */
+int damos_source_check_goals(struct damos *s, struct damos_quota *quota)
+{
+	struct damos_quota_goal *goal;
+
+	if (!s->source_name[0])
+		return 0;
+	damos_for_each_quota_goal(goal, quota) {
+		if (goal->metric == DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP)
+			return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * A scheme with a hot range source is applied to the folios of the ranges
+ * the source hands over and to nothing else.  Refuse what cannot work or
+ * would be silently ignored for those, before a source is started for it.
+ */
+static int damos_source_check(struct damon_ctx *ctx)
+{
+	struct damos *s;
+
+	damon_for_each_scheme(s, ctx) {
+		if (!s->source_name[0])
+			continue;
+		if (!IS_ENABLED(CONFIG_MIGRATION))
+			return -EOPNOTSUPP;
+		if (!ctx->ops.add_range || !ctx->ops.apply_folios)
+			return -EINVAL;
+		if (s->action != DAMOS_MIGRATE_HOT &&
+		    s->action != DAMOS_MIGRATE_COLD)
+			return -EINVAL;
+		/* Pushed folios go to target_nid only */
+		if (s->migrate_dests.nr_dests)
+			return -EINVAL;
+		if (s->target_nid < 0 || s->target_nid >= MAX_NUMNODES ||
+		    !node_state(s->target_nid, N_MEMORY))
+			return -EINVAL;
+		/* Core filters select regions, and these folios have none */
+		if (!list_empty(&s->core_filters))
+			return -EINVAL;
+		if (damos_source_check_goals(s, &s->quota))
+			return -EINVAL;
+	}
+	return 0;
+}
+
 static int __damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
 {
 	int err;
@@ -2023,6 +2101,14 @@ int damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
 	struct damon_ctx *test_ctx;
 	int err;
 
+	/*
+	 * Only the new parameters: what @dst became since it got them, such
+	 * as a target node without memory now, would also refuse the commit
+	 * that repairs it.
+	 */
+	err = damos_source_check(src);
+	if (err)
+		return err;
 	test_ctx = damon_new_test_ctx(dst);
 	if (!test_ctx)
 		return -ENOMEM;
@@ -2152,6 +2238,8 @@ int damon_start(struct damon_ctx **ctxs, int nr_ctxs, bool exclusive)
 
 		err = __damon_commit_ctx(test_ctx, ctxs[i]);
 		damon_destroy_ctx(test_ctx);
+		if (!err)
+			err = damos_source_check(ctxs[i]);
 		if (err)
 			return err;
 	}
@@ -2830,6 +2918,10 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
 	damon_for_each_scheme(s, c) {
 		struct damos_quota *quota = &s->quota;
 
+		/* Applied to what its source hands over, not to regions */
+		if (s->source_name[0])
+			continue;
+
 		if (time_before(c->passed_sample_intervals, s->next_apply_sis))
 			continue;
 
@@ -3446,7 +3538,8 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 
 	if (damos_quota_is_full(quota, c->min_region_sz))
 		return;
-	if (!c->ops.get_scheme_score)
+	/* No region is prioritized for a scheme with a hot range source */
+	if (!c->ops.get_scheme_score || s->source_name[0])
 		return;
 
 	/* Fill up the score histogram */
@@ -3698,8 +3791,14 @@ static void damos_take_folios(struct damos *s, struct list_head *folios)
  * operations set does not take goes back to the LRU.
  * One apply is one try in the statistics of @s, see &struct damos_stat.
  * There is no region to hand to a damos_walk() function, so none is called.
+ *
+ * @fetch_ns is the time it took to get the folios queued.  It is charged
+ * with the time of the action, and like it only together with a size: time
+ * alone would take the throughput that a time quota is converted with, and
+ * with it the quota, down to nothing.
  */
-static void damos_apply_folios(struct damon_ctx *c, struct damos *s)
+static void damos_apply_folios(struct damon_ctx *c, struct damos *s,
+			       u64 fetch_ns)
 {
 	struct damos_quota *quota = &s->quota;
 	unsigned long sz_budget = ULONG_MAX;
@@ -3724,10 +3823,333 @@ static void damos_apply_folios(struct damon_ctx *c, struct damos *s)
 	putback_movable_pages(&folios);
 	if (!sz_tried)
 		return;
-	quota->total_charged_ns += timespec64_to_ns(&end) -
+	quota->total_charged_ns += fetch_ns + timespec64_to_ns(&end) -
 		timespec64_to_ns(&begin);
 	damos_charge_quota(quota, sz_tried, sz_applied);
 	damos_update_stat(s, sz_tried, sz_applied, sz_filter_passed);
+}
+
+/*
+ * Hot range sources
+ *
+ * A source hands DAMON physical ranges that something else found hot, such
+ * as a hardware monitor.  A scheme names one in &damos->source_name.  The
+ * kdamond of the scheme's context does the rest where it applies the scheme:
+ * it attaches the source, which is exclusive, and starts it, fetches ranges
+ * from it into the add_range() operation and applies the action to what that
+ * queued.  It stops and detaches the source when the name changes, the
+ * scheme is destroyed or kdamond exits.
+ *
+ * DAMON's state of a source is a handle of its own, not the structure the
+ * owner registered.  The handle's mutex is held across every callback, so
+ * damos_unregister_source() waits for a running one by taking it, and the
+ * handle is refcounted so that neither side frees a mutex the other may
+ * still be unlocking.  A handle whose source was unregistered is dead; the
+ * scheme that had it finds out at its next fetch.
+ *
+ * damos_sources_lock and a handle's mutex are never nested.
+ */
+
+/*
+ * Bytes of ranges that a scheme takes from its source in one apply, and the
+ * fetches it makes for them: one that hands nothing over adds no byte.
+ */
+#define DAMOS_SOURCE_FETCH_SZ	SZ_1G
+#define DAMOS_SOURCE_FETCH_MAX	1024
+
+struct damos_source_handle {
+	struct list_head list;	/* damos_sources; damos_sources_lock */
+	refcount_t ref;		/* the registration, and the attached scheme */
+	char name[DAMOS_SOURCE_NAME_LEN];	/* immutable */
+	struct module *owner;			/* immutable */
+	struct damos *scheme;	/* who has it attached; damos_sources_lock */
+	struct mutex lock;	/* held across each callback; @src, @started */
+	struct damos_source *src;	/* NULL once unregistered */
+	bool started;
+};
+
+static DEFINE_MUTEX(damos_sources_lock);
+static LIST_HEAD(damos_sources);
+
+static struct damos_source_handle *damos_find_source(const char *name)
+{
+	struct damos_source_handle *h;
+
+	lockdep_assert_held(&damos_sources_lock);
+	list_for_each_entry(h, &damos_sources, list) {
+		if (!strcmp(h->name, name))
+			return h;
+	}
+	return NULL;
+}
+
+static void damos_source_put(struct damos_source_handle *h)
+{
+	if (!refcount_dec_and_test(&h->ref))
+		return;
+	mutex_destroy(&h->lock);
+	kfree(h);
+}
+
+/**
+ * damos_register_source() - Register a source of hot physical ranges.
+ * @src:	The source.  The caller keeps it until it has unregistered it.
+ *
+ * A DAMOS scheme whose &damos->source_name is the name of @src can attach it
+ * from then on.  May sleep.
+ *
+ * Return: 0 on success, -EINVAL if the name is empty or too long or a
+ * callback is missing, -EEXIST if the name is registered, or -ENOMEM.
+ */
+int damos_register_source(struct damos_source *src)
+{
+	struct damos_source_handle *h;
+	int err = 0;
+
+	if (!src->name || !src->start || !src->stop || !src->fetch)
+		return -EINVAL;
+	if (!src->name[0] || strlen(src->name) >= DAMOS_SOURCE_NAME_LEN)
+		return -EINVAL;
+
+	h = kzalloc_obj(*h);
+	if (!h)
+		return -ENOMEM;
+	refcount_set(&h->ref, 1);
+	mutex_init(&h->lock);
+	strscpy(h->name, src->name);
+	h->owner = src->owner;
+	h->src = src;
+
+	mutex_lock(&damos_sources_lock);
+	if (damos_find_source(h->name)) {
+		err = -EEXIST;
+	} else {
+		src->handle = h;
+		list_add_tail(&h->list, &damos_sources);
+	}
+	mutex_unlock(&damos_sources_lock);
+	if (err)
+		damos_source_put(h);
+	return err;
+}
+EXPORT_SYMBOL_GPL(damos_register_source);
+
+/**
+ * damos_unregister_source() - Unregister a source of hot physical ranges.
+ * @src:	A source that damos_register_source() registered.
+ *
+ * Waits for a callback of @src that is running.  If a scheme has @src
+ * started, &damos_source->stop is called from here.  On return no callback
+ * is running or will be called and DAMON does not use @src again: it can be
+ * freed, or registered again.  The scheme that had it attached keeps running
+ * and attaches a source that is registered by the same name later.
+ *
+ * May sleep.  Must not be called with a lock held that a callback of @src
+ * takes.
+ */
+void damos_unregister_source(struct damos_source *src)
+{
+	struct damos_source_handle *h = src->handle;
+	struct damos *bound;
+
+	mutex_lock(&damos_sources_lock);
+	list_del(&h->list);
+	bound = h->scheme;
+	h->scheme = NULL;
+	mutex_unlock(&damos_sources_lock);
+
+	mutex_lock(&h->lock);
+	if (h->started) {
+		src->stop(src);
+		h->started = false;
+	}
+	h->src = NULL;
+	mutex_unlock(&h->lock);
+
+	/* Whoever clears ->scheme puts the module reference of the attach */
+	if (bound)
+		module_put(h->owner);
+	src->handle = NULL;
+	damos_source_put(h);
+}
+EXPORT_SYMBOL_GPL(damos_unregister_source);
+
+/* Undo the attach of @h to @s, unless an unregistration already did */
+static void damos_source_unbind(struct damos_source_handle *h,
+				struct damos *s)
+{
+	bool mine;
+
+	mutex_lock(&damos_sources_lock);
+	mine = h->scheme == s;
+	if (mine)
+		h->scheme = NULL;
+	mutex_unlock(&damos_sources_lock);
+
+	if (mine)
+		module_put(h->owner);
+	damos_source_put(h);
+}
+
+/*
+ * Attach the source that @s names, and start it.  kdamond holds no isolated
+ * folio here.  Returns -ENODEV if there is no such source or it is going
+ * away, -EBUSY if another scheme has it, or what its start returned.
+ */
+static int damos_attach_source(struct damos *s)
+{
+	struct damos_source_handle *h;
+	int err = 0;
+
+	mutex_lock(&damos_sources_lock);
+	h = damos_find_source(s->source_name);
+	if (!h)
+		err = -ENODEV;
+	else if (h->scheme)
+		err = -EBUSY;
+	else if (!try_module_get(h->owner))
+		err = -ENODEV;
+	if (!err) {
+		h->scheme = s;
+		refcount_inc(&h->ref);
+	}
+	mutex_unlock(&damos_sources_lock);
+	if (err)
+		return err;
+
+	mutex_lock(&h->lock);
+	err = h->src ? h->src->start(h->src) : -ENODEV;
+	if (!err)
+		h->started = true;
+	mutex_unlock(&h->lock);
+	if (err) {
+		damos_source_unbind(h, s);
+		return err;
+	}
+	s->source = h;
+	return 0;
+}
+
+/* Stop the source of @s, if nobody did, and detach it.  Nothing is isolated. */
+static void damos_detach_source(struct damos *s)
+{
+	struct damos_source_handle *h = s->source;
+
+	s->source = NULL;
+	mutex_lock(&h->lock);
+	/* ->started implies ->src: an unregistration clears both */
+	if (h->started) {
+		h->src->stop(h->src);
+		h->started = false;
+	}
+	mutex_unlock(&h->lock);
+	damos_source_unbind(h, s);
+}
+
+/**
+ * damos_source_state() - What became of the source of a scheme?
+ * @s:		The scheme.
+ *
+ * For whoever reports the state.  A source that was unregistered stays
+ * attached, stopped, until the next apply of @s finds out; this tells it
+ * apart from a started one.  Must be called by the kdamond of the context
+ * of @s, for example from a damon_call() function.
+ *
+ * Return: 1 if @s has a source that it started and nobody stopped, 0 if it
+ * has none and no attach failed since @s got its &damos->source_name, or a
+ * negative error: that of the last attach, or -ENODEV if the source was
+ * unregistered.
+ */
+int damos_source_state(struct damos *s)
+{
+	struct damos_source_handle *h = s->source;
+	bool started;
+
+	if (!h)
+		return s->source_err;
+	mutex_lock(&h->lock);
+	started = h->started;
+	mutex_unlock(&h->lock);
+	return started ? 1 : -ENODEV;
+}
+
+struct damos_source_fetch {
+	struct damon_ctx *ctx;
+	struct damos *s;
+	u64 sz;			/* bytes of the ranges handed over */
+};
+
+/* The damos_source_add_fn of every fetch */
+static int damos_source_add(void *arg, phys_addr_t start, phys_addr_t size)
+{
+	struct damos_source_fetch *f = arg;
+
+	f->sz += size;
+	return f->ctx->ops.add_range(f->ctx, f->s, start, size);
+}
+
+/*
+ * Fetch from the source of @s while @s takes folios, up to
+ * DAMOS_SOURCE_FETCH_SZ of ranges and DAMOS_SOURCE_FETCH_MAX fetches.
+ * Folios are isolated from the first range that is added until the caller
+ * has applied @s, so nothing in here waits for more than the source's fetch
+ * does.  Returns what the last fetch returned, 0 if there was none, or
+ * -ENODEV if the source was unregistered.
+ */
+static int damos_fetch_source(struct damon_ctx *c, struct damos *s)
+{
+	struct damos_source_fetch f = { .ctx = c, .s = s };
+	struct damos_source_handle *h = s->source;
+	unsigned int nr = 0;
+	int ret = 0;
+
+	mutex_lock(&h->lock);
+	if (!h->src) {
+		ret = -ENODEV;
+	} else {
+		while (!damos_folios_wanted(c, s) &&
+		       f.sz < DAMOS_SOURCE_FETCH_SZ &&
+		       nr++ < DAMOS_SOURCE_FETCH_MAX &&
+		       !kthread_should_stop()) {
+			ret = h->src->fetch(h->src, damos_source_add, &f);
+			cond_resched();
+			if (ret <= 0)
+				break;
+		}
+	}
+	mutex_unlock(&h->lock);
+	return ret;
+}
+
+/*
+ * Apply @s, which names a source and is due and active: attach the source
+ * if it is not, fetch from it and apply the action to what that queued.  A
+ * failed attach is tried again at the next apply of @s.  The time of the
+ * fetch is charged with that of the action, since for a region both are
+ * the work of one apply_scheme() call; see damos_apply_folios().
+ */
+static void damos_apply_source(struct damon_ctx *c, struct damos *s)
+{
+	struct timespec64 begin, end;
+	int ret;
+
+	if (!s->source) {
+		s->source_err = damos_attach_source(s);
+		if (s->source_err)
+			return;
+	}
+
+	ktime_get_coarse_ts64(&begin);
+	ret = damos_fetch_source(c, s);
+	ktime_get_coarse_ts64(&end);
+	damos_apply_folios(c, s, timespec64_to_ns(&end) -
+			   timespec64_to_ns(&begin));
+
+	/* Gone, or of no use as started: start over at the next apply */
+	if (ret == -ENODEV) {
+		damos_detach_source(s);
+		s->source_err = -ENODEV;
+	}
 }
 
 static noinline_for_stack void kdamond_apply_schemes(struct damon_ctx *c)
@@ -3770,8 +4192,12 @@ static noinline_for_stack void kdamond_apply_schemes(struct damon_ctx *c)
 	damon_for_each_scheme(s, c) {
 		if (time_before(c->passed_sample_intervals, s->next_apply_sis))
 			continue;
-		if (damos_can_apply_folios(c, s))
-			damos_apply_folios(c, s);
+		if (!damos_can_apply_folios(c, s))
+			continue;
+		if (s->source_name[0])
+			damos_apply_source(c, s);
+		else
+			damos_apply_folios(c, s, 0);
 	}
 
 	damon_for_each_scheme(s, c) {
@@ -4276,6 +4702,7 @@ static int kdamond_fn(void *data)
 {
 	struct damon_ctx *ctx = data;
 	unsigned long sz_limit = 0;
+	struct damos *s;
 
 	mutex_lock(&ctx->call_controls_lock);
 	ctx->call_controls_obsolete = false;
@@ -4418,6 +4845,10 @@ static int kdamond_fn(void *data)
 		}
 	}
 done:
+	damon_for_each_scheme(s, ctx) {
+		if (s->source)
+			damos_detach_source(s);
+	}
 	damon_destroy_targets(ctx);
 
 	kfree(ctx->regions_score_histogram);

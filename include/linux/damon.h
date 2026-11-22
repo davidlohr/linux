@@ -525,6 +525,71 @@ struct damos_migrate_dests {
 	size_t nr_dests;
 };
 
+#define DAMOS_SOURCE_NAME_LEN	32	/* with the terminating NUL */
+
+struct damos_source;
+struct damos_source_handle;
+
+/**
+ * typedef damos_source_add_fn - Take a physical range from a source.
+ * @arg:	What DAMON passed to &damos_source->fetch.
+ * @start:	Start physical address.
+ * @size:	Size in bytes.
+ *
+ * Return: 0 if the range was taken (folios of it that could not be isolated
+ * or that the filters reject are skipped silently).  A negative error if
+ * the scheme takes no more now; the source must stop handing ranges over
+ * and return that value from its fetch.
+ */
+typedef int (*damos_source_add_fn)(void *arg, phys_addr_t start,
+				   phys_addr_t size);
+
+/**
+ * struct damos_source - A source of hot physical ranges for a DAMOS scheme.
+ * @name:	Unique name, what &damos->source_name is matched with.  At
+ *		most DAMOS_SOURCE_NAME_LEN - 1 characters.  Copied at
+ *		registration.
+ * @owner:	The module of the callbacks, pinned while a scheme is attached.
+ * @start:	Start producing.
+ * @stop:	Stop producing.  Called once for each successful @start, by
+ *		kdamond or by damos_unregister_source().
+ * @fetch:	Hand over one bounded batch of ranges, hottest first, calling
+ *		@add for each until it returns non-zero.
+ *
+ * DAMON serializes the three callbacks of one source and calls none after
+ * damos_unregister_source() returned.  They must not call
+ * damos_unregister_source() on it.
+ *
+ * @start and @stop are called by the kdamond of the scheme's context, with
+ * no folio isolated.  They may sleep but must be bounded: a writer of the
+ * DAMON sysfs files may be waiting for that kdamond with DAMON's sysfs lock
+ * held, and kdamond applies nothing else meanwhile.  A @start that cannot
+ * get a lock without waiting fails with -EBUSY; it is called again at the
+ * scheme's next apply interval, as after any other error.
+ *
+ * @fetch is called by the same kdamond, which may be holding folios it
+ * isolated for earlier ranges.  It must not wait for a lock whose holder
+ * can be waiting for those folios (memory offlining is one), nor for
+ * anything the thread that unregisters the source holds.  What it takes
+ * off its own queue and cannot hand over is lost; a source keeps batches
+ * small for that reason.  It returns a positive value if more may be
+ * pending, 0 if there is nothing left, or a negative error (what @add
+ * returned, or its own).  Any non-positive value ends the fetching for this
+ * apply interval.  -ENODEV says the source cannot produce any more as
+ * started: DAMON stops it and starts it again as it would a source that
+ * failed to start.
+ */
+struct damos_source {
+	const char *name;
+	struct module *owner;
+	int (*start)(struct damos_source *src);
+	void (*stop)(struct damos_source *src);
+	int (*fetch)(struct damos_source *src, damos_source_add_fn add,
+		     void *arg);
+/* private: internal use only */
+	struct damos_source_handle *handle;	/* set by registration */
+};
+
 /**
  * struct damos - Represents a Data Access Monitoring-based Operation Scheme.
  * @pattern:		Access pattern of target regions.
@@ -536,6 +601,7 @@ struct damos_migrate_dests {
  * @target_nid:		Destination node if @action is "migrate_{hot,cold}".
  * @stat:		Statistics of this scheme.
  * @max_nr_snapshots:	Upper limit of nr_snapshots stat.
+ * @source_name:	Name of the &struct damos_source to take ranges from.
  *
  * For each @apply_interval_us, DAMON finds regions which fit in the
  * &pattern and applies &action to those. To avoid consuming too much
@@ -563,6 +629,18 @@ struct damos_migrate_dests {
  *
  * If &max_nr_snapshots is set as non-zero and &stat.nr_snapshots equals or is
  * greater than it, the scheme is deactivated.
+ *
+ * If @source_name is not empty, the scheme is not applied to regions.  The
+ * kdamond attaches the &struct damos_source of that name, starts it, and at
+ * each @apply_interval_us fetches physical ranges from it and applies @action
+ * to their folios, within &quota.  The name is set after damon_new_scheme().
+ * Only &DAMOS_MIGRATE_HOT and &DAMOS_MIGRATE_COLD schemes of a context whose
+ * operations set implements &damon_operations.add_range can have one; they
+ * need a valid @target_nid and can have no @migrate_dests, no core filters
+ * and no &DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP goal.  damon_start() and
+ * damon_commit_ctx() fail otherwise, and whoever commits goals alone with
+ * damos_commit_quota_goals() checks them with damos_source_check_goals()
+ * first.  @pattern is not used.
  */
 struct damos {
 	struct damos_access_pattern pattern;
@@ -578,6 +656,7 @@ struct damos {
 	};
 	struct damos_stat stat;
 	unsigned long max_nr_snapshots;
+	char source_name[DAMOS_SOURCE_NAME_LEN];
 /* private: internal use only */
 	/*
 	 * number of sample intervals that should be passed before applying
@@ -612,6 +691,12 @@ struct damos {
 	 * finished.
 	 */
 	void *last_applied;
+	/*
+	 * The attached and started source of @source_name, and why there is
+	 * none (0 if no attach was tried yet).  kdamond only.
+	 */
+	struct damos_source_handle *source;
+	int source_err;
 	/*
 	 * Folios queued by damos_add_folios() for the apply that kdamond is
 	 * making, their number and their size in bytes.  kdamond only.
@@ -1151,6 +1236,10 @@ int damos_add_folios(struct damon_ctx *ctx, struct damos *s,
 		     struct list_head *folios);
 int damos_folios_wanted(struct damon_ctx *ctx, struct damos *s);
 unsigned long damos_folios_room(struct damon_ctx *ctx, struct damos *s);
+int damos_register_source(struct damos_source *src);
+void damos_unregister_source(struct damos_source *src);
+int damos_source_state(struct damos *s);
+int damos_source_check_goals(struct damos *s, struct damos_quota *quota);
 void damon_add_scheme(struct damon_ctx *ctx, struct damos *s);
 void damon_destroy_scheme(struct damos *s);
 int damos_commit_quota_goals(struct damos_quota *dst, struct damos_quota *src);

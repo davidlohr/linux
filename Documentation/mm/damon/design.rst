@@ -899,6 +899,19 @@ to exclude anonymous pages and the region has only anonymous pages, or if the
 action is ``pageout`` while all pages of the region are unreclaimable, applying
 the action to the region will fail.
 
+A scheme can also be applied to folios that were found by other means than
+DAMON's monitoring and pushed to it (``damos_add_folios()``).  Those belong to
+no region and are counted by the apply: each time the scheme is applied to
+pushed folios counts once in ``nr_tried``, and once in ``nr_applied`` if the
+action was applied to any of them.  ``sz_tried`` grows by the size of the
+folios that the quota let the operation set consider, ``sz_applied`` by the
+size of those the action was applied to, and ``sz_ops_filter_passed`` by the
+same as ``sz_tried``, since the operation set filters are run before a folio
+is pushed.  A folio that was pushed and returned because the quota did not
+reach it is in none of these.
+The ``damos_before_apply_folios`` tracepoint reports each such apply as
+``damos_before_apply`` does a region's.
+
 Unlike normal stats, ``max_nr_snapshots`` is set by users.  If it is set as
 non-zero and ``nr_snapshots`` equals or is greater than ``max_nr_snapshots``,
 the scheme is deactivated.  Note that, unlike watermarks, even if a scheme's

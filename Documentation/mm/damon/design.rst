@@ -931,6 +931,52 @@ and amount of the region's internal memory that passed the DAMOS filters.
 :ref:`DAMON sysfs interface <sysfs_interface>` also allows users read the data
 via special :ref:`files <sysfs_schemes_tried_regions>`.
 
+.. _damon_design_damos_source:
+
+Hot Range Sources
+~~~~~~~~~~~~~~~~~
+
+Some hardware finds hot memory by itself and reports it as physical address
+ranges; a CXL Hotness Monitoring Unit is one example.  A kernel component that
+has such reports registers a *hot range source* with DAMON
+(``damos_register_source()``): a unique name and three callbacks that start
+the source, stop it, and fetch a batch of ranges from it.
+
+A scheme can name a source instead of relying on DAMON's monitoring.  Such a
+scheme is not applied to regions.  The kdamond of its context attaches the
+source, which only one scheme can have at a time, starts it, and for every
+``apply_interval`` fetches ranges from it and applies the action to the folios
+of those ranges.  It stops the source when the scheme stops naming it, is
+removed, or kdamond terminates.  If the source cannot be attached or started,
+for example because it is not registered yet or something else is using the
+hardware, kdamond tries again at the next ``apply_interval``.  If the source is
+unregistered while the scheme uses it, the scheme likewise waits for a source
+of that name to be registered again.
+
+The fetching is bounded by the scheme's :ref:`quota
+<damon_design_damos_quotas>`: kdamond fetches only while the quota of the
+current charge window is not used up, and in any case no more than 1 GiB of
+ranges and 1024 fetches for one ``apply_interval``.  A scheme without a quota
+is applied to at most 65536 folios for one ``apply_interval``.
+Whatever is not fetched stays queued in the source, which is expected to drop
+what it cannot hold.  The time of a fetch is charged to the time quota
+together with that of the action, if the action was tried for any of the
+folios; the time of a fetch that led to none is not charged.
+
+Only ``migrate_hot`` and ``migrate_cold`` schemes of a context that uses the
+``paddr`` operations set can have a source, and they need ``target_nid``.
+The :ref:`watermarks <damon_design_damos_watermarks>` and the operations set
+handled :ref:`filters <damon_design_damos_filters>` work as usual.  The
+:ref:`target access pattern <damon_design_damos_access_pattern>`, the
+prioritization weights and ``max_nr_snapshots`` are not used, since there are
+no regions.  Multiple migration destinations, core layer handled filters and
+the ``node_eligible_mem_bp`` quota goal metric are refused for such a scheme.
+The context needs no monitoring target; if it has one, its other schemes are
+applied to the regions as usual.
+
+The :ref:`statistics <damon_design_damos_stat>` count as described for pushed
+folios.
+
 .. _damon_design_api:
 
 Application Programming Interface

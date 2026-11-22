@@ -88,7 +88,7 @@ comma (",").
     │ │ │ │ │ │ │ │ ...
     │ │ │ │ │ │ ...
     │ │ │ │ │ :ref:`schemes <sysfs_schemes>`/nr_schemes
-    │ │ │ │ │ │ :ref:`0 <sysfs_scheme>`/action,target_nid,apply_interval_us
+    │ │ │ │ │ │ :ref:`0 <sysfs_scheme>`/action,target_nid,apply_interval_us,source,source_state
     │ │ │ │ │ │ │ :ref:`access_pattern <sysfs_access_pattern>`/
     │ │ │ │ │ │ │ │ sz/min,max
     │ │ │ │ │ │ │ │ nr_accesses/min,max
@@ -396,8 +396,8 @@ schemes/<N>/
 
 In each scheme directory, nine directories (``access_pattern``, ``quotas``,
 ``watermarks``, ``core_filters``, ``ops_filters``, ``filters``, ``dests``,
-``stats``, and ``tried_regions``) and three files (``action``, ``target_nid``
-and ``apply_interval_us``) exist.
+``stats``, and ``tried_regions``) and five files (``action``, ``target_nid``,
+``apply_interval_us``, ``source`` and ``source_state``) exist.
 
 The ``action`` file is for setting and getting the scheme's :ref:`action
 <damon_design_damos_action>`.  The keywords that can be written to and read
@@ -410,6 +410,44 @@ only meaningful when the ``action`` is either ``migrate_hot`` or
 
 The ``apply_interval_us`` file is for setting and getting the scheme's
 :ref:`apply_interval <damon_design_damos>` in microseconds.
+
+The ``source`` file is for setting and getting the name of the :ref:`hot range
+source <damon_design_damos_source>` of the scheme.  Writing an empty string
+unsets it, which is the default.  A name is at most 31 characters long.  Like
+other scheme files, it is an input that takes effect when the kdamond is
+turned on, or when ``commit`` is written to its ``state`` file.  The name is
+not checked when it is written, because the source may be registered later,
+for example when a module is loaded.  Turning the kdamond on or committing
+fails if the scheme cannot have a source at all, as the design document
+describes; it does not fail because the source does not exist, is in use or
+cannot start.  Committing an unchanged name leaves a running source alone.
+To restart a source, for example after changing the parameters of the device
+behind it, unset the name, commit, set it and commit again.
+
+The ``source_state`` file is read-only and shows what the kdamond made of
+``source``, as one of the below.
+
+- ``none``: the scheme has no source.
+- ``attached``: the source is attached to the scheme and started.
+- ``waiting``: the scheme has a source name, but the kdamond did not try to
+  attach it yet, because the scheme was not due for applying, is deactivated
+  by its watermarks, or the context is paused.  The first try is made when
+  the scheme is first applied, one ``apply_interval`` after the kdamond was
+  turned on.
+- ``error <errno>``: the last try to attach and start the source failed, or
+  the source went away.  ``<errno>`` is negative: ``-19`` (``ENODEV``) means
+  no source of that name is registered, ``-16`` (``EBUSY``) that another
+  scheme or another user of the hardware has it, and anything else is what
+  the source's own start returned.  The kdamond tries again every
+  ``apply_interval``.
+
+Like the :ref:`stats <sysfs_schemes_stats>` files, ``source_state`` is not
+updated in real time.  It shows the state as of the last update that was made
+by ``refresh_ms`` or by writing ``update_schemes_stats`` to the ``state``
+file, and ``none`` before the first one after the kdamond was turned on.  It
+is ``none`` again once the kdamond was turned off.  If the kdamond terminates
+by itself, the file keeps what the last update showed although the source was
+stopped.
 
 .. _sysfs_access_pattern:
 
@@ -724,6 +762,47 @@ memory rate becomes larger than 60%, or lower than 30%". ::
 Please note that it's highly recommended to use user space tools like `damo
 <https://github.com/damonitor/damo>`_ rather than manually reading and writing
 the files as above.  Above is only for an example.
+
+Below commands apply a scheme saying "Migrate the pages that a hot range
+source named ``hmu_mem0.0.0`` (one that the CXL HMU DAMON client module,
+cxl_hmu_damon, registers; each source documents its names) reports to node
+0.  For the migration, use only up to 10ms per second, and also don't migrate
+more than 128MiB per second".  The context needs no monitoring target for
+this, so the sampling interval is raised to the aggregation interval. ::
+
+    # cd <sysfs>/kernel/mm/damon/admin
+    # echo 1 > kdamonds/nr_kdamonds; echo 1 > kdamonds/0/contexts/nr_contexts;
+    # cd kdamonds/0/contexts/0
+    # echo paddr > operations
+    # echo 100000 > monitoring_attrs/intervals/sample_us
+    # echo 100000 > monitoring_attrs/intervals/aggr_us
+    # echo 1 > schemes/nr_schemes
+    # cd schemes/0
+    # echo migrate_hot > action
+    # echo 0 > target_nid
+    # echo 10 > quotas/ms
+    # echo $((128*1024*1024)) > quotas/bytes
+    # echo 1000 > quotas/reset_interval_ms
+    # echo hmu_mem0.0.0 > source
+    # echo on > ../../../../state
+    # sleep 1
+    # echo update_schemes_stats > ../../../../state
+    # cat source_state
+    attached
+
+The source is attached when the scheme is first applied, so an update that is
+made within the first ``apply_interval`` shows ``waiting``.
+
+Without a quota, what the source reports is migrated up to 65536 folios
+(256MiB of 4KiB pages) or 1GiB of ranges per ``apply_interval``, whichever
+comes first.  What the source hands over beyond that is dropped, and reported
+again only if it stays hot, so setting a quota is recommended.
+
+Note that turning a kdamond on fails with ``-EBUSY`` while a DAMON module that
+runs exclusively is enabled, whether or not a scheme has a source.
+``DAMON_STAT`` is one, and is enabled by default where it is built;
+``DAMON_RECLAIM`` and ``DAMON_LRU_SORT`` are others.  Disable them first, for
+example with ``echo N > /sys/module/damon_stat/parameters/enabled``.
 
 .. _tracepoint:
 

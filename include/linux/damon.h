@@ -651,6 +651,7 @@ enum damon_ops_id {
  * @apply_probes:		Apply probes for each region.
  * @get_scheme_score:		Get the score of a region for a scheme.
  * @apply_scheme:		Apply a DAMON-based operation scheme.
+ * @add_range:			Queue the folios of a physical range for a scheme.
  * @apply_folios:		Apply a scheme to pushed folios.
  * @target_valid:		Determine if the target is valid.
  * @cleanup_target:		Clean up each target before deallocation.
@@ -691,12 +692,16 @@ enum damon_ops_id {
  * to the region and return bytes of the region that the action is successfully
  * applied.  It should also report how many bytes of the region has passed
  * filters (&struct damos_filter) that handled by itself.
+ * @add_range is called from @kdamond while it applies @scheme.  It should
+ * isolate the folios of the physical range of @size bytes at @start that
+ * the filters of @scheme handled by itself pass, queue them with
+ * damos_add_folios(), and return 0 or what damos_add_folios() returned.
  * @apply_folios should apply the action of @scheme to the LRU-isolated
  * folios on @folios while their cumulative size in core address units stays
  * within @sz_budget, taking at least one folio if any budget is left, store
  * the considered size in @sz_tried, add it to @sz_filter_passed, and return
- * the applied size.  It should not run the filters of @scheme: whoever
- * pushed the folios did, before isolating them.  Folios it does not take
+ * the applied size.  It should not run the filters of @scheme: @add_range
+ * did, before isolating them.  Folios it does not take
  * stay on @folios; the core returns them to the LRU.
  * @target_valid should check whether the target is still valid for the
  * monitoring.
@@ -716,6 +721,8 @@ struct damon_operations {
 	unsigned long (*apply_scheme)(struct damon_ctx *context,
 			struct damon_target *t, struct damon_region *r,
 			struct damos *scheme, unsigned long *sz_filter_passed);
+	int (*add_range)(struct damon_ctx *context, struct damos *scheme,
+			phys_addr_t start, phys_addr_t size);
 	unsigned long (*apply_folios)(struct damon_ctx *context,
 			struct damos *scheme, struct list_head *folios,
 			unsigned long sz_budget, unsigned long *sz_tried,

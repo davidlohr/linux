@@ -3627,11 +3627,12 @@ unsigned long damos_folios_room(struct damon_ctx *ctx, struct damos *s)
  *
  * No filter of @s is run on a queued folio.  The core filters select
  * regions and have nothing to say about one.  The operations set filters
- * are for the caller to run before it isolates, so that a folio they reject
- * never leaves the LRU.
+ * are for the caller to run before it isolates, as the paddr add_range()
+ * does, so that a folio they reject never leaves the LRU.
  *
  * Must be called by the kdamond of @ctx from inside kdamond_apply_schemes(),
- * for a scheme it is about to apply.  The queue and the quota of @s
+ * for a scheme it is about to apply; the add_range() operation is the
+ * caller.  The queue and the quota of @s
  * therefore need no lock.
  *
  * What is queued stays off the LRU until that apply.  A caller that pushes

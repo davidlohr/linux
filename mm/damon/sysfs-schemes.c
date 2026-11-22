@@ -2288,6 +2288,14 @@ static const struct kobj_type damos_sysfs_dests_ktype = {
  * scheme directory
  */
 
+/* What kdamond last reported of the hot range source of a scheme */
+enum damos_sysfs_source_state {
+	DAMOS_SYSFS_SOURCE_NONE,
+	DAMOS_SYSFS_SOURCE_WAITING,
+	DAMOS_SYSFS_SOURCE_ATTACHED,
+	DAMOS_SYSFS_SOURCE_ERROR,
+};
+
 struct damon_sysfs_scheme {
 	struct kobject kobj;
 	enum damos_action action;
@@ -2302,6 +2310,9 @@ struct damon_sysfs_scheme {
 	struct damon_sysfs_scheme_regions *tried_regions;
 	int target_nid;
 	struct damos_sysfs_dests *dests;
+	char source[DAMOS_SOURCE_NAME_LEN];
+	enum damos_sysfs_source_state source_state;
+	int source_err;
 };
 
 struct damos_sysfs_action_name {
@@ -2367,6 +2378,9 @@ static struct damon_sysfs_scheme *damon_sysfs_scheme_alloc(
 	scheme->action = action;
 	scheme->apply_interval_us = apply_interval_us;
 	scheme->target_nid = NUMA_NO_NODE;
+	scheme->source[0] = '\0';
+	scheme->source_state = DAMOS_SYSFS_SOURCE_NONE;
+	scheme->source_err = 0;
 	return scheme;
 }
 
@@ -2686,6 +2700,66 @@ static ssize_t target_nid_store(struct kobject *kobj,
 	return err ? err : count;
 }
 
+static ssize_t source_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct damon_sysfs_scheme *scheme = container_of(kobj,
+			struct damon_sysfs_scheme, kobj);
+	int len;
+
+	if (!mutex_trylock(&damon_sysfs_lock))
+		return -EBUSY;
+	len = sysfs_emit(buf, "%s\n", scheme->source);
+	mutex_unlock(&damon_sysfs_lock);
+	return len;
+}
+
+static ssize_t source_store(struct kobject *kobj, struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct damon_sysfs_scheme *scheme = container_of(kobj,
+			struct damon_sysfs_scheme, kobj);
+	size_t len = count;
+
+	if (len && buf[len - 1] == '\n')
+		len--;
+	if (len >= DAMOS_SOURCE_NAME_LEN)
+		return -EINVAL;
+
+	if (!mutex_trylock(&damon_sysfs_lock))
+		return -EBUSY;
+	strscpy(scheme->source, buf, len + 1);
+	mutex_unlock(&damon_sysfs_lock);
+	return count;
+}
+
+static ssize_t source_state_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct damon_sysfs_scheme *scheme = container_of(kobj,
+			struct damon_sysfs_scheme, kobj);
+	int len;
+
+	if (!mutex_trylock(&damon_sysfs_lock))
+		return -EBUSY;
+	switch (scheme->source_state) {
+	case DAMOS_SYSFS_SOURCE_WAITING:
+		len = sysfs_emit(buf, "waiting\n");
+		break;
+	case DAMOS_SYSFS_SOURCE_ATTACHED:
+		len = sysfs_emit(buf, "attached\n");
+		break;
+	case DAMOS_SYSFS_SOURCE_ERROR:
+		len = sysfs_emit(buf, "error %d\n", scheme->source_err);
+		break;
+	default:
+		len = sysfs_emit(buf, "none\n");
+		break;
+	}
+	mutex_unlock(&damon_sysfs_lock);
+	return len;
+}
+
 static void damon_sysfs_scheme_release(struct kobject *kobj)
 {
 	kfree(container_of(kobj, struct damon_sysfs_scheme, kobj));
@@ -2700,10 +2774,18 @@ static struct kobj_attribute damon_sysfs_scheme_apply_interval_us_attr =
 static struct kobj_attribute damon_sysfs_scheme_target_nid_attr =
 		__ATTR_RW_MODE(target_nid, 0600);
 
+static struct kobj_attribute damon_sysfs_scheme_source_attr =
+		__ATTR_RW_MODE(source, 0600);
+
+static struct kobj_attribute damon_sysfs_scheme_source_state_attr =
+		__ATTR_RO_MODE(source_state, 0400);
+
 static struct attribute *damon_sysfs_scheme_attrs[] = {
 	&damon_sysfs_scheme_action_attr.attr,
 	&damon_sysfs_scheme_apply_interval_us_attr.attr,
 	&damon_sysfs_scheme_target_nid_attr.attr,
+	&damon_sysfs_scheme_source_attr.attr,
+	&damon_sysfs_scheme_source_state_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(damon_sysfs_scheme);
@@ -2960,7 +3042,10 @@ int damos_sysfs_set_quota_scores(struct damon_sysfs_schemes *sysfs_schemes,
 				damos_destroy_quota_goal(g);
 			return err;
 		}
-		err = damos_commit_quota_goals(&scheme->quota, &quota);
+		/* What a full commit refuses for a scheme with a source */
+		err = damos_source_check_goals(scheme, &quota);
+		if (!err)
+			err = damos_commit_quota_goals(&scheme->quota, &quota);
 		damos_for_each_quota_goal_safe(g, g_next, &quota)
 			damos_destroy_quota_goal(g);
 		if (err)
@@ -3082,6 +3167,7 @@ static struct damos *damon_sysfs_mk_scheme(
 		return NULL;
 	}
 	scheme->max_nr_snapshots = sysfs_scheme->stats->max_nr_snapshots;
+	strscpy(scheme->source_name, sysfs_scheme->source);
 	return scheme;
 }
 
@@ -3104,6 +3190,41 @@ int damon_sysfs_add_schemes(struct damon_ctx *ctx,
 	return 0;
 }
 
+/* Called by kdamond, with damon_sysfs_lock held */
+static void damon_sysfs_scheme_update_source_state(
+		struct damon_sysfs_scheme *sysfs_scheme, struct damos *scheme)
+{
+	int state = damos_source_state(scheme);
+
+	sysfs_scheme->source_err = state < 0 ? state : 0;
+	if (!scheme->source_name[0])
+		sysfs_scheme->source_state = DAMOS_SYSFS_SOURCE_NONE;
+	else if (state > 0)
+		sysfs_scheme->source_state = DAMOS_SYSFS_SOURCE_ATTACHED;
+	else if (state < 0)
+		sysfs_scheme->source_state = DAMOS_SYSFS_SOURCE_ERROR;
+	else
+		sysfs_scheme->source_state = DAMOS_SYSFS_SOURCE_WAITING;
+}
+
+/*
+ * No kdamond has a source attached for these schemes: one is about to be
+ * started for them, or theirs has stopped and with it the updates.
+ */
+void damon_sysfs_schemes_reset_source_state(
+		struct damon_sysfs_schemes *sysfs_schemes)
+{
+	int i;
+
+	for (i = 0; i < sysfs_schemes->nr; i++) {
+		struct damon_sysfs_scheme *scheme =
+			sysfs_schemes->schemes_arr[i];
+
+		scheme->source_state = DAMOS_SYSFS_SOURCE_NONE;
+		scheme->source_err = 0;
+	}
+}
+
 void damon_sysfs_schemes_update_stats(
 		struct damon_sysfs_schemes *sysfs_schemes,
 		struct damon_ctx *ctx)
@@ -3112,13 +3233,16 @@ void damon_sysfs_schemes_update_stats(
 	int schemes_idx = 0;
 
 	damon_for_each_scheme(scheme, ctx) {
+		struct damon_sysfs_scheme *sysfs_scheme;
 		struct damon_sysfs_stats *sysfs_stats;
 
 		/* user could have removed the scheme sysfs dir */
 		if (schemes_idx >= sysfs_schemes->nr)
 			break;
 
-		sysfs_stats = sysfs_schemes->schemes_arr[schemes_idx++]->stats;
+		sysfs_scheme = sysfs_schemes->schemes_arr[schemes_idx++];
+		damon_sysfs_scheme_update_source_state(sysfs_scheme, scheme);
+		sysfs_stats = sysfs_scheme->stats;
 		sysfs_stats->nr_tried = scheme->stat.nr_tried;
 		sysfs_stats->sz_tried = scheme->stat.sz_tried;
 		sysfs_stats->nr_applied = scheme->stat.nr_applied;

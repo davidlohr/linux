@@ -295,6 +295,24 @@ Contact:	SJ Park <sj@kernel.org>
 Description:	Action's target NUMA node id.  Supported by only relevant
 		actions.
 
+What:		/sys/kernel/mm/damon/admin/kdamonds/<K>/contexts/<C>/schemes/<S>/source
+Date:		Nov 2026
+Contact:	SJ Park <sj@kernel.org>
+Description:	Writing to and reading from this file sets and gets the name of
+		the hot range source of the scheme.  Writing an empty string
+		unsets it.  If set, the scheme is applied to the memory that
+		the source reports instead of to monitoring regions.
+
+What:		/sys/kernel/mm/damon/admin/kdamonds/<K>/contexts/<C>/schemes/<S>/source_state
+Date:		Nov 2026
+Contact:	SJ Park <sj@kernel.org>
+Description:	Reading this file returns the state of the hot range source of
+		the scheme as of the last update of the scheme's stats: 'none',
+		'attached', 'waiting', or 'error <errno>' with the negative
+		error of the last try to attach and start the source.  It is
+		'none' from when the kdamond is turned on until the first
+		update, and after the kdamond was turned off.
+
 What:		/sys/kernel/mm/damon/admin/kdamonds/<K>/contexts/<C>/schemes/<S>/apply_interval_us
 Date:		Sep 2023
 Contact:	SJ Park <sj@kernel.org>

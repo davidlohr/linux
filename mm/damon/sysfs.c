@@ -2599,6 +2599,8 @@ static int damon_sysfs_turn_damon_on(struct damon_sysfs_kdamond *kdamond)
 		return err;
 	}
 	kdamond->damon_ctx = ctx;
+	damon_sysfs_schemes_reset_source_state(
+			kdamond->contexts->contexts_arr[0]->schemes);
 
 	kdamond->next_refresh_jiffies = jiffies +
 		msecs_to_jiffies(kdamond->refresh_ms);
@@ -2618,6 +2620,10 @@ static int damon_sysfs_turn_damon_off(struct damon_sysfs_kdamond *kdamond)
 	if (!kdamond->damon_ctx)
 		return -EINVAL;
 	damon_stop(&kdamond->damon_ctx, 1);
+	/* kdamond has exited, and detached every source as it did */
+	if (kdamond->contexts->nr == 1)
+		damon_sysfs_schemes_reset_source_state(
+				kdamond->contexts->contexts_arr[0]->schemes);
 	/*
 	 * To allow users show final monitoring results of already turned-off
 	 * DAMON, we free kdamond->damon_ctx in next

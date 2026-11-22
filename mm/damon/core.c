@@ -9,6 +9,7 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/memcontrol.h>
+#include <linux/migrate.h>
 #include <linux/mm.h>
 #include <linux/pid.h>
 #include <linux/psi.h>
@@ -775,6 +776,10 @@ struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
 	scheme->max_nr_snapshots = 0;
 	scheme->last_applied = NULL;
 	INIT_LIST_HEAD(&scheme->list);
+
+	INIT_LIST_HEAD(&scheme->folios);
+	scheme->nr_folios = 0;
+	scheme->queued_sz = 0;
 
 	scheme->quota = *quota;
 	damos_quota_init(&scheme->quota);
@@ -3487,6 +3492,243 @@ static void damos_trace_stat(struct damon_ctx *c, struct damos *s)
 	trace_call__damos_stat_after_apply_interval(cidx, sidx, &s->stat);
 }
 
+/*
+ * Pushed folios
+ *
+ * A scheme can be handed folios that something other than DAMON's own
+ * monitoring found, see damos_add_folios().  The kdamond of the scheme's
+ * context queues them while it applies that scheme, and applies them before
+ * it moves on.  So nothing but kdamond touches the queue or reads the quota,
+ * which is why there is no lock, and an isolated folio never waits out a
+ * sleep of kdamond's.
+ */
+
+/* A scheme without a quota queues at most this many folios for one apply */
+#define DAMOS_MAX_QUEUED_FOLIOS		65536
+
+/* The queue of a scheme belongs to the kdamond of its context, if it runs */
+static void damos_assert_kdamond(struct damon_ctx *c)
+{
+	/*
+	 * Written under kdamond_lock by whoever starts kdamond and by
+	 * kdamond as it exits.  kdamond itself reads its own task or NULL;
+	 * any other reader is the bug this is here to report.
+	 */
+	struct task_struct *kdamond = data_race(c->kdamond);
+
+	WARN_ON_ONCE(kdamond && kdamond != current);
+}
+
+static bool damos_can_apply_folios(struct damon_ctx *c, struct damos *s)
+{
+	if (!c->ops.apply_folios || !s->wmarks.activated)
+		return false;
+	if (s->max_nr_snapshots && s->max_nr_snapshots <= s->stat.nr_snapshots)
+		return false;
+	return true;
+}
+
+/*
+ * What the quota of @s leaves for this charge window, in bytes.  The quota
+ * counts in the address unit of the context and the queue in bytes.
+ */
+static unsigned long damos_quota_left_bytes(struct damon_ctx *c,
+					    struct damos *s)
+{
+	struct damos_quota *quota = &s->quota;
+	unsigned long left = quota->esz > quota->charged_sz ?
+		quota->esz - quota->charged_sz : 0;
+
+	return left > ULONG_MAX / c->addr_unit ? ULONG_MAX :
+		left * c->addr_unit;
+}
+
+/*
+ * Would a push of @nr folios be refused?
+ *
+ * The caller is applying @s: it is due and active, and damos_adjust_quota()
+ * has made its charge window current.  With a quota, the queue takes pushes
+ * until it holds what the charge window can still apply, so the caller stops
+ * isolating once the budget is spoken for.  The push that gets there is taken
+ * whole, as the apply takes the folio it reaches the budget on; a caller that
+ * isolates no more than damos_folios_room() says queues no folio the apply
+ * does not take.
+ *
+ * What is not applied goes back to the LRU with putback_movable_pages(),
+ * which does nothing without CONFIG_MIGRATION, and neither does any action
+ * that can be applied to pushed folios, so nothing is queued then.
+ */
+static int damos_folios_refused(struct damon_ctx *c, struct damos *s,
+				unsigned long nr)
+{
+	unsigned long left;
+
+	damos_assert_kdamond(c);
+	if (!IS_ENABLED(CONFIG_MIGRATION))
+		return -EOPNOTSUPP;
+	if (s->nr_folios + nr > DAMOS_MAX_QUEUED_FOLIOS)
+		return -ENOSPC;
+	if (!damos_quota_is_set(&s->quota))
+		return 0;
+
+	left = damos_quota_left_bytes(c, s);
+	if (s->queued_sz >= left)
+		return -ENOSPC;
+	return 0;
+}
+
+/**
+ * damos_folios_wanted() - Would damos_add_folios() take folios now?
+ * @ctx:	The context of @s.
+ * @s:		The scheme.
+ *
+ * The answer damos_add_folios() would give an empty push, so that folios
+ * are not isolated for nothing.  Called from where damos_add_folios() is.
+ *
+ * Return: 0 if a push would be taken, else the error it would return.
+ */
+int damos_folios_wanted(struct damon_ctx *ctx, struct damos *s)
+{
+	return damos_folios_refused(ctx, s, 0);
+}
+
+/**
+ * damos_folios_room() - How many bytes would damos_add_folios() take now?
+ * @ctx:	The context of @s.
+ * @s:		The scheme.
+ *
+ * What the quota of @s leaves for this charge window beyond what is queued.
+ * A caller that isolates folios to push them stops isolating once it holds
+ * this many bytes and pushes, so that it isolates no more than the apply
+ * takes.  Called from where damos_add_folios() is.
+ *
+ * Return: the bytes, ULONG_MAX without a quota, 0 if a push is refused.
+ */
+unsigned long damos_folios_room(struct damon_ctx *ctx, struct damos *s)
+{
+	if (damos_folios_refused(ctx, s, 0))
+		return 0;
+	if (!damos_quota_is_set(&s->quota))
+		return ULONG_MAX;
+	return damos_quota_left_bytes(ctx, s) - s->queued_sz;
+}
+
+/**
+ * damos_add_folios() - Push folios to a DAMOS scheme.
+ * @ctx:	The context of @s.
+ * @s:		The scheme to apply its action to @folios.
+ * @folios:	LRU-isolated folios, linked through folio->lru.
+ *
+ * Queue @folios for @s.  The kdamond of @ctx applies the action of @s to
+ * them under the quota of @s before it does anything else, and returns
+ * whatever it does not apply to the LRU.  The folios must have been isolated
+ * with folio_isolate_lru() and accounted in NR_ISOLATED_*; the isolation's
+ * reference travels with the list.
+ *
+ * No filter of @s is run on a queued folio.  The core filters select
+ * regions and have nothing to say about one.  The operations set filters
+ * are for the caller to run before it isolates, so that a folio they reject
+ * never leaves the LRU.
+ *
+ * Must be called by the kdamond of @ctx from inside kdamond_apply_schemes(),
+ * for a scheme it is about to apply.  The queue and the quota of @s
+ * therefore need no lock.
+ *
+ * What is queued stays off the LRU until that apply.  A caller that pushes
+ * more than once must not wait, between two pushes, for anything whose
+ * holder may itself be waiting for those folios: memory offlining waits for
+ * every page of a block, and holds device_hotplug_lock while it does.
+ *
+ * Return: 0 on success.  -EOPNOTSUPP without CONFIG_MIGRATION, which every
+ * action that takes pushed folios needs.  -ENOSPC if the queue already holds
+ * what the quota of @s can still apply in this charge window, or
+ * DAMOS_MAX_QUEUED_FOLIOS folios; the push that reaches the quota is taken
+ * whole.  On an error @folios is untouched and still owned by the caller.
+ */
+int damos_add_folios(struct damon_ctx *ctx, struct damos *s,
+		     struct list_head *folios)
+{
+	unsigned long nr = 0, sz = 0;
+	struct folio *folio;
+	int err;
+
+	list_for_each_entry(folio, folios, lru) {
+		nr++;
+		sz += folio_size(folio);
+	}
+
+	err = damos_folios_refused(ctx, s, nr);
+	if (err)
+		return err;
+	list_splice_tail_init(folios, &s->folios);
+	s->nr_folios += nr;
+	s->queued_sz += sz;
+	return 0;
+}
+
+/* The pushed counterpart of damos_before_apply: folios queued, and bytes */
+static void damos_trace_before_apply_folios(struct damon_ctx *c,
+					    struct damos *s)
+{
+	unsigned int cidx = 0, sidx = 0;
+	struct damos *siter;
+
+	if (!trace_damos_before_apply_folios_enabled())
+		return;
+
+	damon_for_each_scheme(siter, c) {
+		if (siter == s)
+			break;
+		sidx++;
+	}
+	trace_call__damos_before_apply_folios(cidx, sidx, s->nr_folios,
+					      s->queued_sz);
+}
+
+static void damos_take_folios(struct damos *s, struct list_head *folios)
+{
+	list_splice_init(&s->folios, folios);
+	s->nr_folios = 0;
+	s->queued_sz = 0;
+}
+
+/*
+ * Apply the folios queued for @s, within what is left of the quota; what the
+ * operations set does not take goes back to the LRU.
+ * One apply is one try in the statistics of @s, see &struct damos_stat.
+ * There is no region to hand to a damos_walk() function, so none is called.
+ */
+static void damos_apply_folios(struct damon_ctx *c, struct damos *s)
+{
+	struct damos_quota *quota = &s->quota;
+	unsigned long sz_budget = ULONG_MAX;
+	unsigned long sz_tried = 0, sz_applied = 0, sz_filter_passed = 0;
+	struct timespec64 begin, end;
+	LIST_HEAD(folios);
+
+	if (list_empty(&s->folios))
+		return;
+	damos_trace_before_apply_folios(c, s);
+	damos_take_folios(s, &folios);
+
+	if (damos_quota_is_set(quota))
+		sz_budget = quota->esz > quota->charged_sz ?
+			quota->esz - quota->charged_sz : 0;
+
+	ktime_get_coarse_ts64(&begin);
+	if (sz_budget)
+		sz_applied = c->ops.apply_folios(c, s, &folios, sz_budget,
+				&sz_tried, &sz_filter_passed);
+	ktime_get_coarse_ts64(&end);
+	putback_movable_pages(&folios);
+	if (!sz_tried)
+		return;
+	quota->total_charged_ns += timespec64_to_ns(&end) -
+		timespec64_to_ns(&begin);
+	damos_charge_quota(quota, sz_tried, sz_applied);
+	damos_update_stat(s, sz_tried, sz_applied, sz_filter_passed);
+}
+
 static noinline_for_stack void kdamond_apply_schemes(struct damon_ctx *c)
 {
 	struct damon_target *t;
@@ -3522,6 +3764,13 @@ static noinline_for_stack void kdamond_apply_schemes(struct damon_ctx *c)
 			continue;
 		}
 		damos_apply_target(c, t, max_region_sz);
+	}
+
+	damon_for_each_scheme(s, c) {
+		if (time_before(c->passed_sample_intervals, s->next_apply_sis))
+			continue;
+		if (damos_can_apply_folios(c, s))
+			damos_apply_folios(c, s);
 	}
 
 	damon_for_each_scheme(s, c) {

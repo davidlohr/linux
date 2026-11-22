@@ -115,6 +115,27 @@ TRACE_EVENT_CONDITION(damos_before_apply,
 			__entry->nr_accesses, __entry->age)
 );
 
+TRACE_EVENT(damos_before_apply_folios,
+	TP_PROTO(unsigned int context_idx, unsigned int scheme_idx,
+		 unsigned long nr_folios, unsigned long sz),
+	TP_ARGS(context_idx, scheme_idx, nr_folios, sz),
+	TP_STRUCT__entry(
+		__field(unsigned int, context_idx)
+		__field(unsigned int, scheme_idx)
+		__field(unsigned long, nr_folios)
+		__field(unsigned long, sz)
+	),
+	TP_fast_assign(
+		__entry->context_idx = context_idx;
+		__entry->scheme_idx = scheme_idx;
+		__entry->nr_folios = nr_folios;
+		__entry->sz = sz;
+	),
+	TP_printk("ctx_idx=%u scheme_idx=%u nr_folios=%lu sz=%lu",
+		  __entry->context_idx, __entry->scheme_idx,
+		  __entry->nr_folios, __entry->sz)
+);
+
 TRACE_EVENT(damon_monitor_intervals_tune,
 
 	TP_PROTO(unsigned long sample_us),

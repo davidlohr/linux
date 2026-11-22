@@ -1778,6 +1778,734 @@ static void damon_test_valid_probe_params(struct kunit *test)
 	damon_destroy_ctx(ctx);
 }
 
+/*
+ * An operations set that takes pushed folios.  Its apply_folios() tries
+ * those the budget allows, at least one, and applies the first of them.  It
+ * takes every folio off the list: the tests queue folios that are not LRU
+ * ones, which must not be left for the core to put back.
+ */
+static LIST_HEAD(damos_test_applied_folios);
+static unsigned long damos_test_sz_budget;
+static bool damos_test_apply_none;
+
+static unsigned long
+damos_test_apply_folios(struct damon_ctx *ctx, struct damos *s,
+			struct list_head *folios, unsigned long sz_budget,
+			unsigned long *sz_tried,
+			unsigned long *sz_filter_passed)
+{
+	unsigned long sz = 0, applied = 0;
+	struct folio *folio;
+
+	damos_test_sz_budget = sz_budget;
+	list_for_each_entry(folio, folios, lru) {
+		unsigned long fsz = folio_size(folio) / ctx->addr_unit;
+
+		if (damos_test_apply_none || (sz && sz + fsz > sz_budget))
+			break;
+		if (!sz)
+			applied = fsz;
+		sz += fsz;
+	}
+	list_splice_tail_init(folios, &damos_test_applied_folios);
+	*sz_tried = sz;
+	*sz_filter_passed += sz;
+	return applied;
+}
+
+/* Its add_range(): count the range, and maybe use up the quota or fail */
+static int damos_test_nr_ranges;
+static bool damos_test_range_fills_quota;
+static int damos_test_range_err;
+
+static int damos_test_add_range(struct damon_ctx *ctx, struct damos *s,
+				phys_addr_t start, phys_addr_t size)
+{
+	damos_test_nr_ranges++;
+	if (damos_test_range_fills_quota)
+		s->quota.charged_sz = s->quota.esz;
+	return damos_test_range_err;
+}
+
+/* A source that hands over one range of @range_sz bytes at each fetch */
+struct damos_test_source {
+	struct damos_source src;
+	phys_addr_t range_sz;
+	int start_ret;
+	int fetch_ret;
+	int nr_start;
+	int nr_stop;
+	int nr_fetch;
+};
+
+static int damos_test_source_start(struct damos_source *src)
+{
+	struct damos_test_source *ts =
+		container_of(src, struct damos_test_source, src);
+
+	if (!ts->start_ret)
+		ts->nr_start++;
+	return ts->start_ret;
+}
+
+static void damos_test_source_stop(struct damos_source *src)
+{
+	container_of(src, struct damos_test_source, src)->nr_stop++;
+}
+
+static int damos_test_source_fetch(struct damos_source *src,
+				   damos_source_add_fn add, void *arg)
+{
+	struct damos_test_source *ts =
+		container_of(src, struct damos_test_source, src);
+	int err;
+
+	ts->nr_fetch++;
+	if (ts->range_sz) {
+		err = add(arg, 0, ts->range_sz);
+		if (err)
+			return err;
+	}
+	return ts->fetch_ret;
+}
+
+static void damos_test_source_init(struct damos_test_source *ts,
+				   const char *name)
+{
+	memset(ts, 0, sizeof(*ts));
+	ts->src.name = name;
+	ts->src.start = damos_test_source_start;
+	ts->src.stop = damos_test_source_stop;
+	ts->src.fetch = damos_test_source_fetch;
+}
+
+/*
+ * A context that takes ranges and folios, with one migrate_hot scheme that
+ * is due, active and names the source @name.  Skips the test if it cannot.
+ */
+static struct damon_ctx *damos_test_source_ctx(struct kunit *test,
+					       const char *name,
+					       struct damos **sp)
+{
+	struct damos_access_pattern pattern = {
+		.max_sz_region = ULONG_MAX,
+		.max_nr_accesses = UINT_MAX,
+		.max_age_region = UINT_MAX,
+	};
+	struct damos_quota quota = {};
+	struct damos_watermarks wmarks = {};
+	struct damon_ctx *ctx;
+	struct damos *s;
+
+	if (!IS_ENABLED(CONFIG_MIGRATION))
+		kunit_skip(test, "pushed folios need CONFIG_MIGRATION");
+
+	ctx = damon_new_ctx();
+	if (!ctx)
+		kunit_skip(test, "ctx alloc fail");
+	s = damon_new_scheme(&pattern, DAMOS_MIGRATE_HOT, 0, &quota, &wmarks,
+			     first_memory_node);
+	if (!s) {
+		damon_destroy_ctx(ctx);
+		kunit_skip(test, "scheme alloc fail");
+	}
+	strscpy(s->source_name, name);
+	damon_add_scheme(ctx, s);
+	ctx->passed_sample_intervals = s->next_apply_sis;
+	ctx->ops.id = DAMON_OPS_PADDR;
+	ctx->ops.add_range = damos_test_add_range;
+	ctx->ops.apply_folios = damos_test_apply_folios;
+
+	damos_test_nr_ranges = 0;
+	damos_test_range_fills_quota = false;
+	damos_test_range_err = 0;
+	damos_test_apply_none = false;
+	*sp = s;
+	return ctx;
+}
+
+static void damos_test_add_folios(struct kunit *test)
+{
+	struct folio *f[3], *folio, *next;
+	struct damon_ctx *ctx;
+	struct damos *s;
+	LIST_HEAD(folios);
+	LIST_HEAD(one);
+	int i;
+
+	ctx = damos_test_source_ctx(test, "", &s);
+
+	/* no quota: taken */
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(ctx, s), 0);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &folios), 0);
+
+	/* the quota of this window is used up: refused until the next */
+	s->quota.esz = 1024;
+	s->quota.charged_sz = 1024;
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(ctx, s), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &folios), -ENOSPC);
+	s->quota.charged_sz = 0;
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &folios), 0);
+
+	/* with a quota, the queue holds at most the window's remaining budget */
+	for (i = 0; i < ARRAY_SIZE(f); i++) {
+		f[i] = folio_alloc(GFP_KERNEL, 0);
+		if (!f[i])
+			break;
+		list_add_tail(&f[i]->lru, &folios);
+	}
+	if (i < ARRAY_SIZE(f)) {
+		list_for_each_entry_safe(folio, next, &folios, lru)
+			folio_put(folio);
+		damon_destroy_ctx(ctx);
+		kunit_skip(test, "folio alloc fail");
+	}
+	s->quota.esz = 2 * PAGE_SIZE;
+	KUNIT_EXPECT_EQ(test, damos_folios_room(ctx, s), 2 * PAGE_SIZE);
+	list_move_tail(folios.next, &one);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &one), 0);
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(ctx, s), 0);
+	KUNIT_EXPECT_EQ(test, damos_folios_room(ctx, s), PAGE_SIZE);
+	list_move_tail(folios.next, &one);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &one), 0);
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(ctx, s), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, damos_folios_room(ctx, s), 0);
+	list_move_tail(folios.next, &one);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &one), -ENOSPC);
+	KUNIT_EXPECT_FALSE(test, list_empty(&one));
+	KUNIT_EXPECT_EQ(test, s->nr_folios, 2);
+	KUNIT_EXPECT_EQ(test, s->queued_sz, 2 * PAGE_SIZE);
+
+	/*
+	 * a push that goes past what is left is taken whole, as the apply
+	 * takes the folio it reaches the quota on; then nothing more is
+	 */
+	s->quota.esz = 3 * PAGE_SIZE - 1;
+	KUNIT_EXPECT_EQ(test, damos_folios_room(ctx, s), PAGE_SIZE - 1);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &one), 0);
+	KUNIT_EXPECT_EQ(test, s->queued_sz, 3 * PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(ctx, s), -ENOSPC);
+
+	/*
+	 * the quota counts in address units and the queue in bytes: two units
+	 * of a page each take two pages
+	 */
+	damos_take_folios(s, &folios);
+	list_splice_init(&folios, &one);
+	ctx->addr_unit = PAGE_SIZE;
+	s->quota.esz = 2;
+	for (i = 0; i < 2; i++) {
+		LIST_HEAD(push);
+
+		KUNIT_EXPECT_EQ(test, damos_folios_wanted(ctx, s), 0);
+		list_move_tail(one.next, &push);
+		KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &push), 0);
+	}
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(ctx, s), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &one), -ENOSPC);
+	ctx->addr_unit = 1;
+	s->quota.esz = 0;
+
+	/* without a quota, the queue holds DAMOS_MAX_QUEUED_FOLIOS */
+	s->nr_folios = DAMOS_MAX_QUEUED_FOLIOS;
+	KUNIT_EXPECT_EQ(test, damos_folios_wanted(ctx, s), 0);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &one), -ENOSPC);
+
+	/* these are not LRU folios: off the queue before the scheme goes */
+	damos_take_folios(s, &folios);
+	KUNIT_EXPECT_EQ(test, s->nr_folios, 0);
+	KUNIT_EXPECT_EQ(test, s->queued_sz, 0);
+	list_for_each_entry_safe(folio, next, &folios, lru)
+		folio_put(folio);
+	list_for_each_entry_safe(folio, next, &one, lru)
+		folio_put(folio);
+	damon_destroy_ctx(ctx);
+}
+
+/* What an apply of pushed folios charges and counts */
+static void damos_test_apply_pushed_folios(struct kunit *test)
+{
+	struct folio *folio, *next;
+	struct damon_ctx *ctx;
+	struct damos *s;
+	LIST_HEAD(folios);
+	LIST_HEAD(push);
+	int i;
+
+	ctx = damos_test_source_ctx(test, "", &s);
+	for (i = 0; i < 6; i++) {
+		folio = folio_alloc(GFP_KERNEL, 0);
+		if (!folio)
+			break;
+		list_add_tail(&folio->lru, &folios);
+	}
+	if (i < 6) {
+		list_for_each_entry_safe(folio, next, &folios, lru)
+			folio_put(folio);
+		damon_destroy_ctx(ctx);
+		kunit_skip(test, "folio alloc fail");
+	}
+
+	/* three units of a page each, one of them charged: two are left */
+	ctx->addr_unit = PAGE_SIZE;
+	s->quota.esz = 3;
+	s->quota.charged_sz = 1;
+
+	/* nothing was tried: no size, so no time is charged and no try counted */
+	damos_test_apply_none = true;
+	list_cut_position(&push, &folios, folios.next->next->next);
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &push), 0);
+	damos_apply_folios(ctx, s, NSEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, s->nr_folios, 0);
+	KUNIT_EXPECT_EQ(test, s->quota.total_charged_ns, 0);
+	KUNIT_EXPECT_EQ(test, s->quota.charged_sz, 1);
+	KUNIT_EXPECT_EQ(test, s->stat.nr_tried, 0);
+	damos_test_apply_none = false;
+
+	/* three folios for a budget of two: two tried, one of them applied */
+	KUNIT_EXPECT_EQ(test, damos_add_folios(ctx, s, &folios), 0);
+	KUNIT_EXPECT_EQ(test, s->nr_folios, 3);
+	damos_apply_folios(ctx, s, NSEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, damos_test_sz_budget, 2);
+	KUNIT_EXPECT_TRUE(test, list_empty(&s->folios));
+	KUNIT_EXPECT_EQ(test, s->nr_folios, 0);
+	KUNIT_EXPECT_EQ(test, s->queued_sz, 0);
+	KUNIT_EXPECT_EQ(test, s->quota.charged_sz, 3);
+	KUNIT_EXPECT_GE(test, s->quota.total_charged_ns, NSEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, s->stat.nr_tried, 1);
+	KUNIT_EXPECT_EQ(test, s->stat.sz_tried, 2);
+	KUNIT_EXPECT_EQ(test, s->stat.nr_applied, 1);
+	KUNIT_EXPECT_EQ(test, s->stat.sz_applied, 1);
+	KUNIT_EXPECT_EQ(test, s->stat.sz_ops_filter_passed, 2);
+
+	i = 0;
+	list_for_each_entry_safe(folio, next, &damos_test_applied_folios,
+				 lru) {
+		list_del(&folio->lru);
+		folio_put(folio);
+		i++;
+	}
+	KUNIT_EXPECT_EQ(test, i, 6);
+	damon_destroy_ctx(ctx);
+}
+
+/*
+ * A context made only to take pushed folios has no monitoring target.  Its
+ * kdamond keeps running because the paddr operations set has no
+ * target_valid(): this fails if that stops being so.
+ */
+static void damon_test_paddr_ctx_without_targets(struct kunit *test)
+{
+	struct damon_ctx *ctx = damon_new_ctx();
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	if (damon_select_ops(ctx, DAMON_OPS_PADDR)) {
+		damon_destroy_ctx(ctx);
+		kunit_skip(test, "no paddr operations set");
+	}
+	KUNIT_EXPECT_TRUE(test, list_empty(&ctx->adaptive_targets));
+	KUNIT_EXPECT_FALSE(test, kdamond_need_stop(ctx));
+	damon_destroy_ctx(ctx);
+}
+
+static void damos_test_source_register(struct kunit *test)
+{
+	struct damos_test_source a, b;
+
+	damos_test_source_init(&a, "kunit_a");
+	damos_test_source_init(&b, "kunit_a");
+
+	a.src.name = NULL;
+	KUNIT_EXPECT_EQ(test, damos_register_source(&a.src), -EINVAL);
+	a.src.name = "";
+	KUNIT_EXPECT_EQ(test, damos_register_source(&a.src), -EINVAL);
+	/* DAMOS_SOURCE_NAME_LEN characters: one too many */
+	a.src.name = "kunit_0123456789_0123456789_0123";
+	KUNIT_EXPECT_EQ(test, damos_register_source(&a.src), -EINVAL);
+	a.src.name = "kunit_a";
+	a.src.fetch = NULL;
+	KUNIT_EXPECT_EQ(test, damos_register_source(&a.src), -EINVAL);
+	a.src.fetch = damos_test_source_fetch;
+	KUNIT_EXPECT_NULL(test, a.src.handle);
+
+	KUNIT_ASSERT_EQ(test, damos_register_source(&a.src), 0);
+	KUNIT_EXPECT_NOT_NULL(test, a.src.handle);
+	KUNIT_EXPECT_EQ(test, damos_register_source(&b.src), -EEXIST);
+	KUNIT_EXPECT_NULL(test, b.src.handle);
+
+	/* the name is free again once it is unregistered */
+	damos_unregister_source(&a.src);
+	KUNIT_EXPECT_NULL(test, a.src.handle);
+	KUNIT_ASSERT_EQ(test, damos_register_source(&b.src), 0);
+	damos_unregister_source(&b.src);
+	KUNIT_EXPECT_EQ(test, a.nr_stop + b.nr_stop, 0);
+}
+
+/* What damon_commit_ctx() refuses for a scheme that names a source */
+static void damos_test_source_check(struct kunit *test)
+{
+	struct damos_quota_goal *goal;
+	struct damos_filter *filter;
+	struct damon_ctx *src, *dst;
+	struct damos *s, *ds;
+	int nid;
+
+	src = damos_test_source_ctx(test, "kunit_a", &s);
+	dst = damon_new_ctx();
+	if (!dst) {
+		damon_destroy_ctx(src);
+		kunit_skip(test, "dst alloc fail");
+	}
+	nid = s->target_nid;
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+
+	/* an operations set that takes no ranges, or no folios */
+	src->ops.add_range = NULL;
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), -EINVAL);
+	src->ops.add_range = damos_test_add_range;
+	src->ops.apply_folios = NULL;
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), -EINVAL);
+	src->ops.apply_folios = damos_test_apply_folios;
+
+	/* an action that is not a migration; no kdamond is started for it */
+	s->action = DAMOS_PAGEOUT;
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), -EINVAL);
+	KUNIT_EXPECT_EQ(test, damon_start(&src, 1, false), -EINVAL);
+	KUNIT_EXPECT_FALSE(test, damon_is_running(src));
+	s->action = DAMOS_MIGRATE_COLD;
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+
+	/* no target node, or one that cannot be */
+	s->target_nid = NUMA_NO_NODE;
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), -EINVAL);
+	s->target_nid = MAX_NUMNODES;
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), -EINVAL);
+	s->target_nid = nid;
+
+	/* migration destinations: pushed folios go to target_nid only */
+	s->migrate_dests.nr_dests = 1;
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), -EINVAL);
+	s->migrate_dests.nr_dests = 0;
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+
+	/* a core filter is refused, an operations set one is not */
+	filter = damos_new_filter(DAMOS_FILTER_TYPE_ANON, true, false);
+	if (filter) {
+		damos_add_filter(s, filter);
+		KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+	}
+	filter = damos_new_filter(DAMOS_FILTER_TYPE_ADDR, true, false);
+	if (filter) {
+		damos_add_filter(s, filter);
+		KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), -EINVAL);
+		damos_destroy_filter(filter);
+	}
+
+	/* a goal that is computed from the scheme's regions */
+	goal = damos_new_quota_goal(DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP, false,
+				    1);
+	if (goal) {
+		damos_add_quota_goal(&s->quota, goal);
+		KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), -EINVAL);
+		KUNIT_EXPECT_EQ(test, damos_source_check_goals(s, &s->quota),
+				-EINVAL);
+		damos_destroy_quota_goal(goal);
+		/*
+		 * only the new parameters are checked, not what the destination
+		 * became since (its target node lost its memory): that would
+		 * also refuse the commit that repairs it
+		 */
+		damon_for_each_scheme(ds, dst)
+			ds->target_nid = NUMA_NO_NODE;
+		KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+	}
+
+	goal = damos_new_quota_goal(DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP, false,
+				    1);
+	if (goal) {
+		damos_add_quota_goal(&s->quota, goal);
+		/* all of it is fine for a scheme without a source */
+		s->source_name[0] = '\0';
+		s->action = DAMOS_PAGEOUT;
+		KUNIT_EXPECT_EQ(test, damos_source_check_goals(s, &s->quota),
+				0);
+		KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+	}
+
+	damon_destroy_ctx(src);
+	damon_destroy_ctx(dst);
+}
+
+static void damos_test_source_attach(struct kunit *test)
+{
+	struct damos_test_source a;
+	struct damon_ctx *ctx, *ctx2;
+	struct damos *s, *s2;
+
+	damos_test_source_init(&a, "kunit_a");
+	ctx2 = damos_test_source_ctx(test, "kunit_a", &s2);
+	ctx = damos_test_source_ctx(test, "kunit_a", &s);
+
+	/* no source of that name yet: tried at each apply */
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_NULL(test, s->source);
+	KUNIT_EXPECT_EQ(test, s->source_err, -ENODEV);
+
+	KUNIT_ASSERT_EQ(test, damos_register_source(&a.src), 0);
+
+	/* its start fails: not attached, not stopped, free for the next try */
+	a.start_ret = -EIO;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_NULL(test, s->source);
+	KUNIT_EXPECT_EQ(test, s->source_err, -EIO);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 0);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, 0);
+
+	a.start_ret = 0;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_PTR_EQ(test, s->source, a.src.handle);
+	KUNIT_EXPECT_EQ(test, s->source_err, 0);
+	KUNIT_EXPECT_EQ(test, a.nr_start, 1);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, 1);
+
+	/* started once, however often the scheme is applied */
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_EQ(test, a.nr_start, 1);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, 2);
+
+	/* a source has one scheme at a time */
+	damos_apply_source(ctx2, s2);
+	KUNIT_EXPECT_NULL(test, s2->source);
+	KUNIT_EXPECT_EQ(test, s2->source_err, -EBUSY);
+	KUNIT_EXPECT_EQ(test, a.nr_start, 1);
+
+	/* destroying the scheme stops and frees the source */
+	damon_destroy_ctx(ctx);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 1);
+	damos_apply_source(ctx2, s2);
+	KUNIT_EXPECT_PTR_EQ(test, s2->source, a.src.handle);
+	KUNIT_EXPECT_EQ(test, a.nr_start, 2);
+
+	damon_destroy_ctx(ctx2);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 2);
+	damos_unregister_source(&a.src);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 2);
+}
+
+/* What ends the fetching of one apply */
+static void damos_test_source_fetch_loop(struct kunit *test)
+{
+	struct damos_test_source a;
+	struct damon_ctx *ctx;
+	struct damos *s;
+
+	damos_test_source_init(&a, "kunit_a");
+	ctx = damos_test_source_ctx(test, "kunit_a", &s);
+	KUNIT_ASSERT_EQ(test, damos_register_source(&a.src), 0);
+
+	/* the source has nothing left */
+	a.range_sz = PAGE_SIZE;
+	a.fetch_ret = 0;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, 1);
+	KUNIT_EXPECT_EQ(test, damos_test_nr_ranges, 1);
+
+	/* it has more: DAMOS_SOURCE_FETCH_SZ of ranges were handed over */
+	a.range_sz = DAMOS_SOURCE_FETCH_SZ / 4;
+	a.fetch_ret = 1;
+	a.nr_fetch = 0;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, 4);
+
+	/* it has more and hands nothing over: the fetches are counted */
+	a.range_sz = 0;
+	a.nr_fetch = 0;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, DAMOS_SOURCE_FETCH_MAX);
+	a.range_sz = DAMOS_SOURCE_FETCH_SZ / 4;
+
+	/* an error of its own: it stays attached */
+	a.fetch_ret = -EIO;
+	a.nr_fetch = 0;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, 1);
+	KUNIT_EXPECT_NOT_NULL(test, s->source);
+	KUNIT_EXPECT_EQ(test, s->source_err, 0);
+
+	/* the scheme refused a range */
+	a.fetch_ret = 1;
+	a.nr_fetch = 0;
+	damos_test_range_err = -ENOSPC;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, 1);
+	damos_test_range_err = 0;
+
+	/* the quota was used up by what a fetch added */
+	s->quota.esz = PAGE_SIZE;
+	damos_test_range_fills_quota = true;
+	a.nr_fetch = 0;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, 1);
+	/* and stays so for the rest of the charge window */
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, 1);
+	s->quota.esz = 0;
+	s->quota.charged_sz = 0;
+	damos_test_range_fills_quota = false;
+
+	/* -ENODEV: stopped and detached, attached again at the next apply */
+	a.fetch_ret = -ENODEV;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_NULL(test, s->source);
+	KUNIT_EXPECT_EQ(test, s->source_err, -ENODEV);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 1);
+	a.fetch_ret = 0;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_NOT_NULL(test, s->source);
+	KUNIT_EXPECT_EQ(test, s->source_err, 0);
+	KUNIT_EXPECT_EQ(test, a.nr_start, 2);
+
+	/* no fetch led to a folio that was tried: no time was charged */
+	KUNIT_EXPECT_EQ(test, s->quota.total_charged_ns, 0);
+
+	damon_destroy_ctx(ctx);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 2);
+	damos_unregister_source(&a.src);
+}
+
+/* A commit that changes the name, or removes the scheme, detaches */
+static void damos_test_source_commit(struct kunit *test)
+{
+	struct damos_test_source a, b;
+	struct damon_ctx *src, *dst;
+	struct damos *s, *ds;
+
+	damos_test_source_init(&a, "kunit_a");
+	damos_test_source_init(&b, "kunit_b");
+	src = damos_test_source_ctx(test, "kunit_a", &s);
+	dst = damos_test_source_ctx(test, "kunit_a", &ds);
+	KUNIT_ASSERT_EQ(test, damos_register_source(&a.src), 0);
+	KUNIT_ASSERT_EQ(test, damos_register_source(&b.src), 0);
+
+	damos_apply_source(dst, ds);
+	KUNIT_ASSERT_PTR_EQ(test, ds->source, a.src.handle);
+
+	/* the same name: the source is left alone */
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+	KUNIT_EXPECT_PTR_EQ(test, ds->source, a.src.handle);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 0);
+
+	/* another: the old one is stopped, the new one waits for an apply */
+	strscpy(s->source_name, "kunit_b");
+	ds->source_err = -EIO;
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+	KUNIT_EXPECT_NULL(test, ds->source);
+	KUNIT_EXPECT_EQ(test, ds->source_err, 0);
+	KUNIT_EXPECT_STREQ(test, ds->source_name, "kunit_b");
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 1);
+	KUNIT_EXPECT_EQ(test, b.nr_start, 0);
+	damos_apply_source(dst, ds);
+	KUNIT_EXPECT_PTR_EQ(test, ds->source, b.src.handle);
+
+	/* none: an ordinary scheme again */
+	s->source_name[0] = '\0';
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+	KUNIT_EXPECT_NULL(test, ds->source);
+	KUNIT_EXPECT_EQ(test, ds->source_name[0], '\0');
+	KUNIT_EXPECT_EQ(test, b.nr_stop, 1);
+
+	/* the scheme is removed while its source is attached */
+	strscpy(s->source_name, "kunit_a");
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+	damos_apply_source(dst, ds);
+	KUNIT_EXPECT_PTR_EQ(test, ds->source, a.src.handle);
+	damon_destroy_scheme(s);
+	KUNIT_EXPECT_EQ(test, damon_commit_ctx(dst, src), 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&dst->schemes));
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 2);
+
+	damon_destroy_ctx(src);
+	damon_destroy_ctx(dst);
+	damos_unregister_source(&a.src);
+	damos_unregister_source(&b.src);
+	KUNIT_EXPECT_EQ(test, a.nr_start, a.nr_stop);
+	KUNIT_EXPECT_EQ(test, b.nr_start, b.nr_stop);
+}
+
+/* A source that is unregistered under a scheme */
+static void damos_test_source_unregister(struct kunit *test)
+{
+	struct damos_test_source a;
+	struct damon_ctx *ctx;
+	struct damos *s;
+
+	damos_test_source_init(&a, "kunit_a");
+	ctx = damos_test_source_ctx(test, "kunit_a", &s);
+	KUNIT_ASSERT_EQ(test, damos_register_source(&a.src), 0);
+	damos_apply_source(ctx, s);
+	KUNIT_ASSERT_NOT_NULL(test, s->source);
+
+	/* unregistering stops it; the scheme is left with a dead handle */
+	damos_unregister_source(&a.src);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 1);
+	KUNIT_EXPECT_NULL(test, a.src.handle);
+	KUNIT_EXPECT_NOT_NULL(test, s->source);
+
+	/* which the next apply drops without calling the source */
+	a.nr_fetch = 0;
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_NULL(test, s->source);
+	KUNIT_EXPECT_EQ(test, s->source_err, -ENODEV);
+	KUNIT_EXPECT_EQ(test, a.nr_fetch, 0);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 1);
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_EQ(test, s->source_err, -ENODEV);
+
+	/* registered again, it is attached again */
+	KUNIT_ASSERT_EQ(test, damos_register_source(&a.src), 0);
+	damos_apply_source(ctx, s);
+	KUNIT_EXPECT_PTR_EQ(test, s->source, a.src.handle);
+	KUNIT_EXPECT_EQ(test, a.nr_start, 2);
+
+	/* a dead handle outlives its registration until the scheme goes */
+	damos_unregister_source(&a.src);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 2);
+	damon_destroy_ctx(ctx);
+	KUNIT_EXPECT_EQ(test, a.nr_stop, 2);
+}
+
+/* A scheme that names a source is not applied to regions */
+static void damos_test_source_skips_regions(struct kunit *test)
+{
+	struct damon_ctx *ctx;
+	struct damon_target *t;
+	struct damon_region *r;
+	struct damos *s;
+
+	ctx = damos_test_source_ctx(test, "kunit_a", &s);
+	t = damon_new_target();
+	r = t ? damon_new_region(0, PAGE_SIZE) : NULL;
+	if (!r) {
+		if (t)
+			damon_free_target(t);
+		damon_destroy_ctx(ctx);
+		kunit_skip(test, "target or region alloc fail");
+	}
+	damon_add_region(r, t);
+	damon_add_target(ctx, t);
+
+	damon_do_apply_schemes(ctx, t, r);
+	KUNIT_EXPECT_EQ(test, s->stat.nr_tried, 0);
+	KUNIT_EXPECT_EQ(test, s->stat.nr_snapshots, 0);
+
+	s->source_name[0] = '\0';
+	damon_do_apply_schemes(ctx, t, r);
+	KUNIT_EXPECT_EQ(test, s->stat.nr_tried, 1);
+	KUNIT_EXPECT_EQ(test, s->stat.nr_snapshots, 1);
+
+	damon_destroy_ctx(ctx);
+}
+
 static void damos_test_filter_out(struct kunit *test)
 {
 	struct damon_target *t;
@@ -2517,6 +3245,16 @@ static struct kunit_case damon_test_cases[] = {
 	KUNIT_CASE(damos_test_apply_scheme_filtered_sz),
 	KUNIT_CASE(damos_test_apply_scheme_filter_sz_unchanged),
 	KUNIT_CASE(damos_test_apply_scheme_quota_sz),
+	KUNIT_CASE(damos_test_add_folios),
+	KUNIT_CASE(damos_test_apply_pushed_folios),
+	KUNIT_CASE(damon_test_paddr_ctx_without_targets),
+	KUNIT_CASE(damos_test_source_register),
+	KUNIT_CASE(damos_test_source_check),
+	KUNIT_CASE(damos_test_source_attach),
+	KUNIT_CASE(damos_test_source_fetch_loop),
+	KUNIT_CASE(damos_test_source_commit),
+	KUNIT_CASE(damos_test_source_unregister),
+	KUNIT_CASE(damos_test_source_skips_regions),
 	KUNIT_CASE(damon_test_feed_loop_next_input),
 	KUNIT_CASE(damon_test_set_filters_default_reject),
 	KUNIT_CASE(damon_test_apply_min_nr_regions),

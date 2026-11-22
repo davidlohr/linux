@@ -250,8 +250,8 @@ config CXL_HMU
 	  Driver for CXL Hot-range Monitoring Units (CXL r4.0 section 8.2.8),
 	  which report the units of device memory accessed more than a
 	  threshold number of times. Each instance of a unit is a device with
-	  its capabilities in sysfs, held by one user at a time: the perf
-	  PMU below, while an event is open on it.
+	  its capabilities in sysfs, used by one of the options below at a
+	  time: whichever takes it first holds it until it is done.
 
 	  If unsure say N.
 
@@ -264,4 +264,20 @@ config CXL_HMU_PERF
 	  a perf PMU whose AUX buffer carries the raw hotlist, for perf record
 	  and perf report. An open event holds the instance; opening one on
 	  an instance held by another user fails with -EBUSY.
+
+config CXL_HMU_DAMON
+	bool "CXL HMU DAMOS hot range source"
+	depends on CXL_HMU && DAMON_PADDR && NUMA && MIGRATION
+	help
+	  Register each CHMU instance with DAMON as a hot range source named
+	  after the instance device, for example "hmu_mem0.0.0". A DAMOS
+	  migrate_hot or migrate_cold scheme of a physical address space
+	  context that has that name in its "source" file migrates the pages
+	  of the units the instance reports, under the scheme's quota and
+	  filters. DAMON starts the instance, polls it and stops it; the
+	  scheme holds the instance meanwhile.
+
+	  The schemes are set up in the DAMON sysfs interface (DAMON_SYSFS).
+
+	  If unsure say N.
 endif

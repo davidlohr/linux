@@ -476,6 +476,12 @@ unsigned int cxl_hmu_drain(struct cxl_hmu_inst *inst, u64 *entries,
 	return n;
 }
 
+void cxl_hmu_account_dropped(struct cxl_hmu_inst *inst, unsigned int nr)
+{
+	guard(raw_spinlock_irqsave)(&inst->lock);
+	inst->dropped += nr;
+}
+
 bool cxl_hmu_pending(struct cxl_hmu_inst *inst)
 {
 	return readq(inst->base + CHMU_INST0_STATUS_REG) &
@@ -854,13 +860,17 @@ static void cxl_hmu_default_config(struct cxl_hmu_inst *inst)
  * Unbind. The actions that unregister the instance's PMU and free the
  * interrupt it requested were added after this one, so they have run:
  * every perf event is closed, which released a claim perf held, and none
- * can be opened.
+ * can be opened. That leaves DAMON, which may have the instance started as
+ * a hot range source: unregistering the source waits for a fetch in flight
+ * and stops it, which releases the instance, and DAMON can start nothing
+ * that is not registered. So no claim is left and none can succeed.
  */
 static void cxl_hmu_inst_remove(void *data)
 {
 	struct cxl_hmu_inst *inst = data;
 	struct cxl_hmu_block *block = inst->block;
 
+	cxl_hmu_damon_unregister(inst);
 	scoped_guard(mutex, &block->lock) {
 		WARN_ON_ONCE(inst->owner);
 		block->inst[inst->index] = NULL;
@@ -907,10 +917,13 @@ static int cxl_hmu_inst_add(struct cxl_hmu_block *block, unsigned int index,
 		block->num_inst = max(block->num_inst, index + 1);
 	}
 	rc = device_add(&inst->dev);
+	if (rc)
+		goto err_table;
+	/* Last: DAMON may start the source at once */
+	rc = cxl_hmu_damon_register(inst);
 	if (rc) {
-		scoped_guard(mutex, &block->lock)
-			block->inst[index] = NULL;
-		goto err;
+		device_del(&inst->dev);
+		goto err_table;
 	}
 	rc = devm_add_action_or_reset(dev, cxl_hmu_inst_remove, inst);
 	if (rc)
@@ -934,6 +947,9 @@ static int cxl_hmu_inst_add(struct cxl_hmu_block *block, unsigned int index,
 			inst->irq = irq;
 	}
 	return 0;
+err_table:
+	scoped_guard(mutex, &block->lock)
+		block->inst[index] = NULL;
 err:
 	put_device(&inst->dev);
 	return rc;

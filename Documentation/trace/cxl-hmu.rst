@@ -264,11 +264,61 @@ To avoid problems with downsampling when accesses are periodic this option
 allows for an implementation defined randomization of the sampling interval,
 whilst remaining close to the specified downsampling_factor.
 
+In-kernel use
+=============
+
+An instance that no perf event holds can be used by the kernel instead. With
+CONFIG_CXL_HMU_DAMON every instance is a DAMOS hot range source, named after
+the instance device (see :ref:`Hot Range Sources <damon_design_damos_source>`
+in the DAMON design document). A DAMOS migration scheme that names it
+migrates the pages of the hot units to another NUMA node. The instance is
+then polled by DAMON, with its interrupts disabled, and it is configured by
+the attributes of the instance device, not by the parameters above. While
+the scheme has it, perf_event_open() on the instance's PMU fails with -EBUSY.
+See Documentation/ABI/testing/sysfs-bus-cxl-hmu.
+
+The scheme is an ordinary one of the :doc:`DAMON sysfs interface
+</admin-guide/mm/damon/usage>`, so its quota, filters, target node and
+statistics are set and read there. For example, to promote what instance
+hmu_mem0.0.0 finds hot at a 2 MiB granularity to node 0, at no more than
+128 MiB and 10 ms of work per second::
+
+    # echo N > /sys/module/damon_stat/parameters/enabled  # if built
+    # cd /sys/bus/cxl/devices/hmu_mem0.0/hmu_mem0.0.0
+    # echo 2097152 > unit_size
+    # echo 16 > hotness_threshold
+    # cd /sys/kernel/mm/damon/admin/kdamonds
+    # echo 1 > nr_kdamonds; echo 1 > 0/contexts/nr_contexts
+    # cd 0/contexts/0
+    # echo paddr > operations
+    # echo 100000 > monitoring_attrs/intervals/sample_us
+    # echo 100000 > monitoring_attrs/intervals/aggr_us
+    # echo 1 > schemes/nr_schemes
+    # cd schemes/0
+    # echo migrate_hot > action
+    # echo 0 > target_nid
+    # echo 10 > quotas/ms
+    # echo $((128*1024*1024)) > quotas/bytes
+    # echo 1000 > quotas/reset_interval_ms
+    # echo hmu_mem0.0.0 > source
+    # echo on > ../../../../state
+    # echo update_schemes_stats > ../../../../state
+    # cat source_state
+    attached
+    # cat /sys/bus/cxl/devices/hmu_mem0.0/hmu_mem0.0.0/owner
+    damon
+
+The instance's attributes are read when DAMON starts the source. To apply a
+change to them while the scheme runs, clear the scheme's source, commit, set
+it again and commit, or turn the kdamond off and on. Writing off to the
+kdamond's state, or committing a scheme without the source, stops the
+instance and gives it up.
+
 Trace events
 ============
 
-The cxl_hmu trace system has two events. Each starts with the name of the
-instance device.
+The cxl_hmu trace system has two events, and a third, cxl_hmu_fetch, with
+CONFIG_CXL_HMU_DAMON. Each starts with the name of the instance device.
 
 cxl_hmu_hotlist
   One read of the hotlist, by the PMU or by an in-kernel user, including a
@@ -284,3 +334,15 @@ cxl_hmu_hpa_range
   threshold in always-on mode. Ranges are page granular, so one can be
   larger than the unit, and a unit on an interleaved region has several.
   Only a range that is at least partly System RAM is reported.
+
+cxl_hmu_fetch
+  Only with CONFIG_CXL_HMU_DAMON. One fetch by DAMON from the instance as a
+  hot range source, which is one batch: drained is the number of entries
+  taken off the hotlist, pushed the units of those handed to the scheme
+  whole, dropped the entries taken and not handed over (a unit with no
+  System RAM behind it has nothing to hand over and is one of them), lost
+  is 1 if the device lost hot units to an overflow, and err is what ended
+  the batch: 0 if no entry was refused, else a negative errno (-ENOSPC is
+  the scheme's quota, -EBUSY a unit that could not be translated without
+  waiting for a lock, -ENODEV a memory device that cxl_mem is no longer
+  bound to).

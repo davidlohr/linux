@@ -184,6 +184,8 @@ struct cxl_hmu_block {
 	struct cxl_hmu_inst	*inst[CXL_HMU_MAX_INST];
 };
 
+struct cxl_hmu_damon;
+
 struct cxl_hmu_inst {
 	struct device		dev;
 	struct cxl_hmu_block	*block;
@@ -216,6 +218,7 @@ struct cxl_hmu_inst {
 	bool			enabled;	/* hardware enabled */
 	unsigned long		overflows;	/* hotlist overflows since the last start */
 	unsigned long		dropped;	/* entries the holder discarded since then */
+	struct cxl_hmu_damon	*damon;		/* the DAMOS hot range source, if built */
 };
 #define to_cxl_hmu_inst(d) container_of(d, struct cxl_hmu_inst, dev)
 
@@ -270,6 +273,9 @@ void cxl_hmu_stop(struct cxl_hmu_inst *inst);
  * told from what the device lost. Returns the number taken; @flags says
  * what else there is to know.
  *
+ * cxl_hmu_account_dropped() adds to "dropped" the entries a holder drained
+ * into a buffer and then could not use.
+ *
  * cxl_hmu_pending() is true if the instance has an interrupt status bit
  * set, for the handler of a shared vector.
  */
@@ -283,6 +289,7 @@ void cxl_hmu_stop(struct cxl_hmu_inst *inst);
 
 unsigned int cxl_hmu_drain(struct cxl_hmu_inst *inst, u64 *entries,
 			   unsigned int max, unsigned int *flags);
+void cxl_hmu_account_dropped(struct cxl_hmu_inst *inst, unsigned int nr);
 bool cxl_hmu_pending(struct cxl_hmu_inst *inst);
 
 /*
@@ -305,6 +312,19 @@ int cxl_hmu_perf_probe_inst(struct cxl_hmu_inst *inst);
 static inline int cxl_hmu_perf_init(void) { return 0; }
 static inline void cxl_hmu_perf_exit(void) { }
 static inline int cxl_hmu_perf_probe_inst(struct cxl_hmu_inst *inst) { return 0; }
+#endif
+
+/*
+ * An instance as a DAMOS hot range source, named after its device. It is
+ * registered once the device is added and unregistered first thing at
+ * unbind, which is what stops a source that DAMON has started.
+ */
+#if IS_ENABLED(CONFIG_CXL_HMU_DAMON)
+int cxl_hmu_damon_register(struct cxl_hmu_inst *inst);
+void cxl_hmu_damon_unregister(struct cxl_hmu_inst *inst);
+#else
+static inline int cxl_hmu_damon_register(struct cxl_hmu_inst *inst) { return 0; }
+static inline void cxl_hmu_damon_unregister(struct cxl_hmu_inst *inst) { }
 #endif
 
 #endif

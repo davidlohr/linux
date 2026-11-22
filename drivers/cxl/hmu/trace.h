@@ -56,6 +56,41 @@ TRACE_EVENT(cxl_hmu_hpa_range,
 		  __entry->nr_accesses)
 );
 
+#if IS_ENABLED(CONFIG_CXL_HMU_DAMON)
+/*
+ * One fetch by DAMON from the instance as a hot range source: the entries
+ * taken off the hotlist, the units of those handed over whole, and the
+ * entries that had to be dropped, those of a unit with no range to hand
+ * over included. @err is what ended it: 0 if no entry was refused, else
+ * why DAMON took no more (-ENOSPC is the scheme's quota) or why a unit
+ * could not be walked.
+ */
+TRACE_EVENT(cxl_hmu_fetch,
+	TP_PROTO(const struct cxl_hmu_inst *inst, unsigned int drained,
+		 unsigned int pushed, unsigned int dropped, bool lost, int err),
+	TP_ARGS(inst, drained, pushed, dropped, lost, err),
+	TP_STRUCT__entry(
+		__string(dev, dev_name(&inst->dev))
+		__field(unsigned int, drained)
+		__field(unsigned int, pushed)
+		__field(unsigned int, dropped)
+		__field(bool, lost)
+		__field(int, err)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->drained = drained;
+		__entry->pushed = pushed;
+		__entry->dropped = dropped;
+		__entry->lost = lost;
+		__entry->err = err;
+	),
+	TP_printk("%s drained=%u pushed=%u dropped=%u lost=%d err=%d",
+		  __get_str(dev), __entry->drained, __entry->pushed,
+		  __entry->dropped, __entry->lost, __entry->err)
+);
+#endif /* CONFIG_CXL_HMU_DAMON */
+
 #endif /* _CXL_HMU_TRACE_H */
 
 /* This part must be outside protection */

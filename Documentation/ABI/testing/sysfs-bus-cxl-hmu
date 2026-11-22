@@ -10,6 +10,51 @@ Description:
 		It has one user at a time, whichever takes it first: see
 		owner.
 
+		With CONFIG_CXL_HMU_DAMON the name of this directory,
+		hmu_memX.Y.Z, is also the name of a DAMOS hot range source:
+		write it to the "source" file of a migrate_hot or migrate_cold
+		scheme of a DAMON physical address space context (see
+		Documentation/ABI/testing/sysfs-kernel-mm-damon) to have the
+		pages of the units the instance reports migrated to the
+		scheme's target node, under the scheme's quota and filters.
+		The worker thread of the DAMON context then takes the
+		instance, starts it with the configuration staged in the files
+		below and no interrupt, and polls it: at each apply interval
+		of the scheme, and while the scheme's quota has room, it takes
+		batches of 32 entries off the hotlist, translates each unit to
+		host physical ranges and hands them to the scheme, the unit
+		with the highest count of a batch first if the instance runs
+		in epoch mode. Entries it does not take stay in the hotlist,
+		so a quota that is used up shows as overflows growing, not as
+		work queued in the kernel. The entries of a batch that could
+		not be handed over, because the scheme refused a range,
+		because a unit could not be translated without waiting for a
+		lock of the memory device or because a unit has no System
+		RAM behind it (no region maps it, or a device-dax one does),
+		are counted in dropped; the device reports a unit again
+		while it stays hot. The instance is
+		stopped and given up when the scheme stops naming it, when
+		its DAMON worker thread stops, and at unbind.
+
+		The scheme's "source_state" file tells whether the instance
+		was taken; "error <errno>" there is, for this source: -16 if
+		the instance is held (a perf event is open on it, or its
+		range overlaps that of a held sibling and Address Overlap is
+		not supported) or a lock of the memory device was not free;
+		-22 for a unit_size above the size of a PMD mapping (2 MiB on
+		x86-64; such a unit is for perf) or a hotness_threshold that
+		does not fit the counter; -6 if no committed region maps the
+		instance's range or the node of that memory has no online
+		memory; -19 while the cxl_mem driver is not bound to the
+		memory device; -95 if the only regions that map the range
+		use an addressing that cannot be translated to host physical
+		addresses; -5 or -110 if the instance cannot be programmed.
+		DAMON tries again at every apply interval of the scheme, so
+		the source is taken as soon as what prevented it is gone.
+		After a -5 or a -110 the instance is left alone for 10
+		seconds: it is not taken and its registers are not written,
+		and the same error is shown until the next real attempt.
+
 
 What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/owner
 Date:		November, 2026
@@ -19,10 +64,16 @@ Description:
 		(RO) Who holds the instance: "perf" while a perf event is open
 		on the instance's PMU (CONFIG_CXL_HMU_PERF), from
 		perf_event_open() until the event is closed, whether or not
-		it is enabled; else "none". There is nothing to write: an
-		instance is taken by using it, first come, first served, and
-		whoever comes second gets -EBUSY from perf_event_open(). An
-		instance cannot be reserved for a user that is not using it.
+		it is enabled; "damon" while a DAMOS scheme has the instance
+		started as its hot range source (CONFIG_CXL_HMU_DAMON); else
+		"none". There is nothing to write: an instance is taken by
+		using it, first come, first served. Whoever comes second
+		does not get it: perf_event_open() fails with -EBUSY, and a
+		DAMOS scheme shows "error -16" in its source_state file and
+		takes the instance once it is free. An instance cannot be
+		reserved for a user that is not using it. A scheme that
+		tries and fails to start the instance holds it for the
+		length of the attempt.
 
 
 What:		/sys/bus/cxl/devices/hmu_memX.Y/hmu_memX.Y.Z/unit_size
@@ -34,8 +85,9 @@ Date:		November, 2026
 KernelVersion:	v7.5
 Contact:	linux-cxl@vger.kernel.org
 Description:
-		(RW) The configuration an in-kernel user starts the instance
-		with. Only a write to these files changes them. A
+		(RW) The configuration an in-kernel user (a DAMOS scheme that
+		names the instance as its source) starts the instance with.
+		Only a write to these files changes them. A
 		perf event is configured by its own attributes and neither
 		reads nor changes them. A store takes effect at the next
 		start by an in-kernel user; one that is running keeps what it
@@ -55,7 +107,8 @@ Description:
 		default 1. It must be below 1 << (the counter width), which
 		the device only reports once the unit size is programmed, so
 		a value that is too large is refused with -EINVAL by the
-		start, not by the store, and the kernel log names the width.
+		start, not by the store; with dynamic debug enabled for the
+		driver the kernel log names the width.
 
 		epoch_us: the epoch length in microseconds, clamped to
 		epoch_range_us and rounded down to what the device encodes
@@ -150,4 +203,7 @@ Description:
 		the list was full when a unit became hot, and unless
 		postponed_overflow is 1 that unit is gone. dropped counts the
 		hotlist entries the kernel read and threw away: for a perf
-		event, those its AUX buffer had no room for when it stopped.
+		event, those its AUX buffer had no room for when it stopped;
+		for a DAMOS scheme, those of a batch that could not be handed
+		over to it, the ones without System RAM behind them
+		included.

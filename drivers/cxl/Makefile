@@ -15,6 +15,7 @@ obj-$(CONFIG_CXL_PMEM) += cxl_pmem.o
 obj-$(CONFIG_CXL_MEM) += cxl_mem.o
 obj-$(CONFIG_CXL_PCI) += cxl_pci.o
 obj-$(CONFIG_CXL_HMU) += cxl_hmu.o
+obj-$(CONFIG_CXL_HMU_DAMON) += cxl_hmu_damon.o
 
 cxl_port-y := port.o
 cxl_acpi-y := acpi.o
@@ -24,3 +25,4 @@ cxl_pci-y := pci.o
 CFLAGS_hmu/core.o = -DTRACE_INCLUDE_PATH=. -I$(src)/hmu
 cxl_hmu-y := hmu/core.o
 cxl_hmu-$(CONFIG_CXL_HMU_PERF) += hmu/perf.o
+cxl_hmu_damon-y := hmu/damon.o

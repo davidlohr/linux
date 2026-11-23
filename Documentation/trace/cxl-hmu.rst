@@ -278,6 +278,99 @@ when the instance's interrupt notifies it, and releases the instance, which
 stops it. While a client holds an instance, the instance's owner attribute
 shows the client's name and perf_event_open() on its PMU fails with -EBUSY.
 
+DAMON hot range sources
+-----------------------
+
+With CONFIG_CXL_HMU_DAMON every instance is a DAMOS hot range source, named
+after the instance device (see :ref:`Hot Range Sources
+<damon_design_damos_source>` in the DAMON design document). The client is
+the module cxl_hmu_damon, which is not loaded automatically::
+
+    # modprobe cxl_hmu_damon
+
+A DAMOS migrate_hot or migrate_cold scheme of a physical address space
+context that writes the name of the instance, hmu_memX.Y.Z, to its "source"
+file migrates the pages of the hot units to the scheme's target node, under
+the scheme's quota and filters. The worker thread of the DAMON context then
+claims the instance, and the owner attribute reads "damon". It polls the
+instance, with its interrupts disabled: at each apply interval of the
+scheme, and while the scheme's quota has room, it takes batches of 32
+entries off the hotlist and hands each unit over as host physical ranges,
+the unit with the highest count of a batch first if the instance runs in
+epoch mode. Entries it does not take stay in the hotlist, so a quota that is
+used up shows as overflows growing, not as work queued in the kernel. The
+entries of a batch that could not be handed over, because the scheme
+refused a range, because a unit could not be translated without waiting for
+a lock of the memory device or because a unit has no System RAM behind it
+(no region maps it, or a device-dax one does), are counted in dropped; the
+device reports a unit again while it stays hot. The instance is stopped and
+given up when the scheme stops naming it, when its DAMON worker thread
+stops, and at unbind. Unloading cxl_hmu_damon is refused while a scheme has
+the source attached.
+
+The scheme's "source_state" file tells whether the instance was taken;
+"error <errno>" there is, for this source:
+
+- -16 if another scheme has the source, or the instance is held (a perf
+  event is open on it, or its range overlaps that of a held sibling and
+  Address Overlap is not supported);
+- -22 for a unit_size above the size of a PMD mapping (2 MiB on x86-64; such
+  a unit is for perf), a hotness_threshold that does not fit the counter, or
+  another staged value the instance cannot take; it is refused before the
+  instance is enabled;
+- -95 for a staged value of a kind the instance does not support (the
+  default configuration of an instance with unusual capabilities can be
+  one);
+- -5 or -110 if the instance cannot be programmed;
+- -19 once the cxl_mem driver is no longer bound to the memory device, or
+  when the source is gone.
+
+DAMON tries again at every apply interval of the scheme, so the source is
+taken as soon as what prevented it is gone. After a -22, a -5, a -110 or a
+-19 the instance is left alone for 10 seconds: it is not taken and its
+registers are not written, and the same error is shown until the next real
+attempt. A -22 comes from the staged files and does not go away until they
+are written; the next attempt after the write takes the new values.
+A scheme that has the source attached keeps cxl_hmu_damon loaded, and
+cxl_hmu_damon keeps the driver loaded.
+
+The scheme is an ordinary one of the :doc:`DAMON sysfs interface
+</admin-guide/mm/damon/usage>`, so its quota, filters, target node and
+statistics are set and read there. For example, to promote what instance
+hmu_mem0.0.0 finds hot at a 2 MiB granularity to node 0, at no more than
+128 MiB and 10 ms of work per second::
+
+    # echo N > /sys/module/damon_stat/parameters/enabled  # if built
+    # cd /sys/bus/cxl/devices/hmu_mem0.0/hmu_mem0.0.0
+    # echo 2097152 > unit_size
+    # echo 16 > hotness_threshold
+    # cd /sys/kernel/mm/damon/admin/kdamonds
+    # echo 1 > nr_kdamonds; echo 1 > 0/contexts/nr_contexts
+    # cd 0/contexts/0
+    # echo paddr > operations
+    # echo 100000 > monitoring_attrs/intervals/sample_us
+    # echo 100000 > monitoring_attrs/intervals/aggr_us
+    # echo 1 > schemes/nr_schemes
+    # cd schemes/0
+    # echo migrate_hot > action
+    # echo 0 > target_nid
+    # echo 10 > quotas/ms
+    # echo $((128*1024*1024)) > quotas/bytes
+    # echo 1000 > quotas/reset_interval_ms
+    # echo hmu_mem0.0.0 > source
+    # echo on > ../../../../state
+    # echo update_schemes_stats > ../../../../state
+    # cat source_state
+    attached
+    # cat /sys/bus/cxl/devices/hmu_mem0.0/hmu_mem0.0.0/owner
+    damon
+
+The instance's attributes are read when DAMON starts the source. To apply a
+change to them while the scheme runs, clear the scheme's source, commit, set
+it again and commit, or turn the kdamond off and on. Writing off to the
+kdamond's state, or committing a scheme without the source, stops the
+instance and gives it up.
+
 Trace events
 ============
 
